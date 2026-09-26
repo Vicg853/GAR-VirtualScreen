@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/bridge-core", "crates/bridge-host", "crates/bridge-viewer"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+quinn = "0.11.12"
+rustls = "0.23"
+rcgen = "0.14"
+sha2 = "0.10"
+spake2 = "0.4"
+hmac = "0.12"
+mdns-sd = "0.21.4"
+gpui = { version = "0.2.2", default-features = false }

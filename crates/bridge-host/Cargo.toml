@@ -1,0 +1,21 @@
+[package]
+name = "bridge-host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+anyhow.workspace = true
+tokio.workspace = true
+gpui.workspace = true
+quinn.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "11.0.0"
+videotoolbox = "0.21.0"
+apple-cf = "0.11.0"
+
+[build-dependencies]
+cc = "1"
