@@ -67,12 +67,6 @@ enum Captured {
         row_bytes: usize,
         timestamp_us: u64,
     },
-    Audio {
-        bytes: Vec<u8>,
-        timestamp_us: u64,
-        sample_rate: u32,
-        channels: u8,
-    },
 }
 
 struct CaptureHandler {
@@ -99,49 +93,6 @@ impl SCStreamOutputTrait for CaptureHandler {
                     bytes: bytes.to_vec(),
                     row_bytes: pixel.bytes_per_row(),
                     timestamp_us,
-                }
-            }
-            SCStreamOutputType::Audio => {
-                let Some(format) = sample.format_description() else {
-                    return;
-                };
-                if format.audio_bits_per_channel() != Some(32)
-                    || !format.audio_is_float()
-                    || format.audio_is_big_endian()
-                {
-                    return;
-                }
-                let Ok(list) = sample.audio_buffer_list() else {
-                    return;
-                };
-                let channels = format.audio_channel_count().unwrap_or(2).min(2) as u8;
-                let bytes = if list.num_buffers() == 1 {
-                    list.buffer(0)
-                        .map(|buffer| buffer.data().to_vec())
-                        .unwrap_or_default()
-                } else if channels == 2 && list.num_buffers() >= 2 {
-                    let left = list
-                        .buffer(0)
-                        .map(|buffer| buffer.data().to_vec())
-                        .unwrap_or_default();
-                    let right = list
-                        .buffer(1)
-                        .map(|buffer| buffer.data().to_vec())
-                        .unwrap_or_default();
-                    let mut interleaved = Vec::with_capacity(left.len() + right.len());
-                    for (l, r) in left.chunks_exact(4).zip(right.chunks_exact(4)) {
-                        interleaved.extend_from_slice(l);
-                        interleaved.extend_from_slice(r);
-                    }
-                    interleaved
-                } else {
-                    return;
-                };
-                Captured::Audio {
-                    bytes,
-                    timestamp_us,
-                    sample_rate: format.audio_sample_rate().unwrap_or(48_000.0) as u32,
-                    channels,
                 }
             }
             _ => return,
@@ -209,7 +160,7 @@ pub fn capture(
         .with_minimum_frame_interval(&CMTime::new(1, settings.fps as i32))
         .with_queue_depth(3)
         .with_shows_cursor(true)
-        .with_captures_audio(settings.audio)
+        .with_captures_audio(false)
         .with_sample_rate(48_000)
         .with_channel_count(2);
     let mut stream = SCStream::new(&filter, &config)?;
@@ -217,22 +168,12 @@ pub fn capture(
     let started = Instant::now();
     stream.add_output_handler(
         CaptureHandler {
-            output: captured_tx.clone(),
+            output: captured_tx,
             started,
             dropped: dropped.clone(),
         },
         SCStreamOutputType::Screen,
     )?;
-    if settings.audio {
-        stream.add_output_handler(
-            CaptureHandler {
-                output: captured_tx,
-                started,
-                dropped: dropped.clone(),
-            },
-            SCStreamOutputType::Audio,
-        )?;
-    }
 
     let mut encoder_builder =
         CompressionSession::builder(settings.width as i32, settings.height as i32, Codec::H264)
@@ -346,24 +287,6 @@ pub fn capture(
                     annex_b,
                 )
             }
-            Captured::Audio {
-                bytes,
-                timestamp_us,
-                sample_rate,
-                channels,
-            } => (
-                MediaHeader {
-                    kind: MediaKind::Audio,
-                    sequence,
-                    timestamp_us,
-                    keyframe: false,
-                    width: 0,
-                    height: 0,
-                    sample_rate,
-                    channels,
-                },
-                bytes,
-            ),
         };
         sequence += 1;
         if output

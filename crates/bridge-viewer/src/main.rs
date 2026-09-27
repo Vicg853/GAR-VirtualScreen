@@ -1,7 +1,7 @@
 mod linux;
 
 mod app {
-    use super::linux::{AudioPlayer, VideoDecoder, VideoFrame};
+    use super::linux::{VideoDecoder, VideoFrame};
     use anyhow::{Result, bail};
     use bridge_core::{
         config::{
@@ -275,13 +275,6 @@ mod app {
                             .flex()
                             .gap_2()
                             .child(setting_button(
-                                "Toggle audio",
-                                "audio",
-                                shared.clone(),
-                                |s| s.settings.audio = !s.settings.audio,
-                                cx,
-                            ))
-                            .child(setting_button(
                                 "Toggle VSync",
                                 "vsync",
                                 shared.clone(),
@@ -432,6 +425,10 @@ mod app {
         updates: mpsc::UnboundedSender<()>,
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<()> {
+        let settings = settings.map(|mut settings| {
+            settings.audio = false;
+            settings
+        });
         if let Some(settings) = &settings {
             settings.validate()?;
         }
@@ -484,20 +481,6 @@ mod app {
             updates,
             option.acceleration == Acceleration::Hardware,
         )?;
-        let player = if actual.audio {
-            match AudioPlayer::new() {
-                Ok(player) => Some(player),
-                Err(error) => {
-                    message(
-                        &shared,
-                        format!("Video connected; audio unavailable: {error}"),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
         message(
             &shared,
             format!(
@@ -517,7 +500,7 @@ mod app {
                                 if let Ok(mut frame) = frame.lock() { frame.dropped += 1; }
                             }
                         }
-                        MediaKind::Audio => { if let Some(player) = &player { player.submit(&bytes, header.sample_rate, header.channels); } }
+                        MediaKind::Audio => {}
                     }
                 }
             }

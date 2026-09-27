@@ -145,7 +145,7 @@ pub fn built_in_presets() -> Vec<Preset> {
             h264_profile: H264Profile::High,
             low_latency_rate_control: false,
             vsync: true,
-            audio: true,
+            audio: false,
             preferred_codec: None,
         },
     })

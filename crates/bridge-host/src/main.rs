@@ -245,13 +245,6 @@ mod app {
                             .flex()
                             .gap_2()
                             .child(setting_button(
-                                "Toggle audio",
-                                "audio",
-                                shared.clone(),
-                                |s| s.settings.audio = !s.settings.audio,
-                                cx,
-                            ))
-                            .child(setting_button(
                                 "Toggle VSync",
                                 "vsync",
                                 shared.clone(),
@@ -292,11 +285,8 @@ mod app {
                 .child(div().text_xl().child("AirBridge · Mac host"))
                 .child(format!("Connect from Linux with PIN {}", state.pin))
                 .child(format!(
-                    "{}×{} · {} fps · audio {}",
-                    state.settings.width,
-                    state.settings.height,
-                    state.settings.fps,
-                    if state.settings.audio { "on" } else { "off" }
+                    "{}×{} · {} fps · video only",
+                    state.settings.width, state.settings.height, state.settings.fps,
                 ))
                 .child(div().flex().gap_2().children(presets))
                 .child(
@@ -394,8 +384,9 @@ mod app {
             Control::Hello { .. } => bail!("Viewer uses an incompatible protocol version"),
             _ => bail!("Expected a viewer greeting"),
         };
-        let settings =
+        let mut settings =
             requested_settings.unwrap_or_else(|| shared.lock().unwrap().settings.clone());
+        settings.audio = false;
         settings.validate()?;
         let option = negotiate(
             &mac::available_codecs(),

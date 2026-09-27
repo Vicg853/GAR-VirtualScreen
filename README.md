@@ -1,6 +1,6 @@
 # AirBridge
 
-AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video and system audio, and sends both over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, plays audio, and shows the result in a GPUI window. Input sharing is outside this project's current scope.
+AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video, and sends it over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, and shows the result in a GPUI window. Audio is temporarily disabled while the display path is being tested. Input sharing is outside this project's current scope.
 
 ## Build
 
@@ -10,7 +10,7 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust, FFmpeg, ALSA development headers, and the libraries required by GPUI for Wayland or X11. On Fedora, install the build dependencies and FFmpeg through your configured repositories, then run:
+The Linux viewer needs Rust, FFmpeg, and the libraries required by GPUI for Wayland or X11. On Fedora, install the build dependencies and FFmpeg through your configured repositories, then run:
 
 ```sh
 cargo run -p bridge-viewer --release
@@ -20,9 +20,9 @@ Start the Mac host, then start the viewer. Select the discovered Mac, type the P
 
 ## Settings
 
-The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, low latency rate control, and audio. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
+The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
 
-The protocol carries separate video and audio packets with sequence numbers and timestamps. The host currently advertises VideoToolbox H.264 hardware preferred and software modes. The viewer asks FFmpeg to select hardware decoding in the preferred mode and can use software decoding. The common codec ranking already describes the intended order: hardware AV1, hardware H.264, software AV1, then software H.264. A codec is advertised only after its implementation is available.
+The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently advertises VideoToolbox H.264 hardware preferred and software modes. The viewer asks FFmpeg to select hardware decoding in the preferred mode and can use software decoding. The common codec ranking already describes the intended order: hardware AV1, hardware H.264, software AV1, then software H.264. A codec is advertised only after its implementation is available.
 
 ## Current limits
 
