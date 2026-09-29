@@ -13,7 +13,6 @@ gpui.workspace = true
 quinn.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = "11.0.0"
 videotoolbox = "0.21.0"
 apple-cf = "0.11.0"
 

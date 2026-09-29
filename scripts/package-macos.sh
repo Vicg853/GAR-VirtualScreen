@@ -30,5 +30,12 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+signing_identity="${AIRBRIDGE_SIGNING_IDENTITY:--}"
+codesign --force --sign "$signing_identity" --identifier dev.airbridge.host "$bundle"
+
 printf 'Created %s\n' "$bundle"
+if [[ "$signing_identity" == "-" ]]; then
+    printf 'Ad hoc signing: rebuilding can invalidate Screen Recording permission. Grant access after the final build.\n'
+    printf 'For a stable signing identity, set AIRBRIDGE_SIGNING_IDENTITY to your code signing certificate name.\n'
+fi
 printf 'Open it from Finder or run: open "%s"\n' "$bundle"

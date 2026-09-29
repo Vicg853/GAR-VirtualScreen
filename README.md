@@ -1,6 +1,6 @@
 # AirBridge
 
-AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video, and sends it over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, and shows the result in a GPUI window. Audio is temporarily disabled while the display path is being tested. Input sharing is outside this project's current scope.
+AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video, and sends it over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, and shows the result in a GPUI window. Audio is temporarily disabled while the display path is being tested. If a session requests audio, the host shows a soft warning and continues video-only. Input sharing is outside this project's current scope.
 
 ## Build
 
@@ -28,9 +28,17 @@ cargo run -p bridge-viewer --release
 
 Start the Mac host, then start the viewer. Select the discovered Mac, type the PIN shown in the host window, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
 
+The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, control stays available while independent media lanes start. Video uses its own labeled QUIC stream and async sender/receiver tasks. The viewer can disconnect or receive video-lane errors without waiting on capture. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because this change advances the wire protocol to version 2. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
+
+The host's video-only path uses CoreGraphics display streams, so it does not construct a ScreenCaptureKit stream. ScreenCaptureKit initialized a CoreAudio clock even with audio capture disabled and stalled for about 150 seconds on one Mac. The CoreGraphics display-stream API is marked obsolete by the macOS 15+ SDK and may be removed in a future macOS release; the host reports a visible error if this API is unavailable.
+
 ### App launchers
 
 On macOS, run `./scripts/package-macos.sh` to build `dist/AirBridge Host.app`. Open the bundle from Finder and drag it into the Dock if desired. macOS may ask for Screen Recording permission on the first launch; restart the app after granting it.
+
+If macOS still reports that capture was denied, quit all host instances. In **System Settings → Privacy & Security → Screen & System Audio Recording** (called **Screen Recording** on older macOS), remove the stale AirBridge entry, add the exact `AirBridge Host.app` you launch, and enable it. Relaunch from Finder. The startup log shows the actual executable path and the Screen Recording preflight result. Permission given to a terminal-launched binary may not apply to the app bundle.
+
+The packaging script uses ad hoc signing by default, so rebuilding can invalidate saved permission. Build first, then grant access. To sign subsequent builds with a consistent code signing certificate, use `AIRBRIDGE_SIGNING_IDENTITY="Your certificate name" ./scripts/package-macos.sh`. Use the same certificate and bundle identifier for subsequent builds; switching from ad hoc signing requires granting permission to the newly signed app.
 
 On Linux, run `./scripts/install-linux.sh` to build and install the viewer into `~/.local/bin` with an `AirBridge Viewer` application launcher in `~/.local/share/applications`. Launch it from your desktop environment's application menu. The script installs for the current user and does not require root.
 
@@ -40,7 +48,7 @@ The Linux viewer opens two independent windows: a resizable video window and a c
 
 The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
 
-The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently advertises VideoToolbox H.264 hardware preferred and software modes. The viewer asks FFmpeg to select hardware decoding in the preferred mode and can use software decoding. The common codec ranking already describes the intended order: hardware AV1, hardware H.264, software AV1, then software H.264. A codec is advertised only after its implementation is available.
+The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently advertises VideoToolbox H.264 hardware preferred and software modes. The viewer currently uses FFmpeg software decoding while continuous video delivery is being validated. The common codec ranking already describes the intended order: hardware AV1, hardware H.264, software AV1, then software H.264. A codec is advertised only after its implementation is available.
 
 ## Current limits
 

@@ -5,15 +5,11 @@ use apple_cf::{
 };
 use bridge_core::{
     config::{Acceleration, Codec as BridgeCodec, CodecOption, H264Profile, VideoSettings},
-    protocol::{MediaHeader, MediaKind},
-};
-use screencapturekit::{
-    cm::{CMSampleBuffer, CMSampleBufferExt},
-    cv::CVPixelBufferLockFlags,
-    prelude::*,
+    protocol::{MediaHeader, MediaKind, VERSION},
 };
 use std::{
     ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,6 +23,7 @@ use videotoolbox::{
 };
 
 unsafe extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
     fn airbridge_display_create(
         width: u32,
         height: u32,
@@ -34,6 +31,27 @@ unsafe extern "C" {
         display_id: *mut u32,
     ) -> *mut c_void;
     fn airbridge_display_release(display: *mut c_void);
+    fn airbridge_video_stream_start(
+        display_id: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        context: *mut c_void,
+        callback: extern "C" fn(*mut c_void, *const u8, usize, usize),
+        error_code: *mut i32,
+    ) -> *mut c_void;
+    fn airbridge_video_stream_stop(stream: *mut c_void) -> bool;
+}
+
+pub fn capture_permission_diagnostic() -> String {
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unknown ({error})"));
+    let allowed = unsafe { CGPreflightScreenCaptureAccess() };
+    format!(
+        "AirBridge protocol v{VERSION}, CoreGraphics video-only backend. Running executable: {executable}; macOS Screen Recording preflight: {}",
+        if allowed { "granted" } else { "not granted" }
+    )
 }
 
 struct VirtualDisplay(*mut c_void);
@@ -69,36 +87,88 @@ enum Captured {
     },
 }
 
-struct CaptureHandler {
+struct FrameContext {
     output: mpsc::Sender<Captured>,
     started: Instant,
     dropped: Arc<AtomicU64>,
 }
 
-impl SCStreamOutputTrait for CaptureHandler {
-    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, kind: SCStreamOutputType) {
-        let timestamp_us = self.started.elapsed().as_micros() as u64;
-        let packet = match kind {
-            SCStreamOutputType::Screen => {
-                let Some(pixel) = sample.pixel_buffer() else {
-                    return;
-                };
-                let Ok(guard) = pixel.lock(CVPixelBufferLockFlags::READ_ONLY) else {
-                    return;
-                };
-                let Some(bytes) = (unsafe { guard.as_slice() }) else {
-                    return;
-                };
-                Captured::Video {
-                    bytes: bytes.to_vec(),
-                    row_bytes: pixel.bytes_per_row(),
-                    timestamp_us,
-                }
-            }
-            _ => return,
+extern "C" fn frame_callback(context: *mut c_void, bytes: *const u8, len: usize, row_bytes: usize) {
+    // No unwind may cross the Objective-C callback boundary.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let context = unsafe { &*(context.cast::<FrameContext>()) };
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+        let packet = Captured::Video {
+            bytes: bytes.to_vec(),
+            row_bytes,
+            timestamp_us: context.started.elapsed().as_micros() as u64,
         };
-        if self.output.try_send(packet).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        if context.output.try_send(packet).is_err() {
+            context.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
+}
+
+struct VideoStream {
+    ptr: *mut c_void,
+    context: *mut FrameContext,
+}
+
+impl VideoStream {
+    fn start(
+        display_id: u32,
+        settings: &VideoSettings,
+        output: mpsc::Sender<Captured>,
+        dropped: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let context = Box::into_raw(Box::new(FrameContext {
+            output,
+            started: Instant::now(),
+            dropped,
+        }));
+        let mut error_code = 0;
+        let ptr = unsafe {
+            airbridge_video_stream_start(
+                display_id,
+                settings.width,
+                settings.height,
+                settings.fps,
+                context.cast(),
+                frame_callback,
+                &mut error_code,
+            )
+        };
+        if ptr.is_null() {
+            unsafe { drop(Box::from_raw(context)) };
+            bail!(
+                "CoreGraphics video-only display stream could not start (CGError {error_code}). Screen Recording access or this macOS version may prevent capture."
+            );
+        }
+        Ok(Self { ptr, context })
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if self.ptr.is_null() {
+            return Ok(());
+        }
+        let stopped = unsafe { airbridge_video_stream_stop(self.ptr) };
+        self.ptr = std::ptr::null_mut();
+        if stopped {
+            unsafe { drop(Box::from_raw(self.context)) };
+            self.context = std::ptr::null_mut();
+            Ok(())
+        } else {
+            // Keep the callback data alive rather than risk a callback using
+            // freed memory if macOS never confirmed the stopped event.
+            bail!("CoreGraphics did not confirm that video callbacks stopped")
+        }
+    }
+}
+
+impl Drop for VideoStream {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            eprintln!("[host] {error}");
         }
     }
 }
@@ -126,55 +196,16 @@ pub fn capture(
     output: mpsc::Sender<EncodedPacket>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    progress: impl Fn(&str),
 ) -> Result<()> {
     settings.validate()?;
     if option.codec != BridgeCodec::H264 {
         bail!("The requested encoder is not available on this Mac");
     }
+    progress("Creating virtual display…");
     let (_display, display_id) = VirtualDisplay::new(&settings)?;
-    let mut display = None;
-    for _ in 0..50 {
-        let content = SCShareableContent::get().map_err(|error| {
-            anyhow!("ScreenCaptureKit could not list displays. Grant Screen Recording permission to AirBridge, restart it, and retry: {error}")
-        })?;
-        display = content
-            .displays()
-            .into_iter()
-            .find(|candidate| candidate.display_id() == display_id);
-        if display.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let display = display
-        .context("The virtual display did not appear in ScreenCaptureKit after five seconds")?;
-
-    let filter = SCContentFilter::create()
-        .with_display(&display)
-        .with_excluding_windows(&[])
-        .build()?;
-    let config = SCStreamConfiguration::new()
-        .with_width(settings.width)
-        .with_height(settings.height)
-        .with_pixel_format(PixelFormat::BGRA)
-        .with_minimum_frame_interval(&CMTime::new(1, settings.fps as i32))
-        .with_queue_depth(3)
-        .with_shows_cursor(true)
-        .with_captures_audio(false)
-        .with_sample_rate(48_000)
-        .with_channel_count(2);
-    let mut stream = SCStream::new(&filter, &config)?;
     let (captured_tx, mut captured_rx) = mpsc::channel(4);
-    let started = Instant::now();
-    stream.add_output_handler(
-        CaptureHandler {
-            output: captured_tx,
-            started,
-            dropped: dropped.clone(),
-        },
-        SCStreamOutputType::Screen,
-    )?;
-
+    progress("Preparing VideoToolbox encoder…");
     let mut encoder_builder =
         CompressionSession::builder(settings.width as i32, settings.height as i32, Codec::H264)
             .with_real_time(true)
@@ -202,18 +233,42 @@ pub fn capture(
         4,
     )
     .ok_or_else(|| anyhow!("Cannot allocate encoder surface"))?;
-    stream.start_capture()?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    progress(&format!(
+        "Starting CoreGraphics video-only stream on display {display_id}…"
+    ));
+    let mut stream = VideoStream::start(display_id, &settings, captured_tx, dropped.clone())?;
+    progress("Video-only stream started; waiting for the first frame…");
+    let capture_started = Instant::now();
+    let mut received_first_frame = false;
 
     let mut sequence = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let packet = match captured_rx.try_recv() {
             Ok(packet) => packet,
             Err(mpsc::error::TryRecvError::Empty) => {
+                if !received_first_frame && capture_started.elapsed() > Duration::from_secs(10) {
+                    progress(
+                        "Video capture delivered no frame within 10 seconds; stopping capture…",
+                    );
+                    bail!(
+                        "CoreGraphics delivered no initial video frame within 10 seconds for virtual display {display_id}"
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         };
+        if !received_first_frame {
+            received_first_frame = true;
+            progress("First video frame captured; encoding with VideoToolbox…");
+        }
         let (header, bytes) = match packet {
             Captured::Video {
                 bytes,
@@ -296,6 +351,6 @@ pub fn capture(
             break;
         }
     }
-    stream.stop_capture()?;
+    stream.stop()?;
     Ok(())
 }

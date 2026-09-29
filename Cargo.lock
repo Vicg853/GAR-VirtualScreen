@@ -76,16 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apple-metal"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00a23f6df783ca6a2def6201afc6bd54c1d41454e35552309166432155b544fc"
-dependencies = [
- "doom-fish-utils",
- "libc",
-]
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -775,7 +765,6 @@ dependencies = [
  "cc",
  "gpui",
  "quinn",
- "screencapturekit 11.0.0",
  "tokio",
  "videotoolbox",
 ]
@@ -5079,16 +5068,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "screencapturekit"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe1b2061926d42d24cf1736407c9d7bc3e7d45dbba841e5ac8807c662998967e"
-dependencies = [
- "apple-cf",
- "apple-metal",
-]
-
-[[package]]
 name = "screencapturekit-sys"
 version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7604,7 +7583,7 @@ dependencies = [
  "log",
  "objc",
  "rand 0.8.8",
- "screencapturekit 0.2.8",
+ "screencapturekit",
  "screencapturekit-sys",
  "sysinfo",
  "tao-core-video-sys",

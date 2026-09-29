@@ -5,11 +5,19 @@ use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use std::{fs, net::SocketAddr, sync::Arc};
+use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LABEL: &[u8] = b"airbridge/pin-auth/v1";
 type HmacSha256 = Hmac<Sha256>;
+
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut config = quinn::TransportConfig::default();
+    // macOS can take longer than QUIC's idle timeout to initialize capture.
+    // Keep the authenticated connection alive while there are no media frames.
+    config.keep_alive_interval(Some(Duration::from_secs(5)));
+    Arc::new(config)
+}
 
 pub fn validate_pin(pin: &str) -> Result<()> {
     if pin.len() != 6 || !pin.bytes().all(|digit| digit.is_ascii_digit()) {
@@ -46,9 +54,10 @@ pub fn server_endpoint(address: SocketAddr) -> Result<Endpoint> {
             PrivatePkcs8KeyDer::from(key).into(),
         )?;
     crypto.alpn_protocols = vec![b"airbridge/1".to_vec()];
-    let config = ServerConfig::with_crypto(Arc::new(
+    let mut config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?,
     ));
+    config.transport_config(transport_config());
     Endpoint::server(config, address).context("Cannot listen for QUIC connections")
 }
 
@@ -62,9 +71,11 @@ pub fn client_endpoint(address: SocketAddr) -> Result<Endpoint> {
         ))))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"airbridge/1".to_vec()];
-    endpoint.set_default_client_config(ClientConfig::new(Arc::new(
+    let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    )));
+    ));
+    config.transport_config(transport_config());
+    endpoint.set_default_client_config(config);
     Ok(endpoint)
 }
 

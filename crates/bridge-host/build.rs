@@ -7,6 +7,8 @@ fn main() {
             .compile("airbridge_virtual_display");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     }
 }

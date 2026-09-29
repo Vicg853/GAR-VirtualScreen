@@ -6,9 +6,9 @@ use smallvec::smallvec;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -19,7 +19,7 @@ pub struct VideoFrame {
 }
 
 pub struct VideoDecoder {
-    input: mpsc::SyncSender<Vec<u8>>,
+    input: tokio::sync::mpsc::Sender<Vec<u8>>,
     child: Arc<Mutex<Child>>,
 }
 
@@ -65,11 +65,11 @@ impl VideoDecoder {
             }
         });
         let child = Arc::new(Mutex::new(child));
-        let (send, receive) = mpsc::sync_channel::<Vec<u8>>(3);
+        let (send, mut receive) = tokio::sync::mpsc::channel::<Vec<u8>>(3);
         let target_writer = target.clone();
         let diagnostic_writer = diagnostics.clone();
         thread::spawn(move || {
-            while let Ok(packet) = receive.recv() {
+            while let Some(packet) = receive.blocking_recv() {
                 if let Err(error) = stdin.write_all(&packet) {
                     let message = format!("Decoder input stopped: {error}");
                     diagnostic_writer.record("decoder", &message);
@@ -114,24 +114,11 @@ impl VideoDecoder {
         Ok(Self { input: send, child })
     }
 
-    pub fn submit(&self, packet: Vec<u8>) -> Result<()> {
-        let started = Instant::now();
-        let mut packet = packet;
-        loop {
-            match self.input.try_send(packet) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    anyhow::bail!("Decoder input has stopped")
-                }
-                Err(mpsc::TrySendError::Full(returned)) => {
-                    if started.elapsed() > Duration::from_secs(5) {
-                        anyhow::bail!("Decoder has not accepted a frame for five seconds")
-                    }
-                    packet = returned;
-                    thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
+    pub async fn submit(&self, packet: Vec<u8>) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), self.input.send(packet))
+            .await
+            .context("Decoder has not accepted a frame for five seconds")?
+            .context("Decoder input has stopped")
     }
 }
 

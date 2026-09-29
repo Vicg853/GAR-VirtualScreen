@@ -1,6 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 #import <dispatch/dispatch.h>
+#import <dlfcn.h>
 
 @interface CGVirtualDisplayMode : NSObject
 - (instancetype)initWithWidth:(NSUInteger)width height:(NSUInteger)height refreshRate:(CGFloat)refreshRate;
@@ -63,3 +66,102 @@ void airbridge_display_release(void *display) {
     if (display) CFBridgingRelease(display);
 }
 
+typedef void (*AirBridgeVideoFrameCallback)(void *context, const uint8_t *bytes, size_t length, size_t row_bytes);
+
+@interface AirBridgeVideoStream : NSObject
+@property(nonatomic) CGDisplayStreamRef stream;
+@property(nonatomic, strong) dispatch_semaphore_t stopped;
+@end
+
+@implementation AirBridgeVideoStream
+@end
+
+typedef CGDisplayStreamRef (*AirBridgeCreateStream)(CGDirectDisplayID, size_t, size_t,
+    int32_t, CFDictionaryRef, dispatch_queue_t, CGDisplayStreamFrameAvailableHandler);
+typedef CGError (*AirBridgeStreamAction)(CGDisplayStreamRef);
+
+static AirBridgeCreateStream airbridge_create_stream(void) {
+    return (AirBridgeCreateStream)dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue");
+}
+
+static AirBridgeStreamAction airbridge_stream_action(const char *name) {
+    return (AirBridgeStreamAction)dlsym(RTLD_DEFAULT, name);
+}
+
+static CFStringRef airbridge_stream_key(const char *name) {
+    const CFStringRef *key = dlsym(RTLD_DEFAULT, name);
+    return key ? *key : NULL;
+}
+
+// CGDisplayStream captures display pixels without constructing an SCStream or
+// asking CoreAudio for the clock that can stall video-only connections.
+void *airbridge_video_stream_start(uint32_t display_id, uint32_t width, uint32_t height,
+                                   uint32_t fps, void *context,
+                                   AirBridgeVideoFrameCallback callback, int32_t *error_code) {
+    if (error_code) *error_code = 0;
+    AirBridgeCreateStream create_stream = airbridge_create_stream();
+    AirBridgeStreamAction start_stream = airbridge_stream_action("CGDisplayStreamStart");
+    CFStringRef cursor_key = airbridge_stream_key("kCGDisplayStreamShowCursor");
+    CFStringRef frame_time_key = airbridge_stream_key("kCGDisplayStreamMinimumFrameTime");
+    CFStringRef depth_key = airbridge_stream_key("kCGDisplayStreamQueueDepth");
+    if (!create_stream || !start_stream || !cursor_key || !frame_time_key || !depth_key) {
+        if (error_code) *error_code = -2;
+        return NULL;
+    }
+    AirBridgeVideoStream *capture = [AirBridgeVideoStream new];
+    capture.stopped = dispatch_semaphore_create(0);
+    dispatch_semaphore_t stopped = capture.stopped;
+    dispatch_queue_t queue = dispatch_queue_create("dev.airbridge.video-capture", DISPATCH_QUEUE_SERIAL);
+    NSDictionary *properties = @{
+        (__bridge NSString *)cursor_key: @YES,
+        (__bridge NSString *)frame_time_key: @(1.0 / fps),
+        (__bridge NSString *)depth_key: @3,
+    };
+    capture.stream = create_stream(
+        display_id, width, height, kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)properties, queue,
+        ^(CGDisplayStreamFrameStatus status, uint64_t display_time,
+          IOSurfaceRef surface, CGDisplayStreamUpdateRef update) {
+            (void)display_time;
+            (void)update;
+            if (status == kCGDisplayStreamFrameStatusStopped) {
+                dispatch_semaphore_signal(stopped);
+                return;
+            }
+            if (status != kCGDisplayStreamFrameStatusFrameComplete || !surface) return;
+            if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+            const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+            size_t row_bytes = IOSurfaceGetBytesPerRow(surface);
+            size_t height = IOSurfaceGetHeight(surface);
+            if (base && row_bytes && height && height <= SIZE_MAX / row_bytes) {
+                callback(context, base, row_bytes * height, row_bytes);
+            }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        });
+    if (!capture.stream) {
+        if (error_code) *error_code = -1;
+        return NULL;
+    }
+    CGError error = start_stream(capture.stream);
+    if (error != kCGErrorSuccess) {
+        if (error_code) *error_code = error;
+        CFRelease(capture.stream);
+        capture.stream = NULL;
+        return NULL;
+    }
+    return (__bridge_retained void *)capture;
+}
+
+// Returns false when macOS did not confirm that all callbacks stopped. The
+// caller must keep its callback context alive in that case.
+bool airbridge_video_stream_stop(void *stream) {
+    if (!stream) return true;
+    AirBridgeVideoStream *capture = CFBridgingRelease(stream);
+    AirBridgeStreamAction stop_stream = airbridge_stream_action("CGDisplayStreamStop");
+    CGError error = stop_stream ? stop_stream(capture.stream) : kCGErrorFailure;
+    long finished = dispatch_semaphore_wait(capture.stopped,
+                                             dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+    CFRelease(capture.stream);
+    capture.stream = NULL;
+    return error == kCGErrorSuccess && finished == 0;
+}

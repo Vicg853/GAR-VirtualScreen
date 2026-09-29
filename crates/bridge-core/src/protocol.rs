@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
 pub const MAX_MEDIA: usize = 8 * 1024 * 1024;
@@ -26,7 +26,34 @@ pub enum Control {
         bitrate_kbps: u32,
     },
     Error(String),
+    MediaStatus {
+        lane: MediaLane,
+        state: MediaState,
+        message: String,
+    },
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaLane {
+    Video,
+    Audio,
+    Input,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum MediaState {
+    Starting,
+    Ready,
+    Failed,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MediaStreamHello {
+    pub version: u16,
+    pub lane: MediaLane,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

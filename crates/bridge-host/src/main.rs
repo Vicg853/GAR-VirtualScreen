@@ -17,7 +17,10 @@ mod app {
         },
         diagnostics::Diagnostics,
         discovery::Advertiser,
-        protocol::{Control, MediaKind, PORT, VERSION, receive_json, send_json, send_media},
+        protocol::{
+            Control, MediaLane, MediaState, MediaStreamHello, PORT, VERSION, receive_json,
+            send_json, send_media,
+        },
         security::{authenticate_host, server_endpoint},
     };
     use gpui::{
@@ -44,6 +47,7 @@ mod app {
         frames: u64,
         dropped: u64,
         bytes: u64,
+        audio_notice: Option<String>,
         show_codecs: bool,
         show_logs: bool,
         diagnostics: Arc<Diagnostics>,
@@ -464,6 +468,22 @@ mod app {
                             div()
                                 .rounded_md()
                                 .p_2()
+                                .bg(rgb(if state.audio_notice.is_some() {
+                                    0x4a3924
+                                } else {
+                                    0x203149
+                                }))
+                                .child(
+                                    state
+                                        .audio_notice
+                                        .clone()
+                                        .unwrap_or_else(|| "Audio off · video only".into()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .rounded_md()
+                                .p_2()
                                 .bg(rgb(0x203149))
                                 .child(format!("Status: {}", state.message)),
                         )
@@ -547,6 +567,7 @@ mod app {
         };
         let mut settings =
             requested_settings.unwrap_or_else(|| shared.lock().unwrap().settings.clone());
+        let audio_requested = settings.audio;
         settings.audio = false;
         settings.validate()?;
         let option = negotiate(
@@ -567,60 +588,152 @@ mod app {
             state.frames = 0;
             state.dropped = 0;
             state.bytes = 0;
+            state.audio_notice =
+                audio_requested.then(|| "Audio unavailable · continuing with video only".into());
+            if let Some(notice) = &state.audio_notice {
+                state.diagnostics.record("host", notice);
+            }
         }
-        let mut media_send = connection.open_uni().await?;
         let stop = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel::<mac::EncodedPacket>(4);
         set_message(
             &shared,
             format!(
-                "Streaming {}×{} at {} fps",
+                "Starting capture {}×{} at {} fps",
                 settings.width, settings.height, settings.fps
             ),
         );
         let settings_capture = settings.clone();
         let stop_capture = stop.clone();
         let dropped_capture = dropped.clone();
-        let capture_task = tokio::task::spawn_blocking(move || {
-            mac::capture(settings_capture, option, tx, stop_capture, dropped_capture)
+        let capture_state = shared.clone();
+        send_json(
+            &mut control_send,
+            &Control::MediaStatus {
+                lane: MediaLane::Video,
+                state: MediaState::Starting,
+                message: "Preparing video capture".into(),
+            },
+        )
+        .await?;
+        let video_connection = connection.clone();
+        let video_shared = shared.clone();
+        let video_stop = stop.clone();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<()>();
+        let mut video_task = tokio::spawn(async move {
+            let mut media_send = video_connection.open_uni().await?;
+            send_json(
+                &mut media_send,
+                &MediaStreamHello {
+                    version: VERSION,
+                    lane: MediaLane::Video,
+                },
+            )
+            .await?;
+            while let Some(packet) = rx.recv().await {
+                send_media(&mut media_send, &packet.header, &packet.bytes).await?;
+                if let Ok(mut state) = video_shared.lock() {
+                    state.bytes += packet.bytes.len() as u64;
+                    state.frames += 1;
+                    if state.frames == 1 {
+                        state.message = "Streaming video".into();
+                        state.diagnostics.record("host", &state.message);
+                        let _ = ready_tx.send(());
+                    }
+                    if state.frames == 1 || state.frames % 120 == 0 {
+                        state.diagnostics.record(
+                            "host",
+                            format!(
+                                "Sent {} video frames, {:.1} MB",
+                                state.frames,
+                                state.bytes as f64 / 1_000_000.0
+                            ),
+                        );
+                    }
+                    state.dropped = dropped.load(Ordering::Relaxed);
+                }
+            }
+            let _ = media_send.finish();
+            video_stop.store(true, Ordering::Relaxed);
+            Ok::<(), anyhow::Error>(())
         });
-        let session_result: Result<()> = async {
-            loop {
-                tokio::select! {
-                packet = rx.recv() => {
-                    let Some(packet) = packet else { break; };
-                    send_media(&mut media_send, &packet.header, &packet.bytes).await?;
-                    if let Ok(mut state) = shared.lock() {
-                        state.bytes += packet.bytes.len() as u64;
-                        if matches!(packet.header.kind, MediaKind::Video) {
-                            state.frames += 1;
-                            if state.frames == 1 || state.frames % 120 == 0 {
-                                state.diagnostics.record("host", format!("Sent {} video frames, {:.1} MB", state.frames, state.bytes as f64 / 1_000_000.0));
-                            }
-                        }
-                        state.dropped = dropped.load(Ordering::Relaxed);
+        let capture_task = tokio::task::spawn_blocking(move || {
+            mac::capture(
+                settings_capture,
+                option,
+                tx,
+                stop_capture,
+                dropped_capture,
+                |message| set_message(&capture_state, message),
+            )
+        });
+        let mut capture_task = capture_task;
+        let mut capture_done = false;
+        let mut video_done = false;
+        let mut video_ready = false;
+        let session_result: Result<()> = loop {
+            tokio::select! {
+                ready = ready_rx.recv(), if !video_ready => {
+                    video_ready = true;
+                    if ready.is_some() {
+                        let _ = send_json(&mut control_send, &Control::MediaStatus {
+                            lane: MediaLane::Video,
+                            state: MediaState::Ready,
+                            message: "Video frames are flowing".into(),
+                        }).await;
+                    }
+                }
+                capture = &mut capture_task, if !capture_done => {
+                    capture_done = true;
+                    let status = match capture {
+                        Ok(Ok(())) => (MediaState::Stopped, "Video capture stopped".to_string()),
+                        Ok(Err(error)) => (MediaState::Failed, format!("Video capture failed: {error:#}")),
+                        Err(error) => (MediaState::Failed, format!("Video capture task failed: {error}")),
+                    };
+                    if matches!(status.0, MediaState::Failed) {
+                        set_message(&shared, &status.1);
+                    }
+                    let _ = send_json(&mut control_send, &Control::MediaStatus {
+                        lane: MediaLane::Video, state: status.0, message: status.1,
+                    }).await;
+                }
+                video = &mut video_task, if !video_done => {
+                    video_done = true;
+                    let failure = match video {
+                        Ok(Err(error)) => Some(format!("Video transport failed: {error:#}")),
+                        Err(error) => Some(format!("Video transport task failed: {error}")),
+                        Ok(Ok(())) => None,
+                    };
+                    if let Some(message) = failure {
+                        stop.store(true, Ordering::Relaxed);
+                        set_message(&shared, &message);
+                        let _ = send_json(&mut control_send, &Control::MediaStatus {
+                            lane: MediaLane::Video, state: MediaState::Failed, message,
+                        }).await;
                     }
                 }
                 command = receive_json::<_, Control>(&mut control_recv) => {
                     match command {
-                        Ok(Control::Stop) => break,
+                        Ok(Control::Stop) => break Ok(()),
                         Ok(Control::ChangeSettings(_)) => {
-                            send_json(&mut control_send, &Control::Error("Reconnect to apply new display settings".into())).await?;
+                            let _ = send_json(&mut control_send, &Control::Error("Reconnect to apply new display settings".into())).await;
                         }
                         Ok(_) => {},
-                        Err(_) => break,
+                        Err(error) => break Err(anyhow::anyhow!("Viewer control channel closed: {error}")),
                     }
                 }
-                }
             }
-            Ok(())
-        }.await;
+        };
         stop.store(true, Ordering::Relaxed);
-        let capture_result = capture_task.await?;
-        let _ = media_send.finish();
+        if !video_done {
+            video_task.abort();
+            let _ = video_task.await;
+        }
+        if !capture_done {
+            let _ = capture_task.await;
+        }
         session_result?;
-        capture_result?;
         Ok(())
     }
 
@@ -639,10 +752,16 @@ mod app {
             frames: 0,
             dropped: 0,
             bytes: 0,
+            audio_notice: None,
             show_codecs: false,
             show_logs: false,
             diagnostics: Arc::new(Diagnostics::new("host")),
         }));
+        state
+            .lock()
+            .unwrap()
+            .diagnostics
+            .record("host", mac::capture_permission_diagnostic());
         let server_state = state.clone();
         std::thread::spawn(move || {
             if let Err(error) = run_server(server_state.clone()) {

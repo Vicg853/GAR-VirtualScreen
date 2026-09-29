@@ -10,7 +10,10 @@ mod app {
         },
         diagnostics::Diagnostics,
         discovery::{DiscoveredHost, browse},
-        protocol::{Control, MediaKind, VERSION, receive_json, receive_media, send_json},
+        protocol::{
+            Control, MediaKind, MediaLane, MediaState, MediaStreamHello, VERSION, receive_json,
+            receive_media, send_json,
+        },
         security::{authenticate_viewer, client_endpoint},
     };
     use gpui::{
@@ -22,7 +25,10 @@ mod app {
         cell::RefCell,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         rc::Rc,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
     use tokio::sync::mpsc;
@@ -30,6 +36,13 @@ mod app {
     enum Command {
         Connect(SocketAddr, String, Option<VideoSettings>),
         Disconnect,
+    }
+
+    enum LaneNotice {
+        Opened(MediaLane),
+        FirstFrame,
+        Failed(MediaLane, String),
+        Closed(MediaLane),
     }
 
     #[derive(Clone)]
@@ -780,6 +793,101 @@ mod app {
         })
     }
 
+    async fn receive_video_lane(
+        mut media_recv: quinn::RecvStream,
+        settings: VideoSettings,
+        shared: Arc<Mutex<State>>,
+        frame: Arc<Mutex<VideoFrame>>,
+        events: mpsc::UnboundedSender<LaneNotice>,
+    ) -> Result<()> {
+        let diagnostics = shared.lock().unwrap().diagnostics.clone();
+        let decoder = VideoDecoder::new(settings.width, settings.height, frame, diagnostics)?;
+        let mut first_frame = true;
+        loop {
+            let (header, bytes) = receive_media(&mut media_recv).await?;
+            if !matches!(header.kind, MediaKind::Video) {
+                bail!("The video lane received a non-video packet");
+            }
+            if let Ok(mut state) = shared.lock() {
+                state.bytes += bytes.len() as u64;
+                state.received_frames += 1;
+                if state.received_frames == 1 || state.received_frames % 120 == 0 {
+                    state.diagnostics.record(
+                        "viewer",
+                        format!(
+                            "Received {} video packets, {:.1} MB",
+                            state.received_frames,
+                            state.bytes as f64 / 1_000_000.0
+                        ),
+                    );
+                }
+            }
+            decoder.submit(bytes).await?;
+            if first_frame {
+                first_frame = false;
+                let _ = events.send(LaneNotice::FirstFrame);
+            }
+        }
+    }
+
+    async fn receive_lanes(
+        connection: quinn::Connection,
+        settings: VideoSettings,
+        shared: Arc<Mutex<State>>,
+        frame: Arc<Mutex<VideoFrame>>,
+        events: mpsc::UnboundedSender<LaneNotice>,
+    ) {
+        let mut tasks = tokio::task::JoinSet::new();
+        let video_active = Arc::new(AtomicBool::new(false));
+        loop {
+            tokio::select! {
+                incoming = connection.accept_uni() => {
+                    let Ok(mut stream) = incoming else { break; };
+                    let shared = shared.clone();
+                    let frame = frame.clone();
+                    let settings = settings.clone();
+                    let events = events.clone();
+                    let video_active = video_active.clone();
+                    tasks.spawn(async move {
+                        let hello = tokio::time::timeout(Duration::from_secs(5), receive_json::<_, MediaStreamHello>(&mut stream)).await;
+                        match hello {
+                            Ok(Ok(MediaStreamHello { version: VERSION, lane: MediaLane::Video })) => {
+                                if video_active.swap(true, Ordering::AcqRel) {
+                                    let _ = stream.stop(0u32.into());
+                                    return (MediaLane::Video, Err(anyhow::anyhow!("Duplicate video lane")));
+                                }
+                                let _ = events.send(LaneNotice::Opened(MediaLane::Video));
+                                let result = receive_video_lane(stream, settings, shared, frame, events).await;
+                                video_active.store(false, Ordering::Release);
+                                (MediaLane::Video, result)
+                            }
+                            Ok(Ok(MediaStreamHello { version: VERSION, lane })) => {
+                                let _ = stream.stop(0u32.into());
+                                (lane, Err(anyhow::anyhow!("The {lane:?} lane is not implemented yet")))
+                            }
+                            Ok(Ok(_)) => (MediaLane::Video, Err(anyhow::anyhow!("Incompatible media lane version"))),
+                            Ok(Err(error)) => (MediaLane::Video, Err(error.context("Could not read media lane header"))),
+                            Err(_) => (MediaLane::Video, Err(anyhow::anyhow!("Media lane header timed out"))),
+                        }
+                    });
+                }
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    match finished {
+                        Some(Ok((lane, outcome))) => match outcome {
+                            Ok(()) => { let _ = events.send(LaneNotice::Closed(lane)); },
+                            Err(error) => { let _ = events.send(LaneNotice::Failed(lane, format!("{error:#}"))); },
+                        },
+                        Some(Err(error)) => {
+                            video_active.store(false, Ordering::Release);
+                            let _ = events.send(LaneNotice::Failed(MediaLane::Video, format!("Media lane task failed: {error}")));
+                        }
+                        None => {},
+                    }
+                }
+            }
+        }
+    }
+
     async fn connect(
         address: SocketAddr,
         pin: String,
@@ -835,18 +943,11 @@ mod app {
             Control::Error(text) => bail!("Host: {text}"),
             _ => bail!("Host sent an invalid response"),
         };
-        let mut media_recv = connection.accept_uni().await?;
         *frame.lock().unwrap() = VideoFrame::default();
         if let Ok(mut state) = shared.lock() {
             state.bytes = 0;
             state.received_frames = 0;
         }
-        let decoder = VideoDecoder::new(
-            actual.width,
-            actual.height,
-            frame.clone(),
-            shared.lock().unwrap().diagnostics.clone(),
-        )?;
         message(
             &shared,
             format!(
@@ -857,10 +958,18 @@ mod app {
         message(
             &shared,
             format!(
-                "Streaming {}×{} at {} fps",
+                "Connected; waiting for video {}×{} at {} fps",
                 actual.width, actual.height, actual.fps
             ),
         );
+        let (lane_events, mut lane_notices) = mpsc::unbounded_channel();
+        let mut lane_task = tokio::spawn(receive_lanes(
+            connection.clone(),
+            actual,
+            shared.clone(),
+            frame.clone(),
+            lane_events,
+        ));
         let mut watchdog = tokio::time::interval(Duration::from_secs(3));
         let mut last_decoded = 0;
         let mut last_received = 0;
@@ -877,20 +986,32 @@ mod app {
                     last_decoded = decoded;
                 }
                 command = commands.recv() => { if matches!(command, Some(Command::Disconnect) | None) { break; } }
-                packet = receive_media(&mut media_recv) => {
-                    let (header, bytes) = packet?;
-                    if let Ok(mut state) = shared.lock() {
-                        state.bytes += bytes.len() as u64;
-                        if matches!(header.kind, MediaKind::Video) {
-                            state.received_frames += 1;
-                            if state.received_frames == 1 || state.received_frames % 120 == 0 {
-                                state.diagnostics.record("viewer", format!("Received {} video packets, {:.1} MB", state.received_frames, state.bytes as f64 / 1_000_000.0));
+                lane = &mut lane_task => {
+                    match lane {
+                        Ok(()) => bail!("The media connection closed"),
+                        Err(error) => bail!("Media lane manager stopped: {error}"),
+                    }
+                }
+                notice = lane_notices.recv() => {
+                    match notice {
+                        Some(LaneNotice::Opened(lane)) => message(&shared, format!("{lane:?} lane opened; waiting for frames…")),
+                        Some(LaneNotice::FirstFrame) => message(&shared, "Streaming video"),
+                        Some(LaneNotice::Failed(lane, error)) => message(&shared, format!("{lane:?} lane unavailable: {error}")),
+                        Some(LaneNotice::Closed(lane)) => message(&shared, format!("{lane:?} lane closed")),
+                        None => {},
+                    }
+                }
+                response = receive_json::<_, Control>(&mut control_recv) => {
+                    match response? {
+                        Control::Error(text) => message(&shared, format!("Host: {text}")),
+                        Control::MediaStatus { lane, state, message: detail } => {
+                            match state {
+                                MediaState::Starting | MediaState::Ready | MediaState::Failed | MediaState::Stopped =>
+                                    message(&shared, format!("{lane:?}: {detail}")),
                             }
                         }
-                    }
-                    match header.kind {
-                        MediaKind::Video => decoder.submit(bytes)?,
-                        MediaKind::Audio => {}
+                        Control::Stop => break,
+                        _ => {},
                     }
                 }
                 }
@@ -902,8 +1023,9 @@ mod app {
             send_json(&mut control_send, &Control::Stop),
         )
         .await;
+        lane_task.abort();
+        let _ = lane_task.await;
         connection.close(0u32.into(), b"viewer disconnected");
-        drop(decoder);
         *frame.lock().unwrap() = VideoFrame::default();
         if session_result.is_ok() {
             message(&shared, "Disconnected");
