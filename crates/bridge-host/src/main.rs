@@ -15,13 +15,14 @@ mod app {
             Preset, VideoSettings, built_in_presets, load_custom_presets, negotiate,
             save_custom_presets,
         },
+        diagnostics::Diagnostics,
         discovery::Advertiser,
         protocol::{Control, MediaKind, PORT, VERSION, receive_json, send_json, send_media},
         security::{authenticate_host, server_endpoint},
     };
     use gpui::{
-        App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*,
-        px, rgb, size,
+        App, Application, Bounds, Context, MouseButton, ResizeEdge, Window, WindowBounds,
+        WindowDecorations, WindowOptions, bounds, div, point, prelude::*, px, rgb, size,
     };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -44,16 +45,44 @@ mod app {
         dropped: u64,
         bytes: u64,
         show_codecs: bool,
+        show_logs: bool,
+        diagnostics: Arc<Diagnostics>,
     }
 
     fn set_message(state: &Arc<Mutex<State>>, message: impl Into<String>) {
+        let message = message.into();
         if let Ok(mut state) = state.lock() {
-            state.message = message.into();
+            state.diagnostics.record("host", &message);
+            state.message = message;
         }
     }
 
     struct HostView {
         state: Arc<Mutex<State>>,
+    }
+
+    fn resize_from_border(event: &gpui::MouseDownEvent, window: &mut Window) {
+        let point = event.position;
+        let size = window.window_bounds().get_bounds().size;
+        let border = px(7.0);
+        let left = point.x < border;
+        let right = point.x > size.width - border;
+        let top = point.y < border;
+        let bottom = point.y > size.height - border;
+        let edge = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(ResizeEdge::TopLeft),
+            (_, true, true, _) => Some(ResizeEdge::TopRight),
+            (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+            (_, true, _, true) => Some(ResizeEdge::BottomRight),
+            (true, _, _, _) => Some(ResizeEdge::Left),
+            (_, true, _, _) => Some(ResizeEdge::Right),
+            (_, _, true, _) => Some(ResizeEdge::Top),
+            (_, _, _, true) => Some(ResizeEdge::Bottom),
+            _ => None,
+        };
+        if let Some(edge) = edge {
+            window.start_window_resize(edge);
+        }
     }
 
     fn setting_button(
@@ -74,6 +103,10 @@ mod app {
             .on_click(cx.listener(move |_, _, _, cx| {
                 if let Ok(mut state) = shared.lock() {
                     action(&mut state);
+                    if label != "Save custom preset" {
+                        state.message = format!("{label} updated · applies on the next connection");
+                    }
+                    state.diagnostics.record("settings", &state.message);
                 }
                 cx.notify();
             }))
@@ -98,7 +131,17 @@ mod app {
                         .px_3()
                         .py_2()
                         .rounded_md()
-                        .bg(rgb(0x263248))
+                        .bg(rgb(if index == state.selected {
+                            0x31658e
+                        } else {
+                            0x263248
+                        }))
+                        .border_1()
+                        .border_color(rgb(if index == state.selected {
+                            0x6fd3ff
+                        } else {
+                            0x344158
+                        }))
                         .cursor_pointer()
                         .child(label)
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -107,6 +150,10 @@ mod app {
                                 state.settings = state.presets[index].settings.clone();
                                 state.message =
                                     "Preset selected. It applies to the next connection.".into();
+                                state.diagnostics.record(
+                                    "settings",
+                                    format!("Selected {} preset", state.presets[index].name),
+                                );
                             }
                             cx.notify();
                         }))
@@ -143,6 +190,7 @@ mod app {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(setting_button(
                                 "Rotate",
@@ -169,6 +217,7 @@ mod app {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(setting_button(
                                 "Bitrate −",
@@ -214,6 +263,7 @@ mod app {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(setting_button(
                                 "Cycle codec mode",
@@ -243,6 +293,7 @@ mod app {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(setting_button(
                                 "Toggle VSync",
@@ -274,45 +325,155 @@ mod app {
             } else {
                 div()
             };
+            let logs = if state.show_logs {
+                div()
+                    .id("host-logs-scroll")
+                    .h(px(130.0))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(0x0d1420))
+                    .text_sm()
+                    .child(format!(
+                        "File: {}",
+                        state
+                            .diagnostics
+                            .path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "unavailable".into())
+                    ))
+                    .children(
+                        state
+                            .diagnostics
+                            .recent()
+                            .into_iter()
+                            .map(|line| div().child(line)),
+                    )
+            } else {
+                div().id("host-logs-empty")
+            };
+            let logs_toggle = div()
+                .id("logs-menu")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x28354b))
+                .cursor_pointer()
+                .child(if state.show_logs {
+                    "Logs ▴"
+                } else {
+                    "Logs ▾"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Ok(mut state) = this.state.lock() {
+                        state.show_logs = !state.show_logs;
+                    }
+                    cx.notify();
+                }));
             div()
                 .size_full()
-                .p_5()
+                .min_h_0()
+                .on_mouse_down(MouseButton::Left, |event, window, _| {
+                    resize_from_border(event, window)
+                })
                 .bg(rgb(0x141c2b))
+                .border_1()
+                .border_color(rgb(0x36465f))
                 .text_color(rgb(0xf2f5fb))
                 .flex()
                 .flex_col()
-                .gap_3()
-                .child(div().text_xl().child("AirBridge · Mac host"))
-                .child(format!("Connect from Linux with PIN {}", state.pin))
-                .child(format!(
-                    "{}×{} · {} fps · video only",
-                    state.settings.width, state.settings.height, state.settings.fps,
-                ))
-                .child(div().flex().gap_2().children(presets))
                 .child(
                     div()
-                        .id("codec-menu")
+                        .h(px(42.0))
                         .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x35517a))
-                        .cursor_pointer()
-                        .child("Codec settings ▾")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Ok(mut state) = this.state.lock() {
-                                state.show_codecs = !state.show_codecs;
-                            }
-                            cx.notify();
-                        })),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .bg(rgb(0x1d2940))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child("AIRBRIDGE  ·  HOST")
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.start_window_move()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("minimize")
+                                .px_2()
+                                .cursor_pointer()
+                                .child("−")
+                                .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
+                        )
+                        .child(
+                            div()
+                                .id("close")
+                                .px_2()
+                                .cursor_pointer()
+                                .child("×")
+                                .on_click(cx.listener(|_, _, window, _| window.remove_window())),
+                        ),
                 )
-                .child(codec_panel)
-                .child(format!("Status: {}", state.message))
-                .child(format!(
-                    "Frames: {} · dropped: {} · sent: {:.1} MB",
-                    state.frames,
-                    state.dropped,
-                    state.bytes as f64 / 1_000_000.0
-                ))
+                .child(
+                    div()
+                        .id("host-settings-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xa8b8cf))
+                                .child("PAIRING PIN"),
+                        )
+                        .child(div().text_xl().child(state.pin.clone()))
+                        .child(format!(
+                            "{}×{} · {} fps · video only",
+                            state.settings.width, state.settings.height, state.settings.fps
+                        ))
+                        .child(logs_toggle)
+                        .child(logs)
+                        .child(div().flex().flex_wrap().gap_2().children(presets))
+                        .child(
+                            div()
+                                .id("codec-menu")
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x35517a))
+                                .cursor_pointer()
+                                .child(if state.show_codecs {
+                                    "Settings ▴"
+                                } else {
+                                    "Settings ▾"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Ok(mut state) = this.state.lock() {
+                                        state.show_codecs = !state.show_codecs;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(codec_panel)
+                        .child(
+                            div()
+                                .rounded_md()
+                                .p_2()
+                                .bg(rgb(0x203149))
+                                .child(format!("Status: {}", state.message)),
+                        )
+                        .child(format!(
+                            "Sent {} frames · {} capture drops · {:.1} MB",
+                            state.frames,
+                            state.dropped,
+                            state.bytes as f64 / 1_000_000.0
+                        )),
+                )
         }
     }
 
@@ -403,6 +564,9 @@ mod app {
         .await?;
         if let Ok(mut state) = shared.lock() {
             state.settings = settings.clone();
+            state.frames = 0;
+            state.dropped = 0;
+            state.bytes = 0;
         }
         let mut media_send = connection.open_uni().await?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -421,14 +585,20 @@ mod app {
         let capture_task = tokio::task::spawn_blocking(move || {
             mac::capture(settings_capture, option, tx, stop_capture, dropped_capture)
         });
-        loop {
-            tokio::select! {
+        let session_result: Result<()> = async {
+            loop {
+                tokio::select! {
                 packet = rx.recv() => {
                     let Some(packet) = packet else { break; };
                     send_media(&mut media_send, &packet.header, &packet.bytes).await?;
                     if let Ok(mut state) = shared.lock() {
                         state.bytes += packet.bytes.len() as u64;
-                        if matches!(packet.header.kind, MediaKind::Video) { state.frames += 1; }
+                        if matches!(packet.header.kind, MediaKind::Video) {
+                            state.frames += 1;
+                            if state.frames == 1 || state.frames % 120 == 0 {
+                                state.diagnostics.record("host", format!("Sent {} video frames, {:.1} MB", state.frames, state.bytes as f64 / 1_000_000.0));
+                            }
+                        }
                         state.dropped = dropped.load(Ordering::Relaxed);
                     }
                 }
@@ -442,11 +612,15 @@ mod app {
                         Err(_) => break,
                     }
                 }
+                }
             }
-        }
+            Ok(())
+        }.await;
         stop.store(true, Ordering::Relaxed);
-        capture_task.await??;
+        let capture_result = capture_task.await?;
         let _ = media_send.finish();
+        session_result?;
+        capture_result?;
         Ok(())
     }
 
@@ -466,6 +640,8 @@ mod app {
             dropped: 0,
             bytes: 0,
             show_codecs: false,
+            show_logs: false,
+            diagnostics: Arc::new(Diagnostics::new("host")),
         }));
         let server_state = state.clone();
         std::thread::spawn(move || {
@@ -474,10 +650,26 @@ mod app {
             }
         });
         Application::new().run(move |cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(740.0), px(600.0)), cx);
+            let widget_size = size(px(390.0), px(470.0));
+            let bounds = cx
+                .primary_display()
+                .map(|display| {
+                    let area = display.bounds();
+                    bounds(
+                        point(
+                            area.origin.x + area.size.width - widget_size.width - px(20.0),
+                            area.origin.y + px(70.0),
+                        ),
+                        widget_size,
+                    )
+                })
+                .unwrap_or_else(|| Bounds::centered(None, widget_size, cx));
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: None,
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_min_size: Some(size(px(330.0), px(280.0))),
                     ..Default::default()
                 },
                 |_, cx| {

@@ -48,8 +48,13 @@ pub fn browse() -> Result<mpsc::Receiver<DiscoveredHost>> {
                 let mut addresses: Vec<_> = info
                     .get_addresses()
                     .iter()
-                    .map(|ip| SocketAddr::new(ip.to_ip_addr(), info.get_port()))
+                    .map(|ip| ip.to_ip_addr())
+                    .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
+                    .map(|ip| SocketAddr::new(ip, info.get_port()))
                     .collect();
+                if addresses.is_empty() {
+                    continue;
+                }
                 addresses.sort_by_key(|address| !address.is_ipv4());
                 if send
                     .send(DiscoveredHost {

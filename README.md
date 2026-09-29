@@ -10,13 +10,31 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust, FFmpeg, and the libraries required by GPUI for Wayland or X11. On Fedora, install the build dependencies and FFmpeg through your configured repositories, then run:
+The Linux viewer needs Rust, FFmpeg, and the development libraries required by GPUI for Wayland and X11. In particular, the linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). Install them on the **Linux viewer machine**:
+
+```sh
+# Fedora
+sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel
+
+# Ubuntu / Debian
+sudo apt install libxkbcommon-dev libxkbcommon-x11-dev
+```
+
+Install FFmpeg and any remaining GPUI build dependencies through your distribution's package manager, then run:
 
 ```sh
 cargo run -p bridge-viewer --release
 ```
 
 Start the Mac host, then start the viewer. Select the discovered Mac, type the PIN shown in the host window, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
+
+### App launchers
+
+On macOS, run `./scripts/package-macos.sh` to build `dist/AirBridge Host.app`. Open the bundle from Finder and drag it into the Dock if desired. macOS may ask for Screen Recording permission on the first launch; restart the app after granting it.
+
+On Linux, run `./scripts/install-linux.sh` to build and install the viewer into `~/.local/bin` with an `AirBridge Viewer` application launcher in `~/.local/share/applications`. Launch it from your desktop environment's application menu. The script installs for the current user and does not require root.
+
+The Linux viewer opens two independent windows: a resizable video window and a compact controls widget. The widget can be moved by dragging its header, resized at its edges, minimized, or closed. Use **Controls** in the video window to reopen it. Use **Show display window** in the widget to reopen the video window. Both widgets have an expandable **Logs** section; messages also go to the terminal and to the log file whose path is shown there.
 
 ## Settings
 

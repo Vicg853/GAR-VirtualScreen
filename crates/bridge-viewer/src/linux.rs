@@ -1,20 +1,20 @@
 use anyhow::{Context, Result};
+use bridge_core::diagnostics::Diagnostics;
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Default)]
 pub struct VideoFrame {
     pub image: Option<Arc<RenderImage>>,
     pub frames: u64,
-    pub dropped: u64,
     pub error: Option<String>,
 }
 
@@ -28,56 +28,74 @@ impl VideoDecoder {
         width: u32,
         height: u32,
         target: Arc<Mutex<VideoFrame>>,
-        update: UnboundedSender<()>,
-        hardware_preferred: bool,
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Self> {
         let mut command = Command::new("ffmpeg");
-        command.args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-        ]);
-        if hardware_preferred {
-            command.args(["-hwaccel", "auto"]);
-        }
+        // `-fflags nobuffer` discards H.264 packets during probing on a pipe.
+        // Keep the decoder independent from the host encoder's acceleration choice.
+        command.args(["-hide_banner", "-loglevel", "warning", "-f", "h264"]);
         let mut child = command
             .args([
-                "-f", "h264", "-i", "pipe:0", "-an", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1",
+                "-i", "pipe:0", "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context(
                 "FFmpeg is required for H.264 decoding; install it from your Linux package manager",
             )?;
         let mut stdin = child.stdin.take().context("Cannot feed the decoder")?;
         let mut stdout = child.stdout.take().context("Cannot read decoded frames")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Cannot read FFmpeg diagnostics")?;
+        let diagnostic_output = diagnostics.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) if !line.is_empty() => diagnostic_output.record("FFmpeg", line),
+                    Ok(_) => {}
+                    Err(error) => {
+                        diagnostic_output.record("FFmpeg", format!("stderr: {error}"));
+                        break;
+                    }
+                }
+            }
+        });
         let child = Arc::new(Mutex::new(child));
         let (send, receive) = mpsc::sync_channel::<Vec<u8>>(3);
         let target_writer = target.clone();
+        let diagnostic_writer = diagnostics.clone();
         thread::spawn(move || {
             while let Ok(packet) = receive.recv() {
-                if stdin.write_all(&packet).is_err() {
-                    target_writer.lock().unwrap().error = Some("Video decoder stopped".into());
+                if let Err(error) = stdin.write_all(&packet) {
+                    let message = format!("Decoder input stopped: {error}");
+                    diagnostic_writer.record("decoder", &message);
+                    target_writer.lock().unwrap().error = Some(message);
                     break;
                 }
             }
         });
+        let diagnostic_reader = diagnostics.clone();
+        let target_reader = target.clone();
         thread::spawn(move || {
             let Some(frame_size) = (width as usize)
                 .checked_mul(height as usize)
                 .and_then(|pixels| pixels.checked_mul(4))
             else {
+                diagnostic_reader.record("decoder", "Invalid decoded frame dimensions");
                 return;
             };
             while frame_size <= 7680 * 4320 * 4 {
                 let mut bytes = vec![0; frame_size];
-                if stdout.read_exact(&mut bytes).is_err() {
+                if let Err(error) = stdout.read_exact(&mut bytes) {
+                    let message = format!("Decoded frame output stopped: {error}");
+                    diagnostic_reader.record("decoder", &message);
+                    if let Ok(mut target) = target_reader.lock() {
+                        target.error = Some(message);
+                    }
                     break;
                 }
                 if let Some(buffer) = RgbaImage::from_raw(width, height, bytes) {
@@ -85,8 +103,11 @@ impl VideoDecoder {
                     if let Ok(mut target) = target.lock() {
                         target.image = Some(image);
                         target.frames += 1;
+                        if target.frames == 1 || target.frames % 120 == 0 {
+                            diagnostic_reader
+                                .record("decoder", format!("Decoded {} frames", target.frames));
+                        }
                     }
-                    let _ = update.send(());
                 }
             }
         });
@@ -94,9 +115,23 @@ impl VideoDecoder {
     }
 
     pub fn submit(&self, packet: Vec<u8>) -> Result<()> {
-        self.input
-            .try_send(packet)
-            .map_err(|_| anyhow::anyhow!("Decoder is busy or has stopped"))
+        let started = Instant::now();
+        let mut packet = packet;
+        loop {
+            match self.input.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("Decoder input has stopped")
+                }
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    if started.elapsed() > Duration::from_secs(5) {
+                        anyhow::bail!("Decoder has not accepted a frame for five seconds")
+                    }
+                    packet = returned;
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
     }
 }
 
