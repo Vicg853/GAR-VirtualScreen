@@ -44,6 +44,8 @@ On Linux, run `./scripts/install-linux.sh` to build and install the viewer into 
 
 The Linux viewer opens two independent windows: a resizable video window and a compact controls widget. The widget can be moved by dragging its header, resized at its edges, minimized, or closed. Use **Controls** in the video window to reopen it. Use **Show display window** in the widget to reopen the video window. Both widgets have an expandable **Logs** section; messages also go to the terminal and to the log file whose path is shown there.
 
+The viewer keeps one compressed packet waiting for the decoder and one decoded frame waiting for the video window. If decoding outruns painting, the older unpainted frame is skipped. The previous GPUI image is explicitly removed from its GPU atlas when a new frame replaces it. The widget reports the skipped-frame count so an overloaded viewer is visible.
+
 ## Settings
 
 The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.

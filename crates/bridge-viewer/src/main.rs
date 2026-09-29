@@ -18,9 +18,11 @@ mod app {
     };
     use gpui::{
         App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, ObjectFit,
-        ResizeEdge, Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, bounds,
-        div, img, point, prelude::*, px, rgb, size,
+        RenderImage, ResizeEdge, Window, WindowBounds, WindowDecorations, WindowHandle,
+        WindowOptions, bounds, div, img, point, prelude::*, px, rgb, size,
     };
+    use image::{Frame, RgbaImage};
+    use smallvec::smallvec;
     use std::{
         cell::RefCell,
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -93,6 +95,7 @@ mod app {
         commands: mpsc::UnboundedSender<Command>,
         windows: Rc<RefCell<UiWindows>>,
         last_frame: u64,
+        atlas_image: Option<Arc<RenderImage>>,
         rendered: bool,
     }
 
@@ -134,7 +137,23 @@ mod app {
                     );
                 }
             }
-            let image = self.frame.lock().ok().and_then(|frame| frame.image.clone());
+            let image = self.frame.lock().ok().and_then(|mut frame| {
+                if let Some(bytes) = frame.pending.take() {
+                    if let Some(buffer) = RgbaImage::from_raw(frame.width, frame.height, bytes) {
+                        frame.image =
+                            Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])));
+                    }
+                }
+                frame.image.clone()
+            });
+            if self.atlas_image.as_ref().map(|image| image.id)
+                != image.as_ref().map(|image| image.id)
+            {
+                if let Some(old) = self.atlas_image.take() {
+                    cx.drop_image(old, Some(window));
+                }
+                self.atlas_image = image.clone();
+            }
             let content = if let Some(image) = image {
                 div()
                     .size_full()
@@ -240,6 +259,7 @@ mod app {
             let state = self.state.lock().unwrap().clone();
             let frame = self.frame.lock().unwrap();
             let decoded = frame.frames;
+            let skipped = frame.skipped;
             let frame_error = frame.error.clone();
             drop(frame);
             let hosts = state
@@ -585,7 +605,7 @@ mod app {
                             cx.notify();
                         })))
                     .child(codec_panel)
-                    .child(format!("Received {} · decoded {} · {:.1} MB{}", state.received_frames, decoded, state.bytes as f64 / 1_000_000.0,
+                    .child(format!("Received {} · decoded {} · skipped {} · {:.1} MB{}", state.received_frames, decoded, skipped, state.bytes as f64 / 1_000_000.0,
                         frame_error.map(|e| format!(" · {e}")).unwrap_or_default())))
         }
     }
@@ -719,6 +739,7 @@ mod app {
                     commands,
                     windows,
                     last_frame: 0,
+                    atlas_image: None,
                     rendered: false,
                 });
                 let weak = view.downgrade();

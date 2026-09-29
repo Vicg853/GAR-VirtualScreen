@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use bridge_core::diagnostics::Diagnostics;
 use gpui::RenderImage;
-use image::{Frame, RgbaImage};
-use smallvec::smallvec;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
@@ -14,7 +12,11 @@ use std::{
 #[derive(Default)]
 pub struct VideoFrame {
     pub image: Option<Arc<RenderImage>>,
+    pub pending: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
     pub frames: u64,
+    pub skipped: u64,
     pub error: Option<String>,
 }
 
@@ -30,6 +32,16 @@ impl VideoDecoder {
         target: Arc<Mutex<VideoFrame>>,
         diagnostics: Arc<Diagnostics>,
     ) -> Result<Self> {
+        let frame_size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|size| *size > 0 && *size <= 7680 * 4320 * 4)
+            .context("Unsupported decoded frame dimensions")?;
+        {
+            let mut frame = target.lock().unwrap();
+            frame.width = width;
+            frame.height = height;
+        }
         let mut command = Command::new("ffmpeg");
         // `-fflags nobuffer` discards H.264 packets during probing on a pipe.
         // Keep the decoder independent from the host encoder's acceleration choice.
@@ -65,7 +77,9 @@ impl VideoDecoder {
             }
         });
         let child = Arc::new(Mutex::new(child));
-        let (send, mut receive) = tokio::sync::mpsc::channel::<Vec<u8>>(3);
+        // Keep at most one compressed access unit waiting for FFmpeg. H.264
+        // packets must stay ordered, so apply backpressure instead of dropping them.
+        let (send, mut receive) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let target_writer = target.clone();
         let diagnostic_writer = diagnostics.clone();
         thread::spawn(move || {
@@ -81,15 +95,8 @@ impl VideoDecoder {
         let diagnostic_reader = diagnostics.clone();
         let target_reader = target.clone();
         thread::spawn(move || {
-            let Some(frame_size) = (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
-            else {
-                diagnostic_reader.record("decoder", "Invalid decoded frame dimensions");
-                return;
-            };
-            while frame_size <= 7680 * 4320 * 4 {
-                let mut bytes = vec![0; frame_size];
+            let mut bytes = vec![0; frame_size];
+            loop {
                 if let Err(error) = stdout.read_exact(&mut bytes) {
                     let message = format!("Decoded frame output stopped: {error}");
                     diagnostic_reader.record("decoder", &message);
@@ -98,17 +105,23 @@ impl VideoDecoder {
                     }
                     break;
                 }
-                if let Some(buffer) = RgbaImage::from_raw(width, height, bytes) {
-                    let image = Arc::new(RenderImage::new(smallvec![Frame::new(buffer)]));
-                    if let Ok(mut target) = target.lock() {
-                        target.image = Some(image);
-                        target.frames += 1;
-                        if target.frames == 1 || target.frames % 120 == 0 {
-                            diagnostic_reader
-                                .record("decoder", format!("Decoded {} frames", target.frames));
-                        }
+                let (previous, frames, skipped) = if let Ok(mut target) = target_reader.lock() {
+                    let previous = target.pending.replace(bytes);
+                    if previous.is_some() {
+                        target.skipped += 1;
                     }
+                    target.frames += 1;
+                    (previous, target.frames, target.skipped)
+                } else {
+                    break;
+                };
+                if frames == 1 || frames % 120 == 0 {
+                    diagnostic_reader.record(
+                        "decoder",
+                        format!("Decoded {frames} frames; skipped {skipped} before display"),
+                    );
                 }
+                bytes = previous.unwrap_or_else(|| vec![0; frame_size]);
             }
         });
         Ok(Self { input: send, child })
