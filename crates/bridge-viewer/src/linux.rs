@@ -46,9 +46,11 @@ impl VideoDecoder {
         // `-fflags nobuffer` discards H.264 packets during probing on a pipe.
         // Keep the decoder independent from the host encoder's acceleration choice.
         command.args(["-hide_banner", "-loglevel", "warning", "-f", "h264"]);
+        // GPUI RenderImage stores pixels as BGRA. Request that layout directly
+        // so image construction does not reinterpret RGBA bytes and swap red/blue.
         let mut child = command
             .args([
-                "-i", "pipe:0", "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+                "-i", "pipe:0", "-an", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
