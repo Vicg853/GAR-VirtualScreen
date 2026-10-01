@@ -1,7 +1,11 @@
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(not(target_os = "linux"))]
+#[path = "unsupported.rs"]
 mod linux;
 
 mod app {
-    use super::linux::{VideoDecoder, VideoFrame};
+    use super::linux::{VideoFrame, VideoWindow};
     use anyhow::{Result, bail};
     use bridge_core::{
         config::{
@@ -17,16 +21,12 @@ mod app {
         security::{authenticate_viewer, client_endpoint},
     };
     use gpui::{
-        App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, ObjectFit,
-        RenderImage, ResizeEdge, Window, WindowBounds, WindowDecorations, WindowHandle,
-        WindowOptions, bounds, div, img, point, prelude::*, px, rgb, size,
+        App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, ResizeEdge,
+        Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, bounds, div, point,
+        prelude::*, px, rgb, size,
     };
-    use image::{Frame, RgbaImage};
-    use smallvec::smallvec;
     use std::{
-        cell::RefCell,
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        rc::Rc,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -77,25 +77,9 @@ mod app {
     struct ViewerView {
         state: Arc<Mutex<State>>,
         frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         commands: mpsc::UnboundedSender<Command>,
         focus: FocusHandle,
-        windows: Rc<RefCell<UiWindows>>,
-        rendered: bool,
-    }
-
-    #[derive(Default)]
-    struct UiWindows {
-        controls: Option<WindowHandle<ViewerView>>,
-        video: Option<WindowHandle<VideoView>>,
-    }
-
-    struct VideoView {
-        state: Arc<Mutex<State>>,
-        frame: Arc<Mutex<VideoFrame>>,
-        commands: mpsc::UnboundedSender<Command>,
-        windows: Rc<RefCell<UiWindows>>,
-        last_frame: u64,
-        atlas_image: Option<Arc<RenderImage>>,
         rendered: bool,
     }
 
@@ -120,97 +104,6 @@ mod app {
         };
         if let Some(edge) = edge {
             window.start_window_resize(edge);
-        }
-    }
-
-    impl Render for VideoView {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            if !self.rendered {
-                self.rendered = true;
-                if let Ok(state) = self.state.lock() {
-                    state.diagnostics.record(
-                        "ui",
-                        format!(
-                            "Video window rendering at {:?}",
-                            window.window_bounds().get_bounds()
-                        ),
-                    );
-                }
-            }
-            let image = self.frame.lock().ok().and_then(|mut frame| {
-                if let Some(bytes) = frame.pending.take() {
-                    if let Some(buffer) = RgbaImage::from_raw(frame.width, frame.height, bytes) {
-                        frame.image =
-                            Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])));
-                    }
-                }
-                frame.image.clone()
-            });
-            if self.atlas_image.as_ref().map(|image| image.id)
-                != image.as_ref().map(|image| image.id)
-            {
-                if let Some(old) = self.atlas_image.take() {
-                    cx.drop_image(old, Some(window));
-                }
-                self.atlas_image = image.clone();
-            }
-            let content = if let Some(image) = image {
-                div()
-                    .size_full()
-                    .child(img(image).object_fit(ObjectFit::Contain).size_full())
-            } else {
-                let message = self
-                    .state
-                    .lock()
-                    .map(|state| state.message.clone())
-                    .unwrap_or_default();
-                div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(format!("Waiting for the Mac display · {message}"))
-            };
-            div()
-                .size_full()
-                .bg(rgb(0x05080d))
-                .text_color(rgb(0xf2f5fb))
-                .child(content)
-                .child(
-                    div()
-                        .id("open-controls")
-                        .absolute()
-                        .top_2()
-                        .right_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x203149))
-                        .cursor_pointer()
-                        .child("Controls")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(handle) = this.windows.borrow().controls {
-                                if handle
-                                    .update(cx, |_, window, _| window.activate_window())
-                                    .is_ok()
-                                {
-                                    return;
-                                }
-                            }
-                            match open_controls(
-                                cx,
-                                this.state.clone(),
-                                this.frame.clone(),
-                                this.commands.clone(),
-                                this.windows.clone(),
-                            ) {
-                                Ok(handle) => this.windows.borrow_mut().controls = Some(handle),
-                                Err(error) => {
-                                    message(&this.state, format!("Cannot reopen controls: {error}"))
-                                }
-                            }
-                        })),
-                )
         }
     }
 
@@ -260,6 +153,7 @@ mod app {
             let frame = self.frame.lock().unwrap();
             let decoded = frame.frames;
             let skipped = frame.skipped;
+            let decoder = frame.decoder.clone();
             let frame_error = frame.error.clone();
             drop(frame);
             let hosts = state
@@ -347,7 +241,7 @@ mod app {
                     .p_2()
                     .rounded_md()
                     .bg(rgb(0x28354b))
-                    .child("Decoder: FFmpeg hardware auto, software fallback")
+                    .child("Decoder: Vulkan Video when supported, software fallback")
                     .child("Codec: H.264")
                     .child(format!(
                         "Codec preference: {:?}",
@@ -588,13 +482,10 @@ mod app {
                             .on_click(cx.listener(|this, _, _, _| { let _ = this.commands.send(Command::Disconnect); }))))
                     .child(div().id("show-display").px_3().py_2().rounded_md().bg(rgb(0x28354b)).cursor_pointer().child("Show display window")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(handle) = this.windows.borrow().video {
-                                if handle.update(cx, |_, window, _| window.activate_window()).is_ok() { return; }
+                            if let Err(error) = this.video_window.show() {
+                                message(&this.state, format!("Cannot show display: {error:#}"));
                             }
-                            match open_video(cx, this.state.clone(), this.frame.clone(), this.commands.clone(), this.windows.clone()) {
-                                Ok(handle) => this.windows.borrow_mut().video = Some(handle),
-                                Err(error) => message(&this.state, format!("Cannot reopen display: {error}")),
-                            }
+                            cx.notify();
                         })))
                     .child(div().text_sm().text_color(rgb(0xa8b8cf)).child("PRESETS · next connection"))
                     .child(div().flex().flex_wrap().gap_2().children(presets))
@@ -605,7 +496,7 @@ mod app {
                             cx.notify();
                         })))
                     .child(codec_panel)
-                    .child(format!("Received {} · decoded {} · skipped {} · {:.1} MB{}", state.received_frames, decoded, skipped, state.bytes as f64 / 1_000_000.0,
+                    .child(format!("Received {} · decoded {} · skipped {} · {} · {:.1} MB{}", state.received_frames, decoded, skipped, if decoder.is_empty() { "decoder initializing" } else { decoder.as_str() }, state.bytes as f64 / 1_000_000.0,
                         frame_error.map(|e| format!(" · {e}")).unwrap_or_default())))
         }
     }
@@ -644,8 +535,8 @@ mod app {
         cx: &mut App,
         state: Arc<Mutex<State>>,
         frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         commands: mpsc::UnboundedSender<Command>,
-        windows: Rc<RefCell<UiWindows>>,
     ) -> Result<WindowHandle<ViewerView>> {
         let widget_size = size(px(400.0), px(540.0));
         let bounds = cx
@@ -677,96 +568,11 @@ mod app {
                 let view = cx.new(|_| ViewerView {
                     state,
                     frame,
+                    video_window,
                     commands,
                     focus,
-                    windows,
                     rendered: false,
                 });
-                let weak = view.downgrade();
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(250))
-                            .await;
-                        if weak.update(cx, |_, cx| cx.notify()).is_err() {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-                view
-            },
-        )?;
-        Ok(handle)
-    }
-
-    fn open_video(
-        cx: &mut App,
-        state: Arc<Mutex<State>>,
-        frame: Arc<Mutex<VideoFrame>>,
-        commands: mpsc::UnboundedSender<Command>,
-        windows: Rc<RefCell<UiWindows>>,
-    ) -> Result<WindowHandle<VideoView>> {
-        let bounds = cx
-            .primary_display()
-            .and_then(|display| {
-                let area = display.bounds();
-                if area.size.width < px(1100.0) {
-                    return None;
-                }
-                let video_size = size(
-                    (area.size.width - px(460.0)).min(px(1300.0)),
-                    (area.size.height - px(130.0)).min(px(850.0)),
-                );
-                Some(bounds(
-                    point(area.origin.x + px(20.0), area.origin.y + px(70.0)),
-                    video_size,
-                ))
-            })
-            .unwrap_or_else(|| Bounds::centered(None, size(px(960.0), px(640.0)), cx));
-        let handle = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(320.0), px(200.0))),
-                app_id: Some("airbridge-viewer".into()),
-                ..Default::default()
-            },
-            |window, cx| {
-                window.set_window_title("AirBridge Video");
-                let view = cx.new(|_| VideoView {
-                    state,
-                    frame,
-                    commands,
-                    windows,
-                    last_frame: 0,
-                    atlas_image: None,
-                    rendered: false,
-                });
-                let weak = view.downgrade();
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(16))
-                            .await;
-                        if weak
-                            .update(cx, |view, cx| {
-                                let current = view
-                                    .frame
-                                    .lock()
-                                    .map(|frame| frame.frames)
-                                    .unwrap_or_default();
-                                if current != view.last_frame {
-                                    view.last_frame = current;
-                                    cx.notify();
-                                }
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                })
-                .detach();
                 let weak = view.downgrade();
                 cx.spawn(async move |cx| {
                     loop {
@@ -788,6 +594,7 @@ mod app {
     fn run_network(
         shared: Arc<Mutex<State>>,
         frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         mut commands: mpsc::UnboundedReceiver<Command>,
     ) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -802,6 +609,7 @@ mod app {
                         settings,
                         shared.clone(),
                         frame.clone(),
+                        video_window.clone(),
                         &mut commands,
                     )
                     .await
@@ -816,18 +624,25 @@ mod app {
 
     async fn receive_video_lane(
         mut media_recv: quinn::RecvStream,
-        settings: VideoSettings,
         shared: Arc<Mutex<State>>,
-        frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         events: mpsc::UnboundedSender<LaneNotice>,
     ) -> Result<()> {
-        let diagnostics = shared.lock().unwrap().diagnostics.clone();
-        let decoder = VideoDecoder::new(settings.width, settings.height, frame, diagnostics)?;
         let mut first_frame = true;
         loop {
             let (header, bytes) = receive_media(&mut media_recv).await?;
-            if !matches!(header.kind, MediaKind::Video) {
+            if !matches!(&header.kind, MediaKind::Video) {
                 bail!("The video lane received a non-video packet");
+            }
+            if !(320..=7680).contains(&header.width)
+                || !(240..=4320).contains(&header.height)
+                || (header.width as u64) * (header.height as u64) > 7680 * 4320
+            {
+                bail!(
+                    "Host sent unsupported video dimensions {}×{}",
+                    header.width,
+                    header.height
+                );
             }
             if let Ok(mut state) = shared.lock() {
                 state.bytes += bytes.len() as u64;
@@ -843,7 +658,7 @@ mod app {
                     );
                 }
             }
-            decoder.submit(bytes).await?;
+            video_window.submit(bytes, header.keyframe).await?;
             if first_frame {
                 first_frame = false;
                 let _ = events.send(LaneNotice::FirstFrame);
@@ -853,9 +668,8 @@ mod app {
 
     async fn receive_lanes(
         connection: quinn::Connection,
-        settings: VideoSettings,
         shared: Arc<Mutex<State>>,
-        frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         events: mpsc::UnboundedSender<LaneNotice>,
     ) {
         let mut tasks = tokio::task::JoinSet::new();
@@ -865,8 +679,7 @@ mod app {
                 incoming = connection.accept_uni() => {
                     let Ok(mut stream) = incoming else { break; };
                     let shared = shared.clone();
-                    let frame = frame.clone();
-                    let settings = settings.clone();
+                    let video_window = video_window.clone();
                     let events = events.clone();
                     let video_active = video_active.clone();
                     tasks.spawn(async move {
@@ -878,7 +691,7 @@ mod app {
                                     return (MediaLane::Video, Err(anyhow::anyhow!("Duplicate video lane")));
                                 }
                                 let _ = events.send(LaneNotice::Opened(MediaLane::Video));
-                                let result = receive_video_lane(stream, settings, shared, frame, events).await;
+                                let result = receive_video_lane(stream, shared, video_window, events).await;
                                 video_active.store(false, Ordering::Release);
                                 (MediaLane::Video, result)
                             }
@@ -915,6 +728,7 @@ mod app {
         settings: Option<VideoSettings>,
         shared: Arc<Mutex<State>>,
         frame: Arc<Mutex<VideoFrame>>,
+        video_window: VideoWindow,
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<()> {
         let settings = settings.map(|mut settings| {
@@ -964,7 +778,15 @@ mod app {
             Control::Error(text) => bail!("Host: {text}"),
             _ => bail!("Host sent an invalid response"),
         };
-        *frame.lock().unwrap() = VideoFrame::default();
+        actual.validate()?;
+        video_window.reset(actual.width, actual.height).await?;
+        if let Ok(mut frame) = frame.lock() {
+            frame.width = actual.width;
+            frame.height = actual.height;
+            frame.frames = 0;
+            frame.skipped = 0;
+            frame.error = None;
+        }
         if let Ok(mut state) = shared.lock() {
             state.bytes = 0;
             state.received_frames = 0;
@@ -972,7 +794,7 @@ mod app {
         message(
             &shared,
             format!(
-                "Negotiated {:?} {:?}; FFmpeg software decode",
+                "Negotiated host encoder {:?} {:?}; viewer decoder selected locally",
                 option.codec, option.acceleration
             ),
         );
@@ -986,9 +808,8 @@ mod app {
         let (lane_events, mut lane_notices) = mpsc::unbounded_channel();
         let mut lane_task = tokio::spawn(receive_lanes(
             connection.clone(),
-            actual,
             shared.clone(),
-            frame.clone(),
+            video_window.clone(),
             lane_events,
         ));
         let mut watchdog = tokio::time::interval(Duration::from_secs(3));
@@ -1001,7 +822,7 @@ mod app {
                     let decoded = frame.lock().map(|frame| frame.frames).unwrap_or_default();
                     let received = shared.lock().map(|state| state.received_frames).unwrap_or_default();
                     if received > last_received && decoded == last_decoded && received > 1 {
-                        message(&shared, format!("Decoder stalled: received {received}, decoded {decoded}. Open Logs for FFmpeg details."));
+                        message(&shared, format!("Decoder stalled: received {received}, decoded {decoded}. Open Logs for decoder details."));
                     }
                     last_received = received;
                     last_decoded = decoded;
@@ -1047,7 +868,14 @@ mod app {
         lane_task.abort();
         let _ = lane_task.await;
         connection.close(0u32.into(), b"viewer disconnected");
-        *frame.lock().unwrap() = VideoFrame::default();
+        let _ = video_window.reset(0, 0).await;
+        if let Ok(mut frame) = frame.lock() {
+            frame.width = 0;
+            frame.height = 0;
+            frame.frames = 0;
+            frame.skipped = 0;
+            frame.error = None;
+        }
         if session_result.is_ok() {
             message(&shared, "Disconnected");
         }
@@ -1077,11 +905,28 @@ mod app {
             received_frames: 0,
         }));
         let frame = Arc::new(Mutex::new(VideoFrame::default()));
+        let video_window =
+            match VideoWindow::spawn(frame.clone(), state.lock().unwrap().diagnostics.clone()) {
+                Ok(window) => window,
+                Err(error) => {
+                    message(&state, format!("Display backend unavailable: {error:#}"));
+                    VideoWindow::unavailable(
+                        format!("Display backend unavailable: {error:#}"),
+                        frame.clone(),
+                    )
+                }
+            };
         let (send, receive) = mpsc::unbounded_channel();
         let network_state = state.clone();
         let network_frame = frame.clone();
+        let network_video_window = video_window.clone();
         std::thread::spawn(move || {
-            if let Err(error) = run_network(network_state.clone(), network_frame, receive) {
+            if let Err(error) = run_network(
+                network_state.clone(),
+                network_frame,
+                network_video_window,
+                receive,
+            ) {
                 message(&network_state, format!("Network error: {error:#}"));
             }
         });
@@ -1110,30 +955,19 @@ mod app {
             Err(error) => message(&browse_state, format!("Discovery unavailable: {error}")),
         });
         Application::new().run(move |cx: &mut App| {
-            let windows = Rc::new(RefCell::new(UiWindows::default()));
-            let video = open_video(
-                cx,
-                state.clone(),
-                frame.clone(),
-                send.clone(),
-                windows.clone(),
-            )
-            .expect("Cannot open AirBridge video window");
-            windows.borrow_mut().video = Some(video);
             let controls = open_controls(
                 cx,
                 state.clone(),
                 frame.clone(),
+                video_window.clone(),
                 send.clone(),
-                windows.clone(),
             )
             .expect("Cannot open AirBridge controls");
-            windows.borrow_mut().controls = Some(controls);
-            state
-                .lock()
-                .unwrap()
-                .diagnostics
-                .record("viewer", "Video and controls windows opened");
+            let _ = controls;
+            state.lock().unwrap().diagnostics.record(
+                "viewer",
+                "Independent native video window and GPUI controls opened",
+            );
             cx.activate(true);
         });
     }

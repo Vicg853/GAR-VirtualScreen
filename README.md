@@ -10,17 +10,17 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust, FFmpeg, and the development libraries required by GPUI for Wayland and X11. In particular, the linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). Install them on the **Linux viewer machine**:
+The Linux viewer needs Rust and the development libraries required by GPUI for Wayland and X11. The linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). VA-API support also uses bindgen at build time, so install `libclang`'s development package. Install these on the **Linux viewer machine**:
 
 ```sh
 # Fedora
-sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel
+sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel clang-devel
 
 # Ubuntu / Debian
-sudo apt install libxkbcommon-dev libxkbcommon-x11-dev
+sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libclang-dev
 ```
 
-Install FFmpeg and any remaining GPUI build dependencies through your distribution's package manager, then run:
+Then run:
 
 ```sh
 cargo run -p bridge-viewer --release
@@ -44,21 +44,22 @@ On Linux, run `./scripts/install-linux.sh` to build and install the viewer into 
 
 The Linux viewer opens two independent windows: a resizable video window and a compact controls widget. The widget can be moved by dragging its header, resized at its edges, minimized, or closed. Use **Controls** in the video window to reopen it. Use **Show display window** in the widget to reopen the video window. Both widgets have an expandable **Logs** section; messages also go to the terminal and to the log file whose path is shown there.
 
-The viewer keeps one compressed packet waiting for the decoder and one decoded frame waiting for the video window. If decoding outruns painting, the older unpainted frame is skipped. The previous GPUI image is explicitly removed from its GPU atlas when a new frame replaces it. The widget reports the skipped-frame count so an overloaded viewer is visible.
+The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
 
 ## Settings
 
 The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
 
-The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently advertises VideoToolbox H.264 hardware preferred and software modes. The viewer currently uses FFmpeg software decoding while continuous video delivery is being validated. The common codec ranking already describes the intended order: hardware AV1, hardware H.264, software AV1, then software H.264. A codec is advertised only after its implementation is available.
+The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently sends H.264. On Linux, the viewer probes hardware decoders in this order: NVIDIA NVDEC, VA-API (commonly Intel and AMD), then V4L2 (embedded SoCs). If none can open the stream, it uses OpenH264 software decoding. Hardware decoding and display rendering are separate choices: Vulkan DMA-BUF import can keep supported VA-API frames on the GPU, while unsupported imports and NVDEC CUDA frames currently use the decoder's CPU readback path before GPU presentation.
 
 ## Current limits
 
 - The virtual display uses macOS's private `CGVirtualDisplay` API. It can change between macOS releases and does not suit Mac App Store distribution.
 - Only one viewer and one virtual display are active at a time.
-- The video viewer currently moves decoded frames through system memory into GPUI's GPU image renderer. Direct Vulkan or DMA buffer import is still to be implemented.
+- Linux H.264 decode uses NVDEC, VA-API, or V4L2 when available, with OpenH264 software fallback. AV1 is not yet negotiated by the host/viewer stream, even though NVDEC support exists in the backend dependency.
+- Linux VA-API DMA-BUF frames can be imported into Vulkan for GPU rendering when the decoder and presentation GPU/driver support sharing the exported surface. NVIDIA NVDEC is hardware accelerated, but its CUDA output currently requires a CPU readback before wgpu presentation.
 - The current media path uses an ordered QUIC stream. Packet loss can delay later frames. Independent video frame streams or datagrams are a future latency improvement.
-- AV1 is represented in negotiation but has no encoder or decoder path yet.
+- The common codec ranking still describes future negotiation preference; this session currently streams H.264 only.
 - The VSync setting is stored with presets; explicit display presentation control is not wired to it yet.
 - The Linux build and a two machine streaming session still need validation on Fedora hardware. The viewer has been compiled and launched on macOS to check the shared Rust and GPUI code paths.
 
