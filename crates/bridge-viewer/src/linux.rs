@@ -441,9 +441,7 @@ impl ApplicationHandler<VideoEvent> for VideoApp {
 }
 
 fn initialize_wgpu_renderer(window: &Arc<Window>) -> Result<(Renderer, String, bool)> {
-    let instance = wgpu::Instance::new(
-        &wgpu::InstanceDescriptor::new_without_display_handle(),
-    );
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let surface = instance
         .create_surface(window.clone())
         .context("Cannot create the GPU display surface")?;
@@ -1085,7 +1083,7 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        output.present();
+        self.queue.present(output);
         if reconfigure {
             self.surface.configure(&self.device, &self.configuration);
         }
