@@ -110,6 +110,10 @@ impl VideoWindow {
         self.send_event(VideoEvent::Show)
     }
 
+    pub fn close(&self) -> Result<()> {
+        self.send_event(VideoEvent::Close)
+    }
+
     pub async fn reset(&self, width: u32, height: u32) -> Result<()> {
         self.send_input(VideoInput::Reset { width, height }).await
     }
@@ -148,6 +152,7 @@ impl VideoWindow {
 enum VideoEvent {
     Wake,
     Show,
+    Close,
 }
 
 #[derive(Debug)]
@@ -384,7 +389,7 @@ impl ApplicationHandler<VideoEvent> for VideoApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VideoEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: VideoEvent) {
         match event {
             VideoEvent::Wake => {}
             VideoEvent::Show => {
@@ -393,6 +398,7 @@ impl ApplicationHandler<VideoEvent> for VideoApp {
                     window.focus_window();
                 }
             }
+            VideoEvent::Close => event_loop.exit(),
         }
     }
 

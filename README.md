@@ -30,7 +30,7 @@ cargo run -p bridge-viewer --release
 
 Start the Mac host, then start the viewer. Select the discovered Mac, type the PIN shown in the host window, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
 
-The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, control stays available while independent media lanes start. Video uses its own labeled QUIC stream and async sender/receiver tasks. The viewer can disconnect or receive video-lane errors without waiting on capture. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because this change advances the wire protocol to version 2. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
+The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 3. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
 
 The host's video-only path uses CoreGraphics display streams, so it does not construct a ScreenCaptureKit stream. ScreenCaptureKit initialized a CoreAudio clock even with audio capture disabled and stalled for about 150 seconds on one Mac. The CoreGraphics display-stream API is marked obsolete by the macOS 15+ SDK and may be removed in a future macOS release; the host reports a visible error if this API is unavailable.
 
@@ -48,19 +48,27 @@ The Linux viewer opens two independent windows: a resizable video window and a c
 
 The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
 
+## Wire protocol v3
+
+The viewer opens one bidirectional control stream after TLS/PIN authentication and sends a versioned `ClientHello` with supported codec options and optional initial settings. The host replies with the primary screen's complete `ScreenConfig`. Later control messages are typed and role-specific: add, change settings, remove, status, stats, and scoped errors. Requests carry request IDs; errors and acknowledgements echo them when applicable.
+
+Each `ScreenConfig` has a stable session-local screen ID, a monotonically increasing settings revision, a stream generation, the screen name, negotiated codec, and full video settings. Settings edits apply immediately: the host rebuilds only that screen's capture/encoder pipeline and increments its generation. The viewer resets only that screen's decoder. Media from an older generation is discarded, so delayed packets cannot be mistaken for the replacement stream.
+
+Every media QUIC stream starts with a `MediaStreamHello` containing the protocol version, screen ID, generation, and lane (`video`, `audio`, `input`, or `output`). Video packets repeat their screen ID and generation in `MediaHeader`, along with sequence, timestamp, keyframe, and frame metadata. This gives the receiver enough information to validate channel identity and reject stale or mismatched packets. The control stream carries per-screen capture status and periodic sent-frame, drop, and bitrate statistics; media payload never shares the control stream.
+
 ## Settings
 
-The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect on the next connection. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
+The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer overrides the host's selection for that connection. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect immediately on the selected screen after its media pipeline restarts. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
 
 The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently sends H.264. On Linux, the viewer probes hardware decoders in this order: NVIDIA NVDEC, VA-API (commonly Intel and AMD), then V4L2 (embedded SoCs). If none can open the stream, it uses OpenH264 software decoding. Hardware decoding and display rendering are separate choices: Vulkan DMA-BUF import can keep supported VA-API frames on the GPU, while unsupported imports and NVDEC CUDA frames currently use the decoder's CPU readback path before GPU presentation.
 
 ## Current limits
 
 - The virtual display uses macOS's private `CGVirtualDisplay` API. It can change between macOS releases and does not suit Mac App Store distribution.
-- Only one viewer and one virtual display are active at a time.
+- One viewer can connect at a time. Each session supports up to eight independently configured screen streams.
 - Linux H.264 decode uses NVDEC, VA-API, or V4L2 when available, with OpenH264 software fallback. AV1 is not yet negotiated by the host/viewer stream, even though NVDEC support exists in the backend dependency.
 - Linux VA-API DMA-BUF frames can be imported into Vulkan for GPU rendering when the decoder and presentation GPU/driver support sharing the exported surface. NVIDIA NVDEC is hardware accelerated, but its CUDA output currently requires a CPU readback before wgpu presentation.
-- The current media path uses an ordered QUIC stream. Packet loss can delay later frames. Independent video frame streams or datagrams are a future latency improvement.
+- Each screen/lane currently uses an ordered QUIC stream. Packet loss can delay later frames within that lane, while other lanes continue independently. QUIC datagrams or frame-level retransmission policy are future latency improvements.
 - The common codec ranking still describes future negotiation preference; this session currently streams H.264 only.
 - The VSync setting is stored with presets; explicit display presentation control is not wired to it yet.
 - The Linux build and a two machine streaming session still need validation on Fedora hardware. The viewer has been compiled and launched on macOS to check the shared Rust and GPUI code paths.

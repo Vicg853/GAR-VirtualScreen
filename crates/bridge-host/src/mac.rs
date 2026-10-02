@@ -191,6 +191,8 @@ pub fn available_codecs() -> Vec<CodecOption> {
 }
 
 pub fn capture(
+    screen_id: u32,
+    generation: u64,
     settings: VideoSettings,
     option: CodecOption,
     output: mpsc::Sender<EncodedPacket>,
@@ -330,6 +332,8 @@ pub fn capture(
                 }
                 (
                     MediaHeader {
+                        screen_id,
+                        generation,
                         kind: MediaKind::Video,
                         sequence,
                         timestamp_us,

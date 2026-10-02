@@ -37,6 +37,10 @@ impl VideoWindow {
         bail!("{}", self.message)
     }
 
+    pub fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
     pub async fn reset(&self, _width: u32, _height: u32) -> Result<()> {
         bail!("{}", self.message)
     }
