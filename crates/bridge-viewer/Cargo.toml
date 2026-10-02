@@ -19,4 +19,4 @@ hang = "0.21.8"
 moq-net = "0.3.7"
 moq-video = { version = "0.1.7", default-features = false, features = ["nvidia", "openh264", "render", "vaapi", "v4l2"] }
 pollster = "0.4"
-winit = { version = "0.30", default-features = false, features = ["wayland", "x11"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "x11"] }

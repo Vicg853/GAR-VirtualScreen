@@ -10,15 +10,17 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust and the development libraries required by GPUI for Wayland and X11. The linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). VA-API support also uses bindgen at build time, so install `libclang`'s development package. Install these on the **Linux viewer machine**:
+The Linux viewer needs Rust and the development libraries required by GPUI for Wayland and X11. The linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). VA-API bindings are generated with bindgen, which needs both `libclang` and Clang's builtin resource headers (including `stddef.h`). Install matching Clang packages on the **Linux viewer machine**:
 
 ```sh
 # Fedora
-sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel clang-devel
+sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel clang clang-devel clang-resource-filesystem
 
 # Ubuntu / Debian
-sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libclang-dev
+sudo apt install libxkbcommon-dev libxkbcommon-x11-dev clang libclang-dev
 ```
+
+If `LIBCLANG_PATH` is set to a custom LLVM installation, unset it or point it at the same LLVM version that provides the Clang resource headers. Check that Clang can locate its builtin headers with `clang -print-resource-dir` and that the printed directory contains `include/stddef.h`.
 
 Then run:
 

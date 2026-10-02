@@ -441,7 +441,9 @@ impl ApplicationHandler<VideoEvent> for VideoApp {
 }
 
 fn initialize_wgpu_renderer(window: &Arc<Window>) -> Result<(Renderer, String, bool)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(
+        &wgpu::InstanceDescriptor::new_without_display_handle(),
+    );
     let surface = instance
         .create_surface(window.clone())
         .context("Cannot create the GPU display surface")?;
@@ -449,6 +451,7 @@ fn initialize_wgpu_renderer(window: &Arc<Window>) -> Result<(Renderer, String, b
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: Some(&surface),
         force_fallback_adapter: false,
+        ..Default::default()
     };
     let adapter = match pollster::block_on(instance.request_adapter(&adapter_options)) {
         Ok(adapter) => adapter,
@@ -591,7 +594,12 @@ fn decode_loop(
                 let frames = backend
                     .decoder
                     .decode(&payload, timestamp, keyframe)
-                    .map(|frames| frames.into_iter().map(DecodedFrame::Video).collect())
+                    .map(|frames| {
+                        frames
+                            .into_iter()
+                            .map(DecodedFrame::Video)
+                            .collect::<Vec<_>>()
+                    })
                     .map_err(|error| anyhow!(error));
                 match frames {
                     Ok(frames) => {
@@ -804,6 +812,7 @@ impl Renderer {
         let configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
@@ -1011,14 +1020,25 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(());
         }
-        let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+        let (output, reconfigure) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output) => (output, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(output) => (output, true),
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.configuration);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(error) => return Err(anyhow!(error)),
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.configuration);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(anyhow!(
+                    "GPU reported a validation error while acquiring the display surface"
+                ));
+            }
         };
         let view = output
             .texture
@@ -1066,6 +1086,9 @@ impl Renderer {
         }
         self.queue.submit(Some(encoder.finish()));
         output.present();
+        if reconfigure {
+            self.surface.configure(&self.device, &self.configuration);
+        }
         Ok(())
     }
 }
