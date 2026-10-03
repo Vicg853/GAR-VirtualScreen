@@ -10,6 +10,8 @@ pub struct VideoFrame {
     pub skipped: u64,
     pub decoder: String,
     pub error: Option<String>,
+    pub closed: bool,
+    pub user_closed: bool,
 }
 
 #[derive(Clone)]
@@ -23,6 +25,7 @@ impl VideoWindow {
         diagnostics.record("video-window", message);
         if let Ok(mut frame) = target.lock() {
             frame.error = Some(message.into());
+            frame.closed = true;
         }
         Ok(Self {
             message: message.into(),
@@ -32,6 +35,8 @@ impl VideoWindow {
     pub fn unavailable(message: String, _target: Arc<Mutex<VideoFrame>>) -> Self {
         Self { message }
     }
+
+    pub fn shutdown_backend() {}
 
     pub fn show(&self) -> Result<()> {
         bail!("{}", self.message)

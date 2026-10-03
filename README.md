@@ -1,6 +1,6 @@
 # AirBridge
 
-AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video, and sends it over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, and shows the result in a GPUI window. Audio is temporarily disabled while the display path is being tested. If a session requests audio, the host shows a soft warning and continues video-only. Input sharing is outside this project's current scope.
+AirBridge is a native Mac to Linux extended display experiment. The Mac host creates a virtual display, captures its video, and sends it over an encrypted QUIC connection. The viewer discovers the host on the local network, authenticates with a six digit PIN, decodes the video, and shows each stream in its own native video window. Audio is temporarily disabled while the display path is being tested. If a session requests audio, the host shows a soft warning and continues video-only. Input sharing is outside this project's current scope.
 
 ## Build
 
@@ -44,7 +44,9 @@ The packaging script uses ad hoc signing by default, so rebuilding can invalidat
 
 On Linux, run `./scripts/install-linux.sh` to build and install the viewer into `~/.local/bin` with an `AirBridge Viewer` application launcher in `~/.local/share/applications`. Launch it from your desktop environment's application menu. The script installs for the current user and does not require root.
 
-The Linux viewer opens two independent windows: a resizable video window and a compact controls widget. The widget can be moved by dragging its header, resized at its edges, minimized, or closed. Use **Controls** in the video window to reopen it. Use **Show display window** in the widget to reopen the video window. Both widgets have an expandable **Logs** section; messages also go to the terminal and to the log file whose path is shown there.
+The Linux viewer opens a compact GPUI controls widget and an independent native video window for each screen. Select a screen row to open its details; **← Stream list** returns to the list while preserving the selection highlight. **Add stream** is available in the connected list. Settings, presets, statistics, logs, **Show display window**, **Restart/Retry stream**, and **Remove stream** belong to that screen's details. Before connecting, host selection, address/PIN entry, and next-connection settings are shown; while connecting, **Cancel connection** is shown; during a session, **Disconnect all streams** is shown.
+
+Closing a native video window removes that screen on the host. Removing a screen on the host closes its viewer window. A video lane failure closes its display and keeps its control row available for retry or removal. The primary screen can be removed too; an empty screen list remains connected and can add screens again. Closing the controls widget quits the app and tears down the whole session. Widgets can be dragged by the header, resized at the edges, and minimized. **Show display window** brings an existing live window to the front. Both widgets have expandable **Logs** sections; messages also go to the terminal and the displayed log file.
 
 The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
 
@@ -55,6 +57,14 @@ The viewer opens one bidirectional control stream after TLS/PIN authentication a
 Each `ScreenConfig` has a stable session-local screen ID, a monotonically increasing settings revision, a stream generation, the screen name, negotiated codec, and full video settings. Settings edits apply immediately: the host rebuilds only that screen's capture/encoder pipeline and increments its generation. The viewer resets only that screen's decoder. Media from an older generation is discarded, so delayed packets cannot be mistaken for the replacement stream.
 
 Every media QUIC stream starts with a `MediaStreamHello` containing the protocol version, screen ID, generation, and lane (`video`, `audio`, `input`, or `output`). Video packets repeat their screen ID and generation in `MediaHeader`, along with sequence, timestamp, keyframe, and frame metadata. This gives the receiver enough information to validate channel identity and reject stale or mismatched packets. The control stream carries per-screen capture status and periodic sent-frame, drop, and bitrate statistics; media payload never shares the control stream.
+
+## Lifecycle and cleanup
+
+Control frames are read by a persistent reader task so another event winning `select!` cannot discard a partial message. Clean media FIN is distinguished from a truncated packet. Video notifications and statistics are generation-scoped; late events cannot close a replacement stream. Removed screen IDs are remembered until the session ends, so a delayed settings acknowledgement cannot recreate a deleted screen. Viewer settings revisions are captured with each edit, and an older acknowledgement cannot overwrite a newer pending edit.
+
+Explicit disconnect, transport loss, control EOF or malformed control data, and app quit all close local video windows, cancel media tasks and pending screen operations, and reset session UI state. Host capture guards signal cancellation on drop. Host media workers are supervised so an unexpected task panic becomes a screen/generation-scoped failure; viewer receiver guards similarly report a panic and unregister the affected lane. Host transport closure is sent before waiting for macOS capture cleanup. Closing a receiving lane wakes the sender even when there are no video packets. Screen removal wins over queued restarts and returns selected-screen navigation to the list. Duplicate removal requests are rejected, and failed requests are shown with per-screen feedback.
+
+All Linux video windows share one winit event loop, with separate decoders, renderers and bounded frame queues. Destroying a display closes its queues and releases its frame and GPU resources. Discovery handles host updates/removals and stops on app quit. Audio/input/output lanes remain reserved and unsupported; they are rejected without closing a valid video lane.
 
 ## Settings
 

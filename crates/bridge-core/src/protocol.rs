@@ -181,6 +181,40 @@ pub async fn receive_json<R: AsyncRead + Unpin, T: DeserializeOwned>(stream: &mu
     serde_json::from_slice(&data).context("Invalid control message")
 }
 
+/// Own framing in one persistent task: cancelling a select branch must never
+/// discard a partially read control message. The bounded queue supplies backpressure.
+pub fn control_reader<R, T>(
+    mut stream: R,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<T>>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    T: DeserializeOwned + Send + 'static,
+{
+    let (send, receive) = tokio::sync::mpsc::channel(16);
+    let task = tokio::spawn(async move {
+        loop {
+            let message = receive_json(&mut stream).await;
+            let ended = message.is_err();
+            if send.send(message).await.is_err() || ended {
+                break;
+            }
+        }
+    });
+    (receive, task)
+}
+
+pub async fn send_control<W: AsyncWrite + Unpin, T: Serialize>(
+    stream: &mut W,
+    value: &T,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), send_json(stream, value))
+        .await
+        .context("Control channel write timed out")?
+}
+
 pub async fn send_media<W: AsyncWrite + Unpin>(
     stream: &mut W,
     header: &MediaHeader,
@@ -206,9 +240,110 @@ pub async fn receive_media<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(Medi
     Ok((header, data))
 }
 
+/// A FIN between packets is a graceful lane end; a FIN inside a packet is an error.
+pub async fn receive_media_or_end<R: AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Option<(MediaHeader, Vec<u8>)>> {
+    let mut length = [0; 4];
+    if stream.read(&mut length[..1]).await? == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut length[1..]).await?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_CONTROL {
+        bail!("Media header exceeds size limit");
+    }
+    let mut header = vec![0; length];
+    stream.read_exact(&mut header).await?;
+    let header = serde_json::from_slice(&header).context("Invalid media header")?;
+    let length = stream.read_u32().await? as usize;
+    if length > MAX_MEDIA {
+        bail!("Media packet exceeds size limit");
+    }
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload).await?;
+    Ok(Some((header, payload)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn control_framing_survives_other_ready_select_branches() {
+        let (mut writer, reader) = tokio::io::duplex(4);
+        let (mut messages, task) = control_reader::<_, ClientMessage>(reader);
+        let writing = tokio::spawn(async move {
+            for value in [
+                ClientMessage::Stop,
+                ClientMessage::RemoveScreen {
+                    request_id: 19,
+                    screen_id: 3,
+                },
+            ] {
+                let data = serde_json::to_vec(&value).unwrap();
+                let packet = [u32::to_be_bytes(data.len() as u32).as_slice(), &data].concat();
+                for byte in packet {
+                    writer.write_all(&[byte]).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let mut messages_seen = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while messages_seen.len() < 2 {
+                tokio::select! {
+                    value = messages.recv() => messages_seen.push(value.unwrap().unwrap()),
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(messages_seen[0], ClientMessage::Stop));
+        assert!(matches!(
+            messages_seen[1],
+            ClientMessage::RemoveScreen {
+                request_id: 19,
+                screen_id: 3
+            }
+        ));
+        assert!(messages.recv().await.unwrap().is_err());
+        writing.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_fin_is_clean_only_between_complete_packets() {
+        let header = MediaHeader {
+            screen_id: 2,
+            generation: 4,
+            kind: MediaKind::Video,
+            sequence: 1,
+            timestamp_us: 0,
+            keyframe: true,
+            width: 1920,
+            height: 1080,
+            sample_rate: 0,
+            channels: 0,
+        };
+        let mut encoded = Vec::new();
+        send_media(&mut encoded, &header, b"frame").await.unwrap();
+        let mut reader = encoded.as_slice();
+        let (decoded, data) = receive_media_or_end(&mut reader).await.unwrap().unwrap();
+        assert_eq!(decoded.generation, 4);
+        assert_eq!(data, b"frame");
+        assert!(receive_media_or_end(&mut reader).await.unwrap().is_none());
+        for end in [1, 3, encoded.len() - 1] {
+            assert!(receive_media_or_end(&mut &encoded[..end]).await.is_err());
+        }
+        let oversized = u32::to_be_bytes(MAX_CONTROL as u32 + 1);
+        assert!(
+            receive_media_or_end(&mut oversized.as_slice())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn settings_requests_keep_screen_revision_and_request_identity() {

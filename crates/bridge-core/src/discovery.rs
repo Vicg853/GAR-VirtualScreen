@@ -1,7 +1,16 @@
 use crate::protocol::PORT;
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::{net::SocketAddr, sync::mpsc, thread};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 const SERVICE: &str = "_airbridge._udp.local.";
 
@@ -38,12 +47,51 @@ impl Drop for Advertiser {
     }
 }
 
-pub fn browse() -> Result<mpsc::Receiver<DiscoveredHost>> {
+#[derive(Clone, Debug)]
+pub enum DiscoveryEvent {
+    Found(DiscoveredHost),
+    Lost(String),
+}
+
+pub struct DiscoveryBrowser {
+    receive: mpsc::Receiver<DiscoveryEvent>,
+    cancel: Arc<AtomicBool>,
+    task: Option<thread::JoinHandle<()>>,
+}
+impl DiscoveryBrowser {
+    pub fn recv_timeout(
+        &self,
+        duration: Duration,
+    ) -> std::result::Result<DiscoveryEvent, mpsc::RecvTimeoutError> {
+        self.receive.recv_timeout(duration)
+    }
+}
+impl Drop for DiscoveryBrowser {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+pub fn browse(cancel: Arc<AtomicBool>) -> Result<DiscoveryBrowser> {
     let daemon = ServiceDaemon::new()?;
     let events = daemon.browse(SERVICE)?;
     let (send, receive) = mpsc::channel();
-    thread::spawn(move || {
-        while let Ok(event) = events.recv() {
+    let worker_cancel = cancel.clone();
+    let task = thread::spawn(move || {
+        while !worker_cancel.load(Ordering::Acquire) {
+            let event = match events.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => event,
+                Err(mdns_sd::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            };
+            if let ServiceEvent::ServiceRemoved(_, name) = &event
+                && send.send(DiscoveryEvent::Lost(name.clone())).is_err()
+            {
+                break;
+            }
             if let ServiceEvent::ServiceResolved(info) = event {
                 let mut addresses: Vec<_> = info
                     .get_addresses()
@@ -57,17 +105,24 @@ pub fn browse() -> Result<mpsc::Receiver<DiscoveredHost>> {
                 }
                 addresses.sort_by_key(|address| !address.is_ipv4());
                 if send
-                    .send(DiscoveredHost {
+                    .send(DiscoveryEvent::Found(DiscoveredHost {
                         name: info.get_fullname().to_owned(),
                         addresses,
-                    })
+                    }))
                     .is_err()
                 {
                     break;
                 }
             }
         }
-        let _ = daemon.shutdown();
+        let _ = daemon.stop_browse(SERVICE);
+        if let Ok(stopped) = daemon.shutdown() {
+            let _ = stopped.recv_timeout(Duration::from_secs(1));
+        }
     });
-    Ok(receive)
+    Ok(DiscoveryBrowser {
+        receive,
+        cancel,
+        task: Some(task),
+    })
 }

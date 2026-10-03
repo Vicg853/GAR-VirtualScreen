@@ -6,7 +6,12 @@ use moq_net::Timestamp;
 use moq_video::{Frame as DecodedVideoFrame, decode, render};
 use render::wgpu;
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -31,6 +36,21 @@ pub struct VideoFrame {
     pub skipped: u64,
     pub decoder: String,
     pub error: Option<String>,
+    pub closed: bool,
+    pub user_closed: bool,
+}
+
+static DISPLAY_PROXY: OnceLock<std::result::Result<EventLoopProxy<VideoEvent>, String>> =
+    OnceLock::new();
+
+struct WindowLease {
+    proxy: EventLoopProxy<VideoEvent>,
+    id: u64,
+}
+impl Drop for WindowLease {
+    fn drop(&mut self) {
+        let _ = self.proxy.send_event(VideoEvent::Close(self.id));
+    }
 }
 
 #[derive(Clone)]
@@ -38,60 +58,77 @@ pub struct VideoWindow {
     input: async_mpsc::Sender<VideoInput>,
     proxy: Option<EventLoopProxy<VideoEvent>>,
     unavailable: Option<String>,
+    id: u64,
+    _lease: Option<Arc<WindowLease>>,
 }
 
 impl VideoWindow {
     pub fn spawn(target: Arc<Mutex<VideoFrame>>, diagnostics: Arc<Diagnostics>) -> Result<Self> {
-        let (input, input_rx) = async_mpsc::channel(1);
-        let (proxy_tx, proxy_rx) =
-            mpsc::sync_channel::<std::result::Result<EventLoopProxy<VideoEvent>, String>>(1);
-        let thread_target = target.clone();
-        let thread_diagnostics = diagnostics.clone();
-        thread::Builder::new()
-            .name("airbridge-video-window".into())
-            .spawn(move || {
-                let mut builder = EventLoop::<VideoEvent>::with_user_event();
-                winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
-                    &mut builder,
-                    true,
-                );
-                winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
-                let event_loop = match builder.build() {
-                    Ok(event_loop) => event_loop,
-                    Err(error) => {
-                        let message = format!("Cannot initialize Linux video window: {error}");
-                        thread_diagnostics.record("video-window", &message);
-                        record_error(&thread_target, message.clone());
-                        let _ = proxy_tx.send(Err(message));
-                        return;
-                    }
-                };
-                let proxy = event_loop.create_proxy();
-                if proxy_tx.send(Ok(proxy.clone())).is_err() {
-                    return;
-                }
-                let mut app = VideoApp::new(
-                    input_rx,
-                    thread_target.clone(),
-                    thread_diagnostics.clone(),
-                    proxy,
-                );
-                if let Err(error) = event_loop.run_app(&mut app) {
-                    let message = format!("Video window event loop stopped: {error}");
-                    thread_diagnostics.record("video-window", &message);
-                    record_error(&thread_target, message);
-                }
+        // Winit permits one event loop per process. All independent displays
+        // share that event loop while keeping their own renderer and decoder.
+        static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
+        let proxy = DISPLAY_PROXY
+            .get_or_init(|| {
+                let (send, receive) = mpsc::sync_channel(1);
+                thread::Builder::new()
+                    .name("airbridge-display-events".into())
+                    .spawn(move || {
+                        let mut builder = EventLoop::<VideoEvent>::with_user_event();
+                        winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+                            &mut builder,
+                            true,
+                        );
+                        winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(
+                            &mut builder,
+                            true,
+                        );
+                        let event_loop = match builder.build() {
+                            Ok(event_loop) => event_loop,
+                            Err(error) => {
+                                let _ = send.send(Err(format!(
+                                    "Cannot initialize display events: {error}"
+                                )));
+                                return;
+                            }
+                        };
+                        let proxy = event_loop.create_proxy();
+                        if send.send(Ok(proxy.clone())).is_err() {
+                            return;
+                        }
+                        let mut manager = DisplayManager {
+                            apps: HashMap::new(),
+                            proxy,
+                        };
+                        if let Err(error) = event_loop.run_app(&mut manager) {
+                            for app in manager.apps.values() {
+                                app.report_error(format!("Display event loop stopped: {error}"));
+                            }
+                        }
+                    })
+                    .map_err(|error| format!("Cannot start display events: {error}"))?;
+                receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|error| format!("Display event startup failed: {error}"))?
             })
-            .context("Cannot start the native video-window thread")?;
-
-        let proxy = proxy_rx
-            .recv_timeout(Duration::from_secs(10))
-            .context("Timed out initializing the native video window")?
-            .map_err(|error| anyhow!(error))?;
+            .as_ref()
+            .map_err(|error| anyhow!("{error}"))?
+            .clone();
+        let (input, input_rx) = async_mpsc::channel(1);
+        let id = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+        proxy
+            .send_event(VideoEvent::Create {
+                id,
+                input_rx,
+                target,
+                diagnostics,
+            })
+            .map_err(|_| anyhow!("The display event loop has stopped"))?;
         Ok(Self {
             input,
-            proxy: Some(proxy),
+            proxy: Some(proxy.clone()),
             unavailable: None,
+            id,
+            _lease: Some(Arc::new(WindowLease { proxy, id })),
         })
     }
 
@@ -103,15 +140,23 @@ impl VideoWindow {
             input,
             proxy: None,
             unavailable: Some(message),
+            id: 0,
+            _lease: None,
+        }
+    }
+
+    pub fn shutdown_backend() {
+        if let Some(Ok(proxy)) = DISPLAY_PROXY.get() {
+            let _ = proxy.send_event(VideoEvent::Shutdown);
         }
     }
 
     pub fn show(&self) -> Result<()> {
-        self.send_event(VideoEvent::Show)
+        self.send_event(VideoEvent::Show(self.id))
     }
 
     pub fn close(&self) -> Result<()> {
-        self.send_event(VideoEvent::Close)
+        self.send_event(VideoEvent::Close(self.id))
     }
 
     pub async fn reset(&self, width: u32, height: u32) -> Result<()> {
@@ -150,9 +195,16 @@ impl VideoWindow {
 }
 
 enum VideoEvent {
+    Create {
+        id: u64,
+        input_rx: async_mpsc::Receiver<VideoInput>,
+        target: Arc<Mutex<VideoFrame>>,
+        diagnostics: Arc<Diagnostics>,
+    },
     Wake,
-    Show,
-    Close,
+    Show(u64),
+    Close(u64),
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -314,6 +366,9 @@ impl VideoApp {
     fn report_error(&self, message: String) {
         self.diagnostics.record("video-window", &message);
         record_error(&self.target, message);
+        if let Ok(mut target) = self.target.lock() {
+            target.closed = true;
+        }
     }
 
     fn pump_input(&mut self) {
@@ -381,68 +436,150 @@ impl VideoApp {
     }
 }
 
-impl ApplicationHandler<VideoEvent> for VideoApp {
+struct DisplayManager {
+    apps: HashMap<u64, VideoApp>,
+    proxy: EventLoopProxy<VideoEvent>,
+}
+
+impl ApplicationHandler<VideoEvent> for DisplayManager {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        self.initialize(event_loop);
-        if let Some(window) = &self.window {
-            window.set_visible(true);
+        for app in self.apps.values_mut() {
+            app.initialize(event_loop);
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: VideoEvent) {
         match event {
-            VideoEvent::Wake => {}
-            VideoEvent::Show => {
-                if let Some(window) = &self.window {
+            VideoEvent::Create {
+                id,
+                input_rx,
+                target,
+                diagnostics,
+            } => {
+                let mut app = VideoApp::new(input_rx, target, diagnostics, self.proxy.clone());
+                app.initialize(event_loop);
+                if app.renderer.is_some() && app.decoder_tx.is_some() {
+                    self.apps.insert(id, app);
+                }
+            }
+            VideoEvent::Show(id) => {
+                if let Some(window) = self.apps.get(&id).and_then(|app| app.window.as_ref()) {
                     window.set_visible(true);
                     window.focus_window();
                 }
             }
-            VideoEvent::Close => event_loop.exit(),
+            VideoEvent::Close(id) => {
+                self.apps.remove(&id);
+            }
+            VideoEvent::Shutdown => {
+                self.apps.clear();
+                event_loop.exit();
+            }
+            VideoEvent::Wake => {}
         }
     }
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self
-            .window
-            .as_ref()
-            .filter(|window| window.id() == window_id)
+        let Some(id) = self
+            .apps
+            .iter()
+            .find(|(_, app)| {
+                app.window
+                    .as_ref()
+                    .is_some_and(|window| window.id() == window_id)
+            })
+            .map(|(id, _)| *id)
         else {
             return;
         };
+        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+            if let Some(app) = self.apps.remove(&id) {
+                if let Ok(mut target) = app.target.lock() {
+                    target.user_closed = true;
+                }
+                app.diagnostics.record(
+                    "video-window",
+                    "Display closed by the viewer; removing its host screen",
+                );
+            }
+            return;
+        }
+        let Some(app) = self.apps.get_mut(&id) else {
+            return;
+        };
         match event {
-            WindowEvent::CloseRequested => window.set_visible(false),
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut self.renderer {
+                if let Some(renderer) = &mut app.renderer {
                     renderer.resize(size);
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(renderer) = &mut self.renderer {
+                if let (Some(renderer), Some(window)) = (&mut app.renderer, &app.window) {
                     renderer.resize(window.inner_size());
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut self.renderer {
-                    if let Err(error) = renderer.render(self.latest_frame.as_ref()) {
-                        self.report_error(format!("Video presentation failed: {error:#}"));
+                if let Some(renderer) = &mut app.renderer {
+                    if let Err(error) = renderer.render(app.latest_frame.as_ref()) {
+                        app.report_error(format!("Video presentation failed: {error:#}"));
                     }
                 }
             }
-            WindowEvent::Destroyed => event_loop.exit(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.pump_input();
-        self.collect_decoded();
+        self.apps.retain(|_, app| {
+            !app.target
+                .lock()
+                .map(|target| target.closed)
+                .unwrap_or(true)
+        });
+        for app in self.apps.values_mut() {
+            app.pump_input();
+            app.collect_decoded();
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
+    }
+}
+
+impl Drop for VideoApp {
+    fn drop(&mut self) {
+        self.input_rx.close();
+        self.pending_input = None;
+        self.decoded_rx = None;
+        self.decoder_tx = None;
+        self.latest_frame = None;
+        self.renderer = None;
+        self.window = None;
+        if let Ok(mut target) = self.target.lock() {
+            target.closed = true;
+        }
+        self.diagnostics
+            .record("video-window", "Display, frame queues and decoder released");
+    }
+}
+
+// A fatal decoder exit wakes the window manager and closes the receiving lane.
+struct DecoderExit {
+    target: Arc<Mutex<VideoFrame>>,
+    proxy: EventLoopProxy<VideoEvent>,
+}
+impl Drop for DecoderExit {
+    fn drop(&mut self) {
+        if let Ok(mut target) = self.target.lock() {
+            if !target.closed && target.error.is_none() {
+                target.error = Some("The decoder worker stopped".into());
+            }
+            target.closed = true;
+        }
+        let _ = self.proxy.send_event(VideoEvent::Wake);
     }
 }
 
@@ -494,6 +631,10 @@ fn decode_loop(
     diagnostics: Arc<Diagnostics>,
     proxy: EventLoopProxy<VideoEvent>,
 ) {
+    let _exit = DecoderExit {
+        target: target.clone(),
+        proxy: proxy.clone(),
+    };
     let catalog = VideoConfig::new(H264 {
         inline: true,
         profile: 0x64,
