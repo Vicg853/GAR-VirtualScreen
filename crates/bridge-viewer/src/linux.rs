@@ -1,36 +1,27 @@
-use crate::resource_lifecycle::{InputEpoch, ReleaseGuard, release_barrier};
-use anyhow::{Context, Result, anyhow, bail};
+//! Parent-side supervisor. No codec, GPU or native window calls run here.
+use crate::resource_lifecycle::InputEpoch;
+use anyhow::{Context, Result, bail};
 use bridge_core::{
     diagnostics::Diagnostics,
-    telemetry::{Outcome, Stage, TraceToken, now_us},
+    telemetry::{ClockEstimate, Outcome, Sample, Stage, Telemetry, TraceEvent, TraceToken, now_us},
+    worker::{self, Message, TraceSeed},
 };
-use bytemuck::{Pod, Zeroable};
-use hang::catalog::{H264, VideoConfig};
-use moq_net::Timestamp;
-use moq_video::{Frame as DecodedVideoFrame, decode, render};
-use render::wgpu;
 use std::{
-    collections::{HashMap, HashSet},
+    io::Read,
+    net::Shutdown,
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
+    process::{Child, Command},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc as async_mpsc;
-use wgpu::util::DeviceExt;
-use winit::{
-    application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    window::{Window, WindowId},
-};
-
-const MAX_QUEUED_PACKET_BYTES: usize = bridge_core::protocol::MAX_MEDIA;
-const MAX_FRAME_PIXELS: u64 = 7680 * 4320;
 
 #[derive(Default)]
 pub struct VideoFrame {
@@ -42,32 +33,40 @@ pub struct VideoFrame {
     pub error: Option<String>,
     pub closed: bool,
     pub user_closed: bool,
+    pub cleanup_complete: bool,
 }
-
-static DISPLAY_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
-static DISPLAY_PROXY: OnceLock<std::result::Result<EventLoopProxy<VideoEvent>, String>> =
-    OnceLock::new();
-
-struct WindowLease {
-    proxy: EventLoopProxy<VideoEvent>,
-    id: u64,
+struct Input {
+    epoch: u64,
+    message: Message,
+    payload: Vec<u8>,
 }
-impl Drop for WindowLease {
-    fn drop(&mut self) {
-        let _ = self.proxy.send_event(VideoEvent::Close(self.id));
+struct Owner {
+    stop: Arc<AtomicBool>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+impl Owner {
+    fn join(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.lock().ok().and_then(|mut h| h.take()) {
+            let _ = thread.join();
+        }
     }
 }
-
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+static WORKERS: OnceLock<Mutex<Vec<Weak<Owner>>>> = OnceLock::new();
 #[derive(Clone)]
 pub struct VideoWindow {
-    input: async_mpsc::Sender<VideoInput>,
+    input: mpsc::SyncSender<Input>,
     epoch: InputEpoch,
-    proxy: Option<EventLoopProxy<VideoEvent>>,
+    owner: Arc<Owner>,
+    target: Arc<Mutex<VideoFrame>>,
+    telemetry: Arc<Mutex<Option<Arc<Telemetry>>>>,
     unavailable: Option<String>,
-    id: u64,
-    _lease: Option<Arc<WindowLease>>,
 }
-
 impl VideoWindow {
     pub fn spawn(target: Arc<Mutex<VideoFrame>>, diagnostics: Arc<Diagnostics>) -> Result<Self> {
         Self::spawn_mode(target, diagnostics, false)
@@ -77,145 +76,132 @@ impl VideoWindow {
         diagnostics: Arc<Diagnostics>,
         instrumented: bool,
     ) -> Result<Self> {
-        // Winit permits one event loop per process. All independent displays
-        // share that event loop while keeping their own renderer and decoder.
-        static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
-        let proxy = DISPLAY_PROXY
-            .get_or_init(|| {
-                let (send, receive) = mpsc::sync_channel(1);
-                let worker = thread::Builder::new()
-                    .name("airbridge-display-events".into())
-                    .spawn(move || {
-                        let mut builder = EventLoop::<VideoEvent>::with_user_event();
-                        winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
-                            &mut builder,
-                            true,
-                        );
-                        winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(
-                            &mut builder,
-                            true,
-                        );
-                        let event_loop = match builder.build() {
-                            Ok(event_loop) => event_loop,
-                            Err(error) => {
-                                let _ = send.send(Err(format!(
-                                    "Cannot initialize display events: {error}"
-                                )));
-                                return;
-                            }
-                        };
-                        let proxy = event_loop.create_proxy();
-                        if send.send(Ok(proxy.clone())).is_err() {
-                            return;
-                        }
-                        let mut manager = DisplayManager {
-                            apps: HashMap::new(),
-                            proxy,
-                            diagnostic_ids: HashSet::new(),
-                            wait: DisplayManager::wait::<false>,
-                        };
-                        if let Err(error) = event_loop.run_app(&mut manager) {
-                            for app in manager.apps.values() {
-                                app.report_error(format!("Display event loop stopped: {error}"));
-                            }
-                        }
-                    })
-                    .map_err(|error| format!("Cannot start display events: {error}"))?;
-                let _ = DISPLAY_THREAD.set(Mutex::new(Some(worker)));
-                receive
-                    .recv_timeout(Duration::from_secs(10))
-                    .map_err(|error| format!("Display event startup failed: {error}"))?
-            })
-            .as_ref()
-            .map_err(|error| anyhow!("{error}"))?
-            .clone();
-        let (input, input_rx) = async_mpsc::channel(1);
-        let id = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
-        proxy
-            .send_event(VideoEvent::Create {
-                id,
-                input_rx,
-                target,
-                diagnostics,
-                instrumented,
-            })
-            .map_err(|_| anyhow!("The display event loop has stopped"))?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let telemetry = Arc::new(Mutex::new(None));
+        let child_target = target.clone();
+        let child_stop = stop.clone();
+        let child_telemetry = telemetry.clone();
+        let thread = thread::Builder::new()
+            .name("airbridge-native-supervisor".into())
+            .spawn(move || {
+                if instrumented {
+                    supervise::<true>(rx, child_stop, child_target, child_telemetry, diagnostics);
+                } else {
+                    supervise::<false>(rx, child_stop, child_target, child_telemetry, diagnostics);
+                }
+            })?;
+        let owner = Arc::new(Owner {
+            stop,
+            thread: Mutex::new(Some(thread)),
+        });
+        let registry = WORKERS.get_or_init(Default::default);
+        if let Ok(mut workers) = registry.lock() {
+            workers.retain(|w| w.strong_count() > 0);
+            workers.push(Arc::downgrade(&owner));
+        }
         Ok(Self {
-            input,
+            input: tx,
             epoch: InputEpoch::default(),
-            proxy: Some(proxy.clone()),
+            owner,
+            target,
+            telemetry,
             unavailable: None,
-            id,
-            _lease: Some(Arc::new(WindowLease { proxy, id })),
         })
     }
-
     pub fn unavailable(message: String, target: Arc<Mutex<VideoFrame>>) -> Self {
-        let (input, receiver) = async_mpsc::channel(1);
-        drop(receiver);
-        record_error(&target, message.clone());
+        let (input, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        if let Ok(mut s) = target.lock() {
+            s.error = Some(message.clone());
+            s.closed = true;
+            s.cleanup_complete = true;
+        }
         Self {
             input,
             epoch: InputEpoch::default(),
-            proxy: None,
+            owner: Arc::new(Owner {
+                stop: Arc::new(AtomicBool::new(true)),
+                thread: Mutex::new(None),
+            }),
+            target,
+            telemetry: Arc::new(Mutex::new(None)),
             unavailable: Some(message),
-            id: 0,
-            _lease: None,
         }
     }
-
     pub fn shutdown_backend() {
-        if let Some(Ok(proxy)) = DISPLAY_PROXY.get() {
-            let _ = proxy.send_event(VideoEvent::Shutdown);
-        }
-        // Application return must not terminate the process while native
-        // decoder or GPU destruction is still running on the event thread.
-        if let Some(worker) = DISPLAY_THREAD
+        let workers = WORKERS
             .get()
-            .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
-        {
-            let _ = worker.join();
+            .and_then(|w| {
+                w.lock()
+                    .ok()
+                    .map(|w| w.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        for w in &workers {
+            w.stop.store(true, Ordering::Release);
+        }
+        for w in workers {
+            w.join();
         }
     }
-
-    pub fn show(&self) -> Result<()> {
-        self.send_event(VideoEvent::Show(self.id))
-    }
-
     pub fn close(&self) -> Result<()> {
         self.epoch.invalidate();
-        self.send_event(VideoEvent::Close(self.id))
+        self.owner.stop.store(true, Ordering::Release);
+        Ok(())
     }
-
+    pub async fn close_wait(&self) -> Result<()> {
+        self.close()?;
+        let owner = self.owner.clone();
+        tokio::task::spawn_blocking(move || owner.join())
+            .await
+            .context("Native worker cleanup task failed")?;
+        Ok(())
+    }
+    pub fn show(&self) -> Result<()> {
+        if self.owner.stop.load(Ordering::Acquire) {
+            bail!("Display is stopped; retry the stream to reopen it");
+        }
+        self.input
+            .try_send(Input {
+                epoch: self.epoch.current().unwrap_or(0),
+                message: Message::Show,
+                payload: vec![],
+            })
+            .map_err(|_| anyhow::anyhow!("Display command queue busy"))?;
+        Ok(())
+    }
     pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
         let epoch = self.epoch.advance();
-        self.send_input(VideoInput::Reset {
-            width,
-            height,
-            epoch,
-        })
-        .await
-    }
-
-    pub async fn submit(&self, bytes: Vec<u8>, keyframe: bool) -> Result<()> {
-        if bytes.is_empty() || bytes.len() > MAX_QUEUED_PACKET_BYTES {
-            bail!("Video packet size is outside the supported range");
+        if let Ok(mut s) = self.target.lock() {
+            s.width = width;
+            s.height = height;
+            s.cleanup_complete = false;
         }
-        let epoch = self
-            .epoch
-            .current()
-            .context("Video producer belongs to a replaced or closed stream")?;
-        self.send_input(VideoInput::Packet {
+        self.send(Input {
             epoch,
-            bytes,
-            keyframe,
-            sequence: 0,
-            trace: None,
-            queued_us: 0,
+            message: Message::Reset {
+                width,
+                height,
+                instrumented: false,
+            },
+            payload: vec![],
         })
         .await
     }
-
+    pub async fn submit(&self, bytes: Vec<u8>, keyframe: bool) -> Result<()> {
+        let epoch = self.epoch.current().context("Obsolete video producer")?;
+        self.send(Input {
+            epoch,
+            message: Message::Packet {
+                keyframe,
+                sequence: 0,
+                trace: None,
+            },
+            payload: bytes,
+        })
+        .await
+    }
     pub async fn submit_debug(
         &self,
         bytes: Vec<u8>,
@@ -223,1618 +209,725 @@ impl VideoWindow {
         sequence: u64,
         trace: Option<TraceToken>,
     ) -> Result<()> {
-        if bytes.is_empty() || bytes.len() > MAX_QUEUED_PACKET_BYTES {
-            bail!("Video packet size is outside the supported range");
+        let epoch = self.epoch.current().context("Obsolete video producer")?;
+        if let Some(t) = &trace {
+            if let Ok(mut active) = self.telemetry.lock() {
+                *active = Some(t.telemetry.clone());
+            }
         }
-        let epoch = self
-            .epoch
-            .current()
-            .context("Video producer belongs to a replaced or closed stream")?;
-        self.send_input(VideoInput::Packet {
+        self.send(Input {
             epoch,
-            bytes,
-            keyframe,
-            sequence,
-            trace,
-            queued_us: now_us(),
+            message: Message::Packet {
+                keyframe,
+                sequence,
+                trace: trace.map(|t| TraceSeed {
+                    capture_us: t.capture_us,
+                    offset_us: t.offset_us,
+                    uncertainty_us: t.uncertainty_us,
+                    queued_host_us: now_us() as i64 + t.offset_us,
+                }),
+            },
+            payload: bytes,
         })
         .await
     }
-    async fn send_input(&self, input: VideoInput) -> Result<()> {
+    async fn send(&self, mut input: Input) -> Result<()> {
         if let Some(message) = &self.unavailable {
             bail!("{message}");
         }
-        tokio::time::timeout(Duration::from_secs(5), self.input.send(input))
-            .await
-            .context("The native video window has not accepted a frame for five seconds")?
-            .context("The native video window has stopped")?;
-        self.send_event(VideoEvent::Wake)
-    }
-
-    fn send_event(&self, event: VideoEvent) -> Result<()> {
-        if let Some(message) = &self.unavailable {
-            bail!("{message}");
+        if input.payload.len() > bridge_core::protocol::MAX_MEDIA {
+            bail!("Video packet is too large");
         }
-        self.proxy
-            .as_ref()
-            .context("The native video window is unavailable")?
-            .send_event(event)
-            .map_err(|_| anyhow!("The native video window has stopped"))
+        let start = Instant::now();
+        loop {
+            if self.owner.stop.load(Ordering::Acquire) {
+                bail!("Native video consumer stopped");
+            }
+            match self.input.try_send(input) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(p)) => input = p,
+                Err(_) => bail!("Native worker supervisor stopped"),
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                bail!("Native worker queue stalled");
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 }
-
-enum VideoEvent {
-    Create {
-        id: u64,
-        input_rx: async_mpsc::Receiver<VideoInput>,
-        target: Arc<Mutex<VideoFrame>>,
-        diagnostics: Arc<Diagnostics>,
-        instrumented: bool,
-    },
-    Wake,
-    Show(u64),
-    Close(u64),
-    Shutdown,
+fn fail(target: &Arc<Mutex<VideoFrame>>, diagnostics: &Diagnostics, message: String) {
+    diagnostics.record("native-worker", &message);
+    if let Ok(mut s) = target.lock() {
+        if s.error.is_none() {
+            s.error = Some(message);
+        }
+        s.closed = true;
+    }
 }
-
-#[derive(Debug)]
-enum VideoInput {
-    Reset {
-        epoch: u64,
-        width: u32,
-        height: u32,
-    },
-    Packet {
-        epoch: u64,
-        bytes: Vec<u8>,
-        keyframe: bool,
-        sequence: u64,
-        trace: Option<TraceToken>,
-        queued_us: u64,
-    },
+struct Process {
+    child: Child,
+    socket: UnixStream,
+    reader: Option<thread::JoinHandle<()>>,
+    stopped: mpsc::Receiver<()>,
+    path: std::path::PathBuf,
+    clock: ClockEstimate,
 }
-
-enum DecodedFrame {
-    Release(mpsc::Sender<std::result::Result<(), String>>),
-    Video(DecodedVideoFrame, Option<TraceToken>, u64),
-}
-
-struct DecodeBackend {
-    decoder: decode::Decoder,
-    catalog: VideoConfig,
-    config: decode::Config,
-}
-
-impl DecodeBackend {
-    fn reset(&mut self) -> Result<()> {
-        self.decoder = decode::Decoder::new(&self.catalog, &self.config)
-            .context("Cannot reset the video decoder")?;
+impl Process {
+    fn finish(&mut self) -> Result<()> {
+        let _ = worker::write(&mut self.socket, &Message::Stop, &[]);
+        let deadline = Instant::now()
+            + if cfg!(test) {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(6)
+            };
+        let mut normal = false;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                normal = status.success();
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.child.kill()?;
+                let _ = self.child.wait();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !normal {
+            let _ = self.socket.shutdown(Shutdown::Both);
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        let acknowledged = self.stopped.try_recv().is_ok();
+        let _ = std::fs::remove_file(&self.path);
+        if !normal || !acknowledged {
+            bail!("Native worker did not acknowledge clean shutdown (terminated/reaped)");
+        }
         Ok(())
     }
-
-    fn name(&self) -> &str {
-        self.decoder.name()
-    }
-
-    fn is_hardware(&self) -> bool {
-        matches!(
-            &self.config.kind,
-            decode::Kind::Hardware | decode::Kind::Named(_)
-        )
-    }
-
-    fn fallback(&mut self) -> Result<Vec<String>> {
-        const HARDWARE_BACKENDS: [&str; 3] = ["nvdec", "vaapi", "v4l2"];
-        let current = self.name();
-        let next = HARDWARE_BACKENDS
-            .iter()
-            .position(|name| *name == current)
-            .map_or(HARDWARE_BACKENDS.len(), |index| index + 1);
-        let mut refused = Vec::new();
-
-        for name in HARDWARE_BACKENDS.iter().skip(next) {
-            self.config.kind = decode::Kind::Named((*name).into());
-            match decode::Decoder::new(&self.catalog, &self.config) {
-                Ok(decoder) => {
-                    self.decoder = decoder;
-                    return Ok(refused);
-                }
-                Err(error) => refused.push(format!("{name}: {error:#}")),
-            }
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-
-        self.config.kind = decode::Kind::Software;
-        self.decoder = decode::Decoder::new(&self.catalog, &self.config)
-            .context("Cannot initialize the OpenH264 software fallback")?;
-        Ok(refused)
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
-
-struct VideoApp {
-    input_rx: async_mpsc::Receiver<VideoInput>,
-    pending_input: Option<VideoInput>,
+fn launch(
     target: Arc<Mutex<VideoFrame>>,
+    telemetry: Arc<Mutex<Option<Arc<Telemetry>>>>,
     diagnostics: Arc<Diagnostics>,
-    proxy: EventLoopProxy<VideoEvent>,
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
-    latest_frame: Option<PresentedFrame>,
-    decoder_tx: Option<mpsc::SyncSender<VideoInput>>,
-    decoder_worker: Option<thread::JoinHandle<()>>,
-    decoder_release: Option<mpsc::Sender<()>>,
-    decoded_rx: Option<mpsc::Receiver<DecodedFrame>>,
-    initialized: bool,
-    instrumented: bool,
-    prepare: fn(&mut Renderer, DecodedFrame) -> Result<PresentedFrame>,
-    present: fn(&mut Renderer, Option<&PresentedFrame>) -> Result<()>,
-    collect: fn(&mut VideoApp),
+    stop: Arc<AtomicBool>,
+) -> Result<Process> {
+    let executable = std::env::current_exe()?;
+    launch_using(target, telemetry, diagnostics, stop, |path| {
+        let mut command = Command::new(executable);
+        command.arg("--native-video-worker").arg(path);
+        command
+    })
 }
-
-impl VideoApp {
-    fn new(
-        input_rx: async_mpsc::Receiver<VideoInput>,
-        target: Arc<Mutex<VideoFrame>>,
-        diagnostics: Arc<Diagnostics>,
-        proxy: EventLoopProxy<VideoEvent>,
-        instrumented: bool,
-    ) -> Self {
-        Self {
-            input_rx,
-            pending_input: None,
-            target,
-            diagnostics,
-            proxy,
-            window: None,
-            renderer: None,
-            latest_frame: None,
-            decoder_tx: None,
-            decoder_worker: None,
-            decoder_release: None,
-            decoded_rx: None,
-            initialized: false,
-            instrumented,
-            prepare: if instrumented {
-                Renderer::set_frame::<true>
-            } else {
-                Renderer::set_frame::<false>
-            },
-            collect: if instrumented {
-                VideoApp::collect_decoded::<true>
-            } else {
-                VideoApp::collect_decoded::<false>
-            },
-            present: if instrumented {
-                Renderer::render::<true>
-            } else {
-                Renderer::render::<false>
-            },
+struct SpawnLease(Option<Child>);
+impl Drop for SpawnLease {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
         }
     }
-
-    fn initialize(&mut self, event_loop: &ActiveEventLoop) {
-        if self.initialized {
-            return;
-        }
-        self.initialized = true;
-        let attributes = Window::default_attributes()
-            .with_title("AirBridge Display")
-            .with_inner_size(PhysicalSize::new(1280, 720));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
+}
+struct SocketPath(std::path::PathBuf);
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+fn launch_using(
+    target: Arc<Mutex<VideoFrame>>,
+    telemetry: Arc<Mutex<Option<Arc<Telemetry>>>>,
+    diagnostics: Arc<Diagnostics>,
+    stop: Arc<AtomicBool>,
+    command: impl FnOnce(&std::path::Path) -> Command,
+) -> Result<Process> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut random = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let secret = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let path = std::path::Path::new("/tmp").join(format!(
+        "airbridge-{}-{}-{secret}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let listener = UnixListener::bind(&path)?;
+    let path_guard = SocketPath(path.clone());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let mut child_owner = SpawnLease(Some(command(&path).spawn()?));
+    let child = child_owner
+        .0
+        .as_mut()
+        .context("Native process ownership missing")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut socket = loop {
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => {
-                self.report_error(format!("Cannot create the display window: {error}"));
-                return;
-            }
-        };
-        self.window = Some(window.clone());
-
-        let (renderer, adapter_name, dma_buf_import) = match initialize_wgpu_renderer(&window) {
-            Ok(renderer) => renderer,
-            Err(error) => {
-                self.report_error(format!(
-                    "GPU display initialization failed; decoded frames cannot be presented: {error:#}"
-                ));
-                return;
-            }
-        };
-        if let Ok(mut status) = self.target.lock() {
-            status.decoder = "Probing hardware decoders…".into();
-        }
-        self.diagnostics.record(
-            "renderer",
-            format!(
-                "Presenting on {adapter_name}; Vulkan DMA-BUF import {}",
-                if dma_buf_import {
-                    "capability available; incompatible surfaces fall back to upload"
-                } else {
-                    "unavailable; upload fallback active"
-                }
-            ),
-        );
-        self.renderer = Some(renderer);
-
-        let (decoder_tx, decoder_rx) = mpsc::sync_channel(1);
-        let (decoded_tx, decoded_rx) = mpsc::sync_channel(1);
-        self.decoder_tx = Some(decoder_tx);
-        self.decoded_rx = Some(decoded_rx);
-        let target = self.target.clone();
-        let diagnostics = self.diagnostics.clone();
-        let proxy = self.proxy.clone();
-        let instrumented = self.instrumented;
-        let (release, released) = mpsc::channel();
-        self.decoder_release = Some(release);
-        match thread::Builder::new()
-            .name("airbridge-video-decoder".into())
-            .spawn(move || {
-                if instrumented {
-                    decode_loop::<true>(
-                        decoder_rx,
-                        decoded_tx,
-                        target,
-                        diagnostics,
-                        proxy,
-                        released,
-                    )
-                } else {
-                    decode_loop::<false>(
-                        decoder_rx,
-                        decoded_tx,
-                        target,
-                        diagnostics,
-                        proxy,
-                        released,
-                    )
-                }
-            }) {
-            Ok(worker) => self.decoder_worker = Some(worker),
-            Err(error) => {
-                self.report_error(format!("Cannot start the video decoder worker: {error}"));
-                self.decoder_tx = None;
-                self.decoder_release = None;
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&path);
+                return Err(error.into());
             }
         }
-    }
-
-    fn report_error(&self, message: String) {
-        self.diagnostics.record("video-window", &message);
-        record_error(&self.target, message);
-        if let Ok(mut target) = self.target.lock() {
-            target.closed = true;
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline || child.try_wait()?.is_some()
+        {
+            let _ = child.kill();
+            let status = child.wait();
+            let _ = std::fs::remove_file(&path);
+            bail!("Native worker startup failed: {status:?}");
         }
-    }
-
-    fn pump_input(&mut self) {
-        if self.pending_input.is_none() {
-            self.pending_input = self.input_rx.try_recv().ok();
-        }
-        let Some(input) = self.pending_input.take() else {
-            return;
-        };
-        if let VideoInput::Reset { width, height, .. } = &input {
-            self.latest_frame = None;
-            if let Ok(mut status) = self.target.lock() {
-                status.width = *width;
-                status.height = *height;
-                status.frames = 0;
-                status.skipped = 0;
-                status.error = None;
+        thread::sleep(Duration::from_millis(10));
+    };
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    socket.set_nonblocking(false)?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let t1 = now_us();
+    worker::write(&mut socket, &Message::ClockProbe { t1 }, &[])?;
+    let clock = loop {
+        let (message, _) = worker::read(&mut socket)?;
+        if let Message::ClockReply { t1: echo, t2, t3 } = message {
+            if echo != t1 {
+                bail!("Invalid worker clock reply");
             }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            break ClockEstimate::from_probe(t1, t2, t3, now_us())
+                .context("Invalid worker clock estimate")?;
         }
-        let Some(sender) = &self.decoder_tx else {
-            self.pending_input = Some(input);
-            return;
-        };
-        match sender.try_send(input) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(input)) => self.pending_input = Some(input),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.report_error("The video decoder worker has stopped".into());
-                self.decoder_tx = None;
-            }
-        }
-    }
-
-    fn release_frames(&mut self) -> Result<()> {
-        if let Some(renderer) = &mut self.renderer {
-            renderer.quiesce()?;
-            // Drop importer leases only after all submitted reads are complete.
-            renderer.frame_renderer = None;
-        }
-        self.latest_frame = None;
-        Ok(())
-    }
-
-    fn collect_decoded<const DEBUG: bool>(&mut self) {
-        let mut latest = None;
-        while let Some(decoded) = self.decoded_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            if let DecodedFrame::Release(ack) = decoded {
-                drop(latest.take());
-                let result = self.release_frames().map_err(|e| format!("{e:#}"));
-                if let Err(error) = &result {
-                    self.report_error(format!(
-                        "Could not release frames before decoder replacement: {error}"
-                    ));
-                }
-                let _ = ack.send(result);
-                continue;
-            }
-            if DEBUG {
-                if let Some(DecodedFrame::Video(_, Some(t), queued_us)) = &latest {
-                    t.mark(
-                        Stage::RenderQueue,
-                        *queued_us,
-                        Some(now_us()),
-                        Outcome::Dropped,
-                        "Superseded before GPU preparation",
-                    );
-                }
-            }
-            latest = Some(decoded);
-        }
-        if let Some(decoded) = latest {
-            match decoded {
-                DecodedFrame::Release(_) => unreachable!("release barrier handled above"),
-                decoded => {
-                    let trace = if DEBUG {
-                        match &decoded {
-                            DecodedFrame::Video(_, t, _) => t.clone(),
-                            _ => None,
+    };
+    socket.set_read_timeout(None)?;
+    let mut events = socket.try_clone()?;
+    let (stopped_tx, stopped) = mpsc::channel();
+    let reader = thread::Builder::new()
+        .name("airbridge-native-status".into())
+        .spawn(move || {
+            while let Ok((message, _)) = worker::read(&mut events) {
+                match message {
+                    Message::Status(status) => {
+                        if let Ok(mut s) = target.lock() {
+                            s.width = status.width;
+                            s.height = status.height;
+                            s.frames = status.frames;
+                            s.skipped = status.skipped;
+                            s.decoder = status.decoder;
+                            s.user_closed = status.user_closed;
+                            if s.error.is_none() {
+                                s.error = status.error;
+                            }
+                            s.closed |= status.closed;
                         }
-                    } else {
-                        None
-                    };
-                    if let Some(renderer) = &mut self.renderer {
-                        match (self.prepare)(renderer, decoded) {
-                            Ok(frame) => self.latest_frame = Some(frame),
-                            Err(error) => {
-                                if DEBUG {
-                                    if let Some(t) = trace {
-                                        t.mark(
-                                            Stage::Upload,
-                                            now_us(),
-                                            Some(now_us()),
-                                            Outcome::Failed,
-                                            &error.to_string(),
-                                        );
-                                    }
-                                }
-                                self.report_error(format!(
-                                    "Could not prepare a decoded frame for display: {error:#}"
-                                ));
+                    }
+                    Message::Error(message) => fail(&target, &diagnostics, message),
+                    Message::Diagnostics { events, lost } => {
+                        if let Some(t) = telemetry.lock().ok().and_then(|t| t.clone()) {
+                            t.peer_lost(lost);
+                            for event in events {
+                                t.trace(event);
                             }
                         }
                     }
-                }
-            }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-        }
-    }
-}
-
-struct DisplayManager {
-    apps: HashMap<u64, VideoApp>,
-    proxy: EventLoopProxy<VideoEvent>,
-    diagnostic_ids: HashSet<u64>,
-    wait: fn(&mut DisplayManager, &ActiveEventLoop),
-}
-impl DisplayManager {
-    fn update_wait_policy(&mut self) {
-        self.wait = if self.diagnostic_ids.is_empty() {
-            Self::wait::<false>
-        } else {
-            Self::wait::<true>
-        };
-    }
-    fn wait<const DEBUG: bool>(&mut self, event_loop: &ActiveEventLoop) {
-        if DEBUG {
-            for id in &self.diagnostic_ids {
-                if let Some(renderer) = self.apps.get(id).and_then(|app| app.renderer.as_ref()) {
-                    let _ = renderer.device.poll(wgpu::PollType::Poll);
-                }
-            }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                std::time::Instant::now() + Duration::from_millis(10),
-            ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
-    }
-}
-
-impl ApplicationHandler<VideoEvent> for DisplayManager {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        for app in self.apps.values_mut() {
-            app.initialize(event_loop);
-        }
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: VideoEvent) {
-        match event {
-            VideoEvent::Create {
-                id,
-                input_rx,
-                target,
-                diagnostics,
-                instrumented,
-            } => {
-                let mut app = VideoApp::new(
-                    input_rx,
-                    target,
-                    diagnostics,
-                    self.proxy.clone(),
-                    instrumented,
-                );
-                app.initialize(event_loop);
-                if app.renderer.is_some() && app.decoder_tx.is_some() {
-                    self.apps.insert(id, app);
-                    if instrumented {
-                        self.diagnostic_ids.insert(id);
-                        self.update_wait_policy();
+                    Message::Stopped => {
+                        let _ = stopped_tx.send(());
+                        break;
+                    }
+                    _ => {
+                        fail(
+                            &target,
+                            &diagnostics,
+                            "Invalid native worker response".into(),
+                        );
+                        break;
                     }
                 }
             }
-            VideoEvent::Show(id) => {
-                if let Some(window) = self.apps.get(&id).and_then(|app| app.window.as_ref()) {
-                    window.set_visible(true);
-                    window.focus_window();
+        })?;
+    drop(path_guard);
+    Ok(Process {
+        child: child_owner
+            .0
+            .take()
+            .context("Native child ownership missing")?,
+        socket,
+        reader: Some(reader),
+        stopped,
+        path,
+        clock,
+    })
+}
+fn supervise<const DEBUG: bool>(
+    rx: mpsc::Receiver<Input>,
+    stop: Arc<AtomicBool>,
+    target: Arc<Mutex<VideoFrame>>,
+    telemetry: Arc<Mutex<Option<Arc<Telemetry>>>>,
+    diagnostics: Arc<Diagnostics>,
+) {
+    let mut process: Option<Process> = None;
+    let mut config = (1280, 720);
+    let mut generation = 0;
+    while !stop.load(Ordering::Acquire) {
+        if let Some(p) = process.as_mut() {
+            match p.child.try_wait() {
+                Ok(Some(status)) => {
+                    fail(
+                        &target,
+                        &diagnostics,
+                        format!("Native video worker exited: {status}"),
+                    );
+                    break;
                 }
+                Err(error) => {
+                    fail(&target, &diagnostics, error.to_string());
+                    break;
+                }
+                _ => {}
             }
-            VideoEvent::Close(id) => {
-                self.apps.remove(&id);
-                self.diagnostic_ids.remove(&id);
-                self.update_wait_policy();
-            }
-            VideoEvent::Shutdown => {
-                self.apps.clear();
-                self.diagnostic_ids.clear();
-                self.update_wait_policy();
-                event_loop.exit();
-            }
-            VideoEvent::Wake => {}
         }
-    }
-
-    fn window_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        let Some(id) = self
-            .apps
-            .iter()
-            .find(|(_, app)| {
-                app.window
-                    .as_ref()
-                    .is_some_and(|window| window.id() == window_id)
-            })
-            .map(|(id, _)| *id)
-        else {
-            return;
+        let mut input = match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(p) => p,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
         };
-        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
-            self.diagnostic_ids.remove(&id);
-            self.update_wait_policy();
-            if let Some(app) = self.apps.remove(&id) {
-                if let Ok(mut target) = app.target.lock() {
-                    target.user_closed = true;
+        match input.message {
+            Message::Reset { width, height, .. } => {
+                if input.epoch <= generation {
+                    continue;
                 }
-                app.diagnostics.record(
-                    "video-window",
-                    "Display closed by the viewer; removing its host screen",
-                );
-            }
-            return;
-        }
-        let Some(app) = self.apps.get_mut(&id) else {
-            return;
-        };
-        match event {
-            WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut app.renderer {
-                    renderer.resize(size);
-                }
-            }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                if let (Some(renderer), Some(window)) = (&mut app.renderer, &app.window) {
-                    renderer.resize(window.inner_size());
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut app.renderer {
-                    if let Err(error) = (app.present)(renderer, app.latest_frame.as_ref()) {
-                        app.report_error(format!("Video presentation failed: {error:#}"));
+                generation = input.epoch;
+                config = (width, height);
+                if let Some(p) = process.as_mut() {
+                    if let Err(error) = worker::write(
+                        &mut p.socket,
+                        &Message::Reset {
+                            width,
+                            height,
+                            instrumented: DEBUG,
+                        },
+                        &[],
+                    ) {
+                        fail(&target, &diagnostics, error.to_string());
+                        break;
                     }
+                }
+            }
+            Message::Packet { keyframe, .. } => {
+                if input.epoch != generation {
+                    continue;
+                }
+                if process.is_none() {
+                    if !keyframe {
+                        continue;
+                    }
+                    match launch(
+                        target.clone(),
+                        telemetry.clone(),
+                        diagnostics.clone(),
+                        stop.clone(),
+                    ) {
+                        Ok(mut p) => {
+                            if let Err(error) = worker::write(
+                                &mut p.socket,
+                                &Message::Reset {
+                                    width: config.0,
+                                    height: config.1,
+                                    instrumented: DEBUG,
+                                },
+                                &[],
+                            ) {
+                                fail(&target, &diagnostics, error.to_string());
+                                break;
+                            }
+                            process = Some(p);
+                        }
+                        Err(error) => {
+                            fail(&target, &diagnostics, format!("{error:#}"));
+                            break;
+                        }
+                    }
+                }
+                if let Some(p) = process.as_mut() {
+                    if DEBUG {
+                        if let Message::Packet {
+                            trace: Some(seed), ..
+                        } = &mut input.message
+                        {
+                            seed.offset_us = seed.offset_us.saturating_sub(p.clock.offset_us);
+                            seed.uncertainty_us = seed
+                                .uncertainty_us
+                                .map(|u| u.saturating_add(p.clock.uncertainty_us));
+                        }
+                    }
+                    if let Err(error) = worker::write(&mut p.socket, &input.message, &input.payload)
+                    {
+                        fail(
+                            &target,
+                            &diagnostics,
+                            format!("Native media IPC failed: {error}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            Message::Show => {
+                if let Some(p) = process.as_mut() {
+                    let _ = worker::write(&mut p.socket, &Message::Show, &[]);
                 }
             }
             _ => {}
         }
     }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let closed = self
-            .apps
-            .iter()
-            .filter_map(|(id, app)| {
-                app.target
-                    .lock()
-                    .map(|target| target.closed)
-                    .unwrap_or(true)
-                    .then_some(*id)
-            })
-            .collect::<Vec<_>>();
-        for id in closed {
-            self.apps.remove(&id);
-            self.diagnostic_ids.remove(&id);
-            self.update_wait_policy();
+    if let Some(mut p) = process {
+        if let Err(error) = p.finish() {
+            fail(&target, &diagnostics, error.to_string());
         }
-        for app in self.apps.values_mut() {
-            app.pump_input();
-            (app.collect)(app);
-        }
-        (self.wait)(self, event_loop);
     }
-}
-
-impl Drop for VideoApp {
-    fn drop(&mut self) {
-        self.input_rx.close();
-        self.pending_input = None;
-        // Stop packet admission first. The worker retains its native backend
-        // behind ReleaseGuard until every consumer below has been released.
-        self.decoder_tx = None;
-        if let Ok(mut target) = self.target.lock() {
-            target.closed = true;
-        }
-        if let Err(error) = self.release_frames() {
-            self.diagnostics
-                .record("video-window", format!("GPU cleanup reported: {error:#}"));
-        }
-        // Disconnect output before joining: a producer waiting on a full queue
-        // or a replacement acknowledgement must be able to wake and exit.
-        self.decoded_rx = None;
-        self.latest_frame = None;
-        self.renderer = None;
-        if let Some(release) = self.decoder_release.take() {
-            let _ = release.send(());
-        }
-        if let Some(worker) = self.decoder_worker.take() {
-            if worker.join().is_err() {
-                self.diagnostics
-                    .record("video-window", "Decoder worker panicked during shutdown");
-            }
-        }
-        self.window = None;
-        self.diagnostics.record(
-            "video-window",
-            "GPU work finished; frames, decoder worker and display released",
-        );
+    if let Ok(mut s) = target.lock() {
+        s.closed = true;
+        s.cleanup_complete = true;
     }
-}
-
-// A fatal decoder exit wakes the window manager and closes the receiving lane.
-struct DecoderExit {
-    target: Arc<Mutex<VideoFrame>>,
-    proxy: EventLoopProxy<VideoEvent>,
-}
-impl Drop for DecoderExit {
-    fn drop(&mut self) {
-        if let Ok(mut target) = self.target.lock() {
-            if !target.closed && target.error.is_none() {
-                target.error = Some("The decoder worker stopped".into());
-            }
-            target.closed = true;
-        }
-        let _ = self.proxy.send_event(VideoEvent::Wake);
-    }
-}
-
-fn initialize_wgpu_renderer(window: &Arc<Window>) -> Result<(Renderer, String, bool)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let surface = instance
-        .create_surface(window.clone())
-        .context("Cannot create the GPU display surface")?;
-    let adapter_options = wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: Some(&surface),
-        force_fallback_adapter: false,
-        ..Default::default()
-    };
-    let adapter = match pollster::block_on(instance.request_adapter(&adapter_options)) {
-        Ok(adapter) => adapter,
-        Err(_) => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            force_fallback_adapter: true,
-            ..adapter_options
-        }))
-        .context("No GPU or software GPU is available for video presentation")?,
-    };
-    let info = adapter.get_info();
-    let supported = adapter.features();
-    let dma_buf_import = supported.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
-    let required_features = if dma_buf_import {
-        wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF
-    } else {
-        wgpu::Features::empty()
-    };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("AirBridge video renderer"),
-        required_features,
-        ..Default::default()
-    }))
-    .context("Cannot create the GPU presentation device")?;
-    let renderer = Renderer::new(surface, adapter, device, queue, window.inner_size())?;
-    Ok((
-        renderer,
-        format!("{} ({:?})", info.name, info.backend),
-        dma_buf_import,
-    ))
-}
-
-fn decode_loop<const DEBUG: bool>(
-    receiver: mpsc::Receiver<VideoInput>,
-    output: mpsc::SyncSender<DecodedFrame>,
-    target: Arc<Mutex<VideoFrame>>,
-    diagnostics: Arc<Diagnostics>,
-    proxy: EventLoopProxy<VideoEvent>,
-    released: mpsc::Receiver<()>,
-) {
-    let exit = DecoderExit {
-        target: target.clone(),
-        proxy: proxy.clone(),
-    };
-    let catalog = VideoConfig::new(H264 {
-        inline: true,
-        profile: 0x64,
-        constraints: 0,
-        level: 0x28,
-    });
-    let mut decoder_config = decode::Config::new();
-    decoder_config.kind = decode::Kind::Hardware;
-    decoder_config.output = moq_video::Output::Native;
-    let decoder = match decode::Decoder::new(&catalog, &decoder_config) {
-        Ok(decoder) => decoder,
-        Err(hardware_error) => {
-            diagnostics.record(
-                "decoder",
-                format!(
-                    "No H.264 hardware decoder is available: {hardware_error:#}; trying OpenH264"
-                ),
-            );
-            decoder_config.kind = decode::Kind::Software;
-            match decode::Decoder::new(&catalog, &decoder_config) {
-                Ok(decoder) => decoder,
-                Err(software_error) => {
-                    let message = format!(
-                        "Could not initialize video decoding; hardware: {hardware_error:#}; software: {software_error:#}"
-                    );
-                    diagnostics.record("decoder", &message);
-                    record_error(&target, message);
-                    return;
-                }
-            }
-        }
-    };
-    let mut backend = DecodeBackend {
-        decoder,
-        catalog,
-        config: decoder_config,
-    };
-    // Declared after backend: on every exit, consumers release first, then
-    // the native decoder is destroyed on this same worker thread.
-    let _release_guard = ReleaseGuard::new(released, move || drop(exit));
     diagnostics.record(
-        "decoder",
-        format!(
-            "Using {} H.264 {} decoding",
-            backend.name(),
-            if backend.is_hardware() {
-                "hardware"
-            } else {
-                "software"
-            }
-        ),
+        "native-worker",
+        "Video consumer stopped and child process reaped",
     );
-    update_decoder_status(&target, backend.name());
-    let mut packet_count = 0u64;
-    let mut error_count = 0u64;
-    let mut pending = HashMap::<u64, (TraceToken, u64)>::new();
-    let mut active_epoch = 0;
-    while let Ok(input) = receiver.recv() {
-        match input {
-            VideoInput::Reset {
-                width,
-                height,
-                epoch,
-            } => {
-                if epoch <= active_epoch {
-                    continue;
-                }
-                active_epoch = epoch;
-                if DEBUG {
-                    for (_, (t, start)) in pending.drain() {
-                        t.mark(
-                            Stage::Decode,
-                            start,
-                            Some(now_us()),
-                            Outcome::Cancelled,
-                            "Decoder reset",
-                        );
-                    }
-                }
-                packet_count = 0;
-                error_count = 0;
-                if let Ok(mut status) = target.lock() {
-                    status.width = width;
-                    status.height = height;
-                    status.frames = 0;
-                    status.skipped = 0;
-                    status.error = None;
-                }
-                if !release_decoder_frames(&output, &proxy, &target) {
-                    return;
-                }
-                if let Err(error) = backend.reset() {
-                    let message = format!("Could not reset the video decoder: {error:#}");
-                    diagnostics.record("decoder", &message);
-                    record_error(&target, message);
-                    if backend.is_hardware() {
-                        match backend.fallback() {
-                            Ok(refused) => {
-                                diagnostics.record(
-                                    "decoder",
-                                    format!(
-                                        "Reset fallback selected {}; later hardware backends refused: {}",
-                                        backend.name(),
-                                        refused.join("; ")
-                                    ),
-                                );
-                                update_decoder_status(&target, backend.name());
-                            }
-                            Err(fallback_error) => {
-                                let message =
-                                    format!("Software decoder reset failed: {fallback_error:#}");
-                                diagnostics.record("decoder", &message);
-                                record_error(&target, message);
-                                return;
-                            }
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            }
-            VideoInput::Packet {
-                epoch,
-                bytes,
-                keyframe,
-                sequence,
-                trace,
-                queued_us,
-            } => {
-                if epoch != active_epoch {
-                    if DEBUG {
-                        if let Some(t) = trace {
-                            t.mark(
-                                Stage::DecodeQueue,
-                                queued_us,
-                                Some(now_us()),
-                                Outcome::Cancelled,
-                                "Packet belongs to an obsolete decoder generation",
-                            );
-                        }
-                    }
-                    continue;
-                }
-                let decode_start = if DEBUG { now_us() } else { 0 };
-                if DEBUG {
-                    if let Some(t) = &trace {
-                        t.mark(
-                            Stage::DecodeQueue,
-                            queued_us,
-                            Some(decode_start),
-                            Outcome::Complete,
-                            "",
-                        );
-                        t.mark(Stage::Decode, decode_start, None, Outcome::Pending, "");
-                        if pending.len() >= 64 {
-                            if let Some(id) = pending.keys().min().copied() {
-                                if let Some((t, start)) = pending.remove(&id) {
-                                    t.mark(
-                                        Stage::Decode,
-                                        start,
-                                        Some(now_us()),
-                                        Outcome::Dropped,
-                                        "Decoder correlation capacity exceeded",
-                                    );
-                                }
-                            }
-                        }
-                        pending.insert(sequence.saturating_add(1), (t.clone(), decode_start));
-                    }
-                }
-                packet_count += 1;
-                let timestamp = Timestamp::from_micros(if DEBUG {
-                    sequence.saturating_add(1)
-                } else {
-                    packet_count
+}
+/// Child entry uses the same executable. GPUI and host networking never run here.
+pub fn worker_entry() -> bool {
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--native-video-worker")) {
+        return false;
+    }
+    let result = args
+        .next()
+        .context("Missing worker socket")
+        .and_then(|path| run_child(path));
+    if let Err(error) = result {
+        eprintln!("[native-worker] {error:#}");
+        std::process::exit(1);
+    }
+    true
+}
+fn run_child(path: std::ffi::OsString) -> Result<()> {
+    let mut input = UnixStream::connect(path)?;
+    input.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let output = Arc::new(Mutex::new(input.try_clone()?));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let diagnostics = Arc::new(Diagnostics::new("viewer-native"));
+    let frame = Arc::new(Mutex::new(crate::native_video::VideoFrame::default()));
+    let telemetry = Telemetry::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let tick_done = done.clone();
+    let tick_output = output.clone();
+    let tick_frame = frame.clone();
+    let tick_telemetry = telemetry.clone();
+    let events = thread::spawn(move || {
+        while !tick_done.load(Ordering::Acquire) {
+            let status = tick_frame
+                .lock()
+                .map(|s| worker::Status {
+                    width: s.width,
+                    height: s.height,
+                    frames: s.frames,
+                    skipped: s.skipped,
+                    decoder: s.decoder.clone(),
+                    error: s.error.clone(),
+                    closed: s.closed,
+                    user_closed: s.user_closed,
                 })
-                .unwrap_or(Timestamp::ZERO);
-                let payload = bytes::Bytes::from(bytes);
-                let frames = backend
-                    .decoder
-                    .decode(&payload, timestamp, keyframe)
-                    .map(|frames| {
-                        frames
-                            .into_iter()
-                            .map(|frame| {
-                                let trace = if DEBUG {
-                                    pending.remove(&(frame.timestamp.as_micros() as u64)).map(
-                                        |(t, start)| {
-                                            t.mark(
-                                                Stage::Decode,
-                                                start,
-                                                Some(now_us()),
-                                                Outcome::Complete,
-                                                "",
-                                            );
-                                            t
-                                        },
-                                    )
-                                } else {
-                                    None
-                                };
-                                DecodedFrame::Video(frame, trace, if DEBUG { now_us() } else { 0 })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .map_err(|error| anyhow!(error));
-                match frames {
-                    Ok(frames) => {
-                        for frame in frames {
-                            if !publish_frame::<DEBUG>(frame, &output, &target) {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        if DEBUG {
-                            if let Some((t, start)) = pending.remove(&sequence.saturating_add(1)) {
-                                t.mark(
-                                    Stage::Decode,
-                                    start,
-                                    Some(now_us()),
-                                    Outcome::Failed,
-                                    &error.to_string(),
-                                );
-                            }
-                        }
-                        error_count += 1;
-                        if backend.is_hardware() {
-                            let failed_backend = backend.name().to_owned();
-                            let message = format!(
-                                "{failed_backend} failed on packet {packet_count}: {error:#}; trying the next available decoder"
-                            );
-                            diagnostics.record("decoder", &message);
-                            record_error(
-                                &target,
-                                format!("{message}; waiting for the next keyframe"),
-                            );
-                            if !release_decoder_frames(&output, &proxy, &target) {
-                                return;
-                            }
-                            match backend.fallback() {
-                                Ok(refused) => {
-                                    let message = format!(
-                                        "Decoder fallback selected {}; later hardware backends refused: {}",
-                                        backend.name(),
-                                        refused.join("; ")
-                                    );
-                                    diagnostics.record("decoder", &message);
-                                    update_decoder_status(&target, backend.name());
-                                }
-                                Err(fallback_error) => {
-                                    let message = format!(
-                                        "Cannot start remaining hardware or OpenH264 software decoders: {fallback_error:#}"
-                                    );
-                                    diagnostics.record("decoder", &message);
-                                    record_error(&target, message);
-                                    return;
-                                }
-                            }
-                            if keyframe {
-                                loop {
-                                    match backend.decoder.decode(&payload, timestamp, keyframe) {
-                                        Ok(frames) => {
-                                            for frame in frames {
-                                                if !publish_frame::<DEBUG>(
-                                                    DecodedFrame::Video(frame, None, 0),
-                                                    &output,
-                                                    &target,
-                                                ) {
-                                                    return;
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        Err(error) if backend.is_hardware() => {
-                                            let failed_backend = backend.name().to_owned();
-                                            diagnostics.record(
-                                                "decoder",
-                                                format!(
-                                                    "{failed_backend} rejected the keyframe; trying the next decoder: {error:#}"
-                                                ),
-                                            );
-                                            if !release_decoder_frames(&output, &proxy, &target) {
-                                                return;
-                                            }
-                                            match backend.fallback() {
-                                                Ok(refused) => {
-                                                    diagnostics.record(
-                                                        "decoder",
-                                                        format!(
-                                                            "Decoder fallback selected {}; later hardware backends refused: {}",
-                                                            backend.name(),
-                                                            refused.join("; ")
-                                                        ),
-                                                    );
-                                                    update_decoder_status(&target, backend.name());
-                                                }
-                                                Err(fallback_error) => {
-                                                    let message = format!(
-                                                        "Cannot start remaining hardware or OpenH264 software decoders: {fallback_error:#}"
-                                                    );
-                                                    diagnostics.record("decoder", &message);
-                                                    record_error(&target, message);
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        Err(error) => {
-                                            diagnostics.record(
-                                                "decoder",
-                                                format!(
-                                                    "{} could not decode fallback keyframe: {error:#}",
-                                                    backend.name()
-                                                ),
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let message = format!("H.264 decoder error: {error:#}");
-                            if error_count == 1 || error_count % 60 == 0 {
-                                diagnostics.record("decoder", &message);
-                                record_error(&target, format!("{message} · packet {packet_count}"));
-                            }
-                        }
-                    }
+                .unwrap_or_default();
+            if let Ok(mut socket) = tick_output.lock() {
+                if worker::write(&mut *socket, &Message::Status(status), &[]).is_err() {
+                    break;
                 }
-            }
-        }
-        let _ = proxy.send_event(VideoEvent::Wake);
-    }
-    if DEBUG {
-        for (_, (t, start)) in pending {
-            t.mark(
-                Stage::Decode,
-                start,
-                Some(now_us()),
-                Outcome::Cancelled,
-                "Decoder worker stopped",
-            );
-        }
-    }
-}
-
-// This is a protocol barrier, not a delay: the renderer acknowledges only
-// after GPU completion and release of imported/queued frame resources.
-fn release_decoder_frames(
-    output: &mpsc::SyncSender<DecodedFrame>,
-    proxy: &EventLoopProxy<VideoEvent>,
-    target: &Arc<Mutex<VideoFrame>>,
-) -> bool {
-    match release_barrier(output, DecodedFrame::Release, || {
-        let _ = proxy.send_event(VideoEvent::Wake);
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            if !target.lock().map(|t| t.closed).unwrap_or(true) {
-                record_error(target, error);
-            }
-            false
-        }
-    }
-}
-
-fn publish_frame<const DEBUG: bool>(
-    frame: DecodedFrame,
-    output: &mpsc::SyncSender<DecodedFrame>,
-    target: &Arc<Mutex<VideoFrame>>,
-) -> bool {
-    let (width, height) = match &frame {
-        DecodedFrame::Video(frame, _, _) => (frame.size().width, frame.size().height),
-        DecodedFrame::Release(_) => return true,
-    };
-    if width == 0
-        || height == 0
-        || width > 7680
-        || height > 4320
-        || (width as u64) * (height as u64) > MAX_FRAME_PIXELS
-    {
-        record_error(
-            target,
-            format!("Decoded frame dimensions are unsupported: {width}×{height}"),
-        );
-        return true;
-    }
-    if let Ok(mut status) = target.lock() {
-        status.width = width;
-        status.height = height;
-        status.frames += 1;
-        status.error = None;
-    }
-    let trace = if DEBUG {
-        match &frame {
-            DecodedFrame::Video(_, t, _) => t.clone(),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    if DEBUG {
-        if let Some(t) = &trace {
-            t.mark(
-                Stage::RenderQueue,
-                now_us(),
-                None,
-                Outcome::Pending,
-                "Awaiting GPU frame preparation",
-            );
-        }
-    }
-    match output.try_send(frame) {
-        Ok(()) => true,
-        Err(mpsc::TrySendError::Full(_)) => {
-            if DEBUG {
-                if let Some(t) = trace {
-                    t.mark(
-                        Stage::RenderQueue,
-                        now_us(),
-                        Some(now_us()),
-                        Outcome::Dropped,
-                        "Decoded frame queue full",
-                    );
-                }
-            }
-            if let Ok(mut status) = target.lock() {
-                status.skipped += 1;
-            }
-            true
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => false,
-    }
-}
-
-fn update_decoder_status(target: &Arc<Mutex<VideoFrame>>, name: &str) {
-    if let Ok(mut status) = target.lock() {
-        status.decoder = name.into();
-    }
-}
-
-fn record_error(target: &Arc<Mutex<VideoFrame>>, message: String) {
-    if let Ok(mut status) = target.lock() {
-        status.error = Some(message);
-    }
-}
-
-struct PresentedFrame {
-    _texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    width: u32,
-    height: u32,
-    trace: Option<TraceToken>,
-    measured: AtomicBool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ColorUniform {
-    values: [f32; 4],
-    coefficients: [f32; 4],
-    output: [f32; 4],
-}
-
-struct Renderer {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    configuration: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    uniform_buffer: wgpu::Buffer,
-    dummy_uv: wgpu::Texture,
-    frame_renderer: Option<render::Renderer>,
-    size: PhysicalSize<u32>,
-}
-
-impl Renderer {
-    fn new(
-        surface: wgpu::Surface<'static>,
-        adapter: wgpu::Adapter,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        size: PhysicalSize<u32>,
-    ) -> Result<Self> {
-        let capabilities = surface.get_capabilities(&adapter);
-        let format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(|format| !format.is_srgb())
-            .or_else(|| capabilities.formats.first().copied())
-            .context("Display surface exposes no supported pixel formats")?;
-        let configuration = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: capabilities
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &configuration);
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("AirBridge decoded-frame layout"),
-            entries: &[
-                texture_entry(0),
-                texture_entry(1),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("AirBridge color-conversion parameters"),
-            contents: bytemuck::bytes_of(&ColorUniform::zeroed()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("AirBridge YUV and RGBA presentation shader"),
-            source: wgpu::ShaderSource::Wgsl(VIDEO_SHADER.into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("AirBridge video pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("AirBridge native video renderer"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let dummy_uv = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("AirBridge packed-frame dummy chroma plane"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let frame_renderer = render::Renderer::new(&device, &queue, render::Config::new())
-            .context("Cannot initialize the cross-vendor GPU frame importer")?;
-
-        Ok(Self {
-            surface,
-            device,
-            queue,
-            configuration,
-            pipeline,
-            bind_group_layout,
-            sampler,
-            uniform_buffer,
-            dummy_uv,
-            frame_renderer: Some(frame_renderer),
-            size,
-        })
-    }
-
-    fn quiesce(&self) -> Result<()> {
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .context("Waiting for GPU frame work during cleanup")?;
-        Ok(())
-    }
-
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        self.size = size;
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.configuration.width = size.width;
-        self.configuration.height = size.height;
-        self.surface.configure(&self.device, &self.configuration);
-    }
-
-    fn set_frame<const DEBUG: bool>(&mut self, decoded: DecodedFrame) -> Result<PresentedFrame> {
-        let upload_start = if DEBUG { now_us() } else { 0 };
-        let mut token = None;
-        let (texture, y_view, uv_view, width, height, color) = match decoded {
-            DecodedFrame::Video(frame, trace, queued_us) => {
-                if DEBUG {
-                    if let Some(t) = &trace {
-                        t.mark(
-                            Stage::RenderQueue,
-                            queued_us,
-                            Some(upload_start),
-                            Outcome::Complete,
-                            "",
-                        );
-                        t.mark(Stage::Upload, upload_start, None, Outcome::Pending, "");
-                    }
-                    token = trace;
-                }
-                let size = frame.size();
-                if size.width == 0
-                    || size.height == 0
-                    || size.width > 7680
-                    || size.height > 4320
-                    || size.pixels() > MAX_FRAME_PIXELS
-                {
-                    bail!("Decoded frame exceeds the 7680×4320 presentation limit");
-                }
-                if self.frame_renderer.is_none() {
-                    self.frame_renderer = Some(
-                        render::Renderer::new(&self.device, &self.queue, render::Config::new())
-                            .context("Recreating frame importer after decoder reset")?,
-                    );
-                }
-                let rendered = self
-                    .frame_renderer
-                    .as_mut()
-                    .context("Frame importer unavailable")?
-                    .render(&frame)
-                    .context("Cross-vendor GPU frame import/render failed")?;
-                let y_view = rendered.create_view(&wgpu::TextureViewDescriptor::default());
-                let uv_view = self
-                    .dummy_uv
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                (
-                    rendered,
-                    y_view,
-                    uv_view,
-                    size.width,
-                    size.height,
-                    ColorUniform {
-                        // The cross-vendor frame renderer already converted the
-                        // source's YUV matrix/range into gamma-coded RGBA.
-                        values: [0.0, 1.0, 1.0, 1.0],
-                        coefficients: [1.5748, -0.187324, -0.468124, 1.8556],
-                        output: [
-                            if self.configuration.format.is_srgb() {
-                                1.0
-                            } else {
-                                0.0
-                            },
-                            0.0,
-                            0.0,
-                            0.0,
-                        ],
-                    },
-                )
-            }
-            DecodedFrame::Release(_) => bail!("Release barrier is not a displayable video frame"),
-        };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&color));
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("AirBridge current video frame"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&uv_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        if DEBUG {
-            if let Some(t) = &token {
-                t.mark(
-                    Stage::Upload,
-                    upload_start,
-                    Some(now_us()),
-                    Outcome::Complete,
-                    "CPU preparation and GPU import/upload submission, not GPU completion",
-                );
-                t.mark(Stage::Submit, now_us(), None, Outcome::Pending, "");
-            }
-        }
-        Ok(PresentedFrame {
-            _texture: texture,
-            bind_group,
-            width,
-            height,
-            trace: token,
-            measured: AtomicBool::new(false),
-        })
-    }
-
-    fn render<const DEBUG: bool>(&mut self, frame: Option<&PresentedFrame>) -> Result<()> {
-        if self.size.width == 0 || self.size.height == 0 {
-            return Ok(());
-        }
-        let (output, reconfigure) = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output) => (output, false),
-            wgpu::CurrentSurfaceTexture::Suboptimal(output) => (output, true),
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.configuration);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.configuration);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(anyhow!(
-                    "GPU reported a validation error while acquiring the display surface"
-                ));
-            }
-        };
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("AirBridge display frame"),
-            });
-        {
-            let color_attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("AirBridge display render pass"),
-                color_attachments: &color_attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some(frame) = frame {
-                let surface_width = self.size.width as f32;
-                let surface_height = self.size.height as f32;
-                let image_aspect = frame.width as f32 / frame.height as f32;
-                let surface_aspect = surface_width / surface_height;
-                let (x, y, width, height) = if surface_aspect > image_aspect {
-                    let width = surface_height * image_aspect;
-                    ((surface_width - width) / 2.0, 0.0, width, surface_height)
-                } else {
-                    let height = surface_width / image_aspect;
-                    (0.0, (surface_height - height) / 2.0, surface_width, height)
-                };
-                pass.set_viewport(x, y, width, height, 0.0, 1.0);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &frame.bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-        }
-        let token = if DEBUG {
-            frame
-                .filter(|f| !f.measured.swap(true, Ordering::Relaxed))
-                .and_then(|f| f.trace.as_ref())
-        } else {
-            None
-        };
-        let submit_start = if DEBUG { now_us() } else { 0 };
-        self.queue.submit(Some(encoder.finish()));
-        if DEBUG {
-            if let Some(t) = token {
-                t.mark(
-                    Stage::Submit,
-                    submit_start,
-                    Some(now_us()),
-                    Outcome::Complete,
-                    "",
-                );
-                let t = t.clone();
-                let completion_start = now_us();
-                t.mark(
-                    Stage::GpuComplete,
-                    completion_start,
-                    None,
-                    Outcome::Pending,
-                    "",
-                );
-                self.queue.on_submitted_work_done(move || {
-                    t.mark(
-                        Stage::GpuComplete,
-                        completion_start,
-                        Some(now_us()),
-                        Outcome::Complete,
-                        "Callback observation includes driver scheduling delay",
+                let batch = tick_telemetry.drain(0, 0);
+                for chunk in batch.events.chunks(24) {
+                    if worker::write(
+                        &mut *socket,
+                        &Message::Diagnostics {
+                            events: chunk.to_vec(),
+                            lost: batch.lost_events,
+                        },
+                        &[],
                     )
-                });
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
             }
+            thread::sleep(Duration::from_millis(200));
         }
-        let present_start = if DEBUG { now_us() } else { 0 };
-        self.queue.present(output);
-        if DEBUG {
-            if let Some(t) = token {
-                t.mark(
-                    Stage::PresentSubmit,
-                    present_start,
-                    Some(now_us()),
-                    Outcome::Complete,
-                    "Queued to compositor; scanout not observed",
-                );
+    });
+    let mut window: Option<crate::native_video::VideoWindow> = None;
+    let mut config = (1280, 720, false);
+    let mut submit: fn(
+        &tokio::runtime::Runtime,
+        &crate::native_video::VideoWindow,
+        Vec<u8>,
+        bool,
+        u64,
+        Option<TraceSeed>,
+        Arc<Telemetry>,
+    ) -> Result<()> = child_submit::<false>;
+    let result: Result<()> = (|| {
+        loop {
+            let (message, payload) = worker::read(&mut input)?;
+            match message {
+                Message::Reset {
+                    width,
+                    height,
+                    instrumented,
+                } => {
+                    if width == 0 || height == 0 || width > 7680 || height > 4320 {
+                        bail!("Invalid worker video dimensions");
+                    }
+                    config = (width, height, instrumented);
+                    submit = if instrumented {
+                        child_submit::<true>
+                    } else {
+                        child_submit::<false>
+                    };
+                    if let Some(window) = window.as_mut() {
+                        runtime.block_on(window.reset(width, height))?;
+                    }
+                }
+                Message::Packet {
+                    keyframe,
+                    sequence,
+                    trace,
+                } => {
+                    if window.is_none() {
+                        if !keyframe {
+                            continue;
+                        }
+                        let mut created = crate::native_video::VideoWindow::spawn_mode(
+                            frame.clone(),
+                            diagnostics.clone(),
+                            config.2,
+                        )?;
+                        runtime.block_on(created.reset(config.0, config.1))?;
+                        window = Some(created);
+                    }
+                    let window = window.as_ref().context("Native window unavailable")?;
+                    submit(
+                        &runtime,
+                        window,
+                        payload,
+                        keyframe,
+                        sequence,
+                        trace,
+                        telemetry.clone(),
+                    )?;
+                }
+                Message::ClockProbe { t1 } => {
+                    let t2 = now_us();
+                    if let Ok(mut socket) = output.lock() {
+                        worker::write(
+                            &mut *socket,
+                            &Message::ClockReply {
+                                t1,
+                                t2,
+                                t3: now_us(),
+                            },
+                            &[],
+                        )?;
+                    }
+                }
+                Message::Show => {
+                    if let Some(window) = &window {
+                        window.show()?;
+                    }
+                }
+                Message::Stop => break,
+                _ => bail!("Invalid parent worker command"),
             }
-        }
-        if DEBUG {
-            let _ = self.device.poll(wgpu::PollType::Poll);
-        }
-        if reconfigure {
-            self.surface.configure(&self.device, &self.configuration);
         }
         Ok(())
+    })();
+    done.store(true, Ordering::Release);
+    let _ = events.join();
+    if let Some(window) = window {
+        window.close_wait()?;
+        drop(window);
     }
-}
-
-fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
+    crate::native_video::VideoWindow::shutdown_backend();
+    if let Err(error) = &result {
+        if let Ok(mut socket) = output.lock() {
+            let _ = worker::write(&mut *socket, &Message::Error(format!("{error:#}")), &[]);
+        }
     }
+    if let Ok(mut socket) = output.lock() {
+        worker::write(&mut *socket, &Message::Stopped, &[])?;
+    }
+    result
 }
 
-const VIDEO_SHADER: &str = r#"
-struct ColorUniform {
-    values: vec4<f32>,
-    coefficients: vec4<f32>,
-    output: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@group(0) @binding(0) var plane_y_or_rgba: texture_2d<f32>;
-@group(0) @binding(1) var plane_uv: texture_2d<f32>;
-@group(0) @binding(2) var frame_sampler: sampler;
-@group(0) @binding(3) var<uniform> color: ColorUniform;
-
-@vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0)
-    );
-    let position = positions[index];
-    var output: VertexOutput;
-    output.position = vec4<f32>(position, 0.0, 1.0);
-    output.uv = vec2<f32>(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
-    return output;
-}
-
-fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
-    let low = value / 12.92;
-    let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    return select(low, high, value > vec3<f32>(0.04045));
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var rgb: vec3<f32>;
-    if color.values.w > 0.5 {
-        rgb = textureSample(plane_y_or_rgba, frame_sampler, input.uv).rgb;
+fn child_submit<const DEBUG: bool>(
+    runtime: &tokio::runtime::Runtime,
+    window: &crate::native_video::VideoWindow,
+    payload: Vec<u8>,
+    keyframe: bool,
+    sequence: u64,
+    trace: Option<TraceSeed>,
+    telemetry: Arc<Telemetry>,
+) -> Result<()> {
+    if DEBUG {
+        let token = trace.map(|t| {
+            let end = now_us() as i64 + t.offset_us;
+            telemetry.trace(TraceEvent {
+                sequence,
+                capture_us: t.capture_us,
+                uncertainty_us: t.uncertainty_us,
+                stage: Stage::IpcQueue,
+                sample: Sample {
+                    start_us: t.queued_host_us,
+                    duration_us: Some(end.saturating_sub(t.queued_host_us).max(0) as u64),
+                    outcome: Outcome::Complete,
+                    reason: "Compressed packet IPC and native worker scheduling".into(),
+                    estimated: true,
+                },
+            });
+            TraceToken {
+                sequence,
+                capture_us: t.capture_us,
+                offset_us: t.offset_us,
+                uncertainty_us: t.uncertainty_us,
+                telemetry: telemetry.clone(),
+            }
+        });
+        runtime.block_on(window.submit_debug(payload, keyframe, sequence, token))
     } else {
-        let luma = textureSample(plane_y_or_rgba, frame_sampler, input.uv).r;
-        let chroma = textureSample(plane_uv, frame_sampler, input.uv).rg - vec2<f32>(0.5, 0.5);
-        let y = (luma + color.values.x) * color.values.y;
-        let u = chroma.x * color.values.z;
-        let v = chroma.y * color.values.z;
-        rgb = vec3<f32>(
-            y + color.coefficients.x * v,
-            y + color.coefficients.y * u + color.coefficients.z * v,
-            y + color.coefficients.w * u
-        );
+        runtime.block_on(window.submit(payload, keyframe))
     }
-    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    if color.output.x > 0.5 {
-        rgb = srgb_to_linear(rgb);
-    }
-    return vec4<f32>(rgb, 1.0);
 }
-"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Invoked in a separate test process. No native window/GPU APIs are called.
+    #[test]
+    fn fixture() {
+        let Some(path) = std::env::var_os("AIRBRIDGE_FIXTURE_SOCKET") else {
+            return;
+        };
+        let mode = std::env::var("AIRBRIDGE_FIXTURE_MODE").unwrap_or_default();
+        if mode == "startup-failure" {
+            std::process::exit(7);
+        }
+        let mut socket = UnixStream::connect(path).unwrap();
+        loop {
+            let Ok((message, _)) = worker::read(&mut socket) else {
+                break;
+            };
+            match message {
+                Message::ClockProbe { t1 } => {
+                    let t2 = now_us();
+                    worker::write(
+                        &mut socket,
+                        &Message::ClockReply {
+                            t1,
+                            t2,
+                            t3: now_us(),
+                        },
+                        &[],
+                    )
+                    .unwrap();
+                }
+                Message::Packet { .. } if mode == "crash" => std::process::exit(139),
+                Message::Stop if mode == "hang" => loop {
+                    thread::sleep(Duration::from_millis(50));
+                },
+                Message::Stop => {
+                    worker::write(&mut socket, &Message::Stopped, &[]).unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    fn fixture_process(mode: &str) -> Result<Process> {
+        launch_using(
+            Arc::new(Mutex::new(VideoFrame::default())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Diagnostics::new("worker-test")),
+            Arc::new(AtomicBool::new(false)),
+            |path| {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg("linux::tests::fixture")
+                    .arg("--nocapture")
+                    .env("AIRBRIDGE_FIXTURE_SOCKET", path)
+                    .env("AIRBRIDGE_FIXTURE_MODE", mode);
+                command
+            },
+        )
+    }
+    #[test]
+    fn clean_worker_acknowledges_and_is_reaped() {
+        let mut p = fixture_process("normal").unwrap();
+        assert!(p.finish().is_ok());
+        assert!(p.child.try_wait().unwrap().is_some());
+    }
+    #[test]
+    fn crashed_worker_is_contained_and_reaped() {
+        let mut p = fixture_process("crash").unwrap();
+        worker::write(
+            &mut p.socket,
+            &Message::Packet {
+                keyframe: true,
+                sequence: 1,
+                trace: None,
+            },
+            b"compressed",
+        )
+        .unwrap();
+        assert!(p.finish().is_err());
+        assert!(p.child.try_wait().unwrap().is_some());
+    }
+    #[test]
+    fn hung_worker_is_terminated_without_freeing_parent_native_resources() {
+        let mut p = fixture_process("hang").unwrap();
+        let start = Instant::now();
+        assert!(p.finish().is_err());
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(p.child.try_wait().unwrap().is_some());
+    }
+    #[test]
+    fn failed_worker_startup_returns_an_error() {
+        assert!(fixture_process("startup-failure").is_err());
+    }
+    #[test]
+    fn host_error_before_keyframe_starts_no_native_process() {
+        let frame = Arc::new(Mutex::new(VideoFrame::default()));
+        let window =
+            VideoWindow::spawn(frame.clone(), Arc::new(Diagnostics::new("no-native-start")))
+                .unwrap();
+        window.close().unwrap();
+        window.owner.join();
+        assert!(frame.lock().unwrap().cleanup_complete);
+    }
+}

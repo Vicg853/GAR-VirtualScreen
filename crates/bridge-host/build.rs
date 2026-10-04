@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=native/virtual_display.m");
     #[cfg(target_os = "macos")]
     {
         cc::Build::new()

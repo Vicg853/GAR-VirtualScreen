@@ -16,6 +16,10 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     // macOS can take longer than QUIC's idle timeout to initialize capture.
     // Keep the authenticated connection alive while there are no media frames.
     config.keep_alive_interval(Some(Duration::from_secs(5)));
+    config.max_concurrent_uni_streams(8u32.into());
+    config.max_concurrent_bidi_streams(4u32.into());
+    config.stream_receive_window((8u32 * 1024 * 1024).into());
+    config.receive_window((16u32 * 1024 * 1024).into());
     Arc::new(config)
 }
 
@@ -136,12 +140,15 @@ fn proof(key: &[u8], binding: &[u8], role: &[u8]) -> Result<[u8; 32]> {
 }
 
 pub async fn authenticate_host(connection: &Connection, pin: &str) -> Result<()> {
+    authenticate_host_scoped(connection, pin, b"legacy").await
+}
+async fn authenticate_host_scoped(connection: &Connection, pin: &str, scope: &[u8]) -> Result<()> {
     validate_pin(pin)?;
     let (mut send, mut recv) = connection.accept_bi().await?;
     let (state, outbound) = Spake2::<Ed25519Group>::start_b(
         &Password::new(pin.as_bytes()),
-        &Identity::new(b"viewer"),
-        &Identity::new(b"host"),
+        &Identity::new(&[b"viewer/".as_slice(), scope].concat()),
+        &Identity::new(&[b"host/".as_slice(), scope].concat()),
     );
     send.write_u16(outbound.len() as u16).await?;
     send.write_all(&outbound).await?;
@@ -171,12 +178,19 @@ pub async fn authenticate_host(connection: &Connection, pin: &str) -> Result<()>
 }
 
 pub async fn authenticate_viewer(connection: &Connection, pin: &str) -> Result<()> {
+    authenticate_viewer_scoped(connection, pin, b"legacy").await
+}
+async fn authenticate_viewer_scoped(
+    connection: &Connection,
+    pin: &str,
+    scope: &[u8],
+) -> Result<()> {
     validate_pin(pin)?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let (state, outbound) = Spake2::<Ed25519Group>::start_a(
         &Password::new(pin.as_bytes()),
-        &Identity::new(b"viewer"),
-        &Identity::new(b"host"),
+        &Identity::new(&[b"viewer/".as_slice(), scope].concat()),
+        &Identity::new(&[b"host/".as_slice(), scope].concat()),
     );
     send.write_u16(outbound.len() as u16).await?;
     send.write_all(&outbound).await?;
@@ -212,4 +226,61 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b)
         .fold(0u8, |difference, (&x, &y)| difference | (x ^ y))
         == 0
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthTarget {
+    version: u16,
+    screen_id: u32,
+}
+fn screen_scope(id: u32) -> Vec<u8> {
+    format!("airbridge/v{}/screen/{id}", crate::protocol::VERSION).into_bytes()
+}
+/// Target selection is untrusted; protected content is sent only after proof.
+pub async fn authenticate_host_screen(
+    connection: &Connection,
+    pin_for: impl Fn(u32) -> Option<String>,
+) -> Result<u32> {
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    let target: AuthTarget = crate::protocol::receive_json(&mut recv).await?;
+    let pin = if target.version == crate::protocol::VERSION {
+        pin_for(target.screen_id)
+    } else {
+        None
+    };
+    let rejection = if target.version != crate::protocol::VERSION {
+        Some(crate::failure::FailureCode::VersionMismatch)
+    } else if pin.is_none() {
+        Some(crate::failure::FailureCode::ScreenUnavailable)
+    } else {
+        None
+    };
+    crate::protocol::send_json(&mut send, &rejection).await?;
+    send.finish()?;
+    let pin = pin.ok_or_else(|| anyhow!("Screen unavailable or protocol version mismatch"))?;
+    authenticate_host_scoped(connection, &pin, &screen_scope(target.screen_id)).await?;
+    Ok(target.screen_id)
+}
+pub async fn authenticate_viewer_screen(
+    connection: &Connection,
+    pin: &str,
+    screen_id: u32,
+) -> Result<()> {
+    validate_pin(pin)?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    crate::protocol::send_json(
+        &mut send,
+        &AuthTarget {
+            version: crate::protocol::VERSION,
+            screen_id,
+        },
+    )
+    .await?;
+    send.finish()?;
+    let rejection: Option<crate::failure::FailureCode> =
+        crate::protocol::receive_json(&mut recv).await?;
+    if let Some(reason) = rejection {
+        bail!("Host rejected screen selection: {reason:?}");
+    }
+    authenticate_viewer_scoped(connection, pin, &screen_scope(screen_id)).await
 }

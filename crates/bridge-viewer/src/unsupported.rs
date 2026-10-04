@@ -12,6 +12,7 @@ pub struct VideoFrame {
     pub error: Option<String>,
     pub closed: bool,
     pub user_closed: bool,
+    pub cleanup_complete: bool,
 }
 
 #[derive(Clone)]
@@ -42,13 +43,19 @@ impl VideoWindow {
         if let Ok(mut frame) = target.lock() {
             frame.error = Some(message.into());
             frame.closed = true;
+            frame.cleanup_complete = true;
         }
         Ok(Self {
             message: message.into(),
         })
     }
 
-    pub fn unavailable(message: String, _target: Arc<Mutex<VideoFrame>>) -> Self {
+    pub fn unavailable(message: String, target: Arc<Mutex<VideoFrame>>) -> Self {
+        if let Ok(mut frame) = target.lock() {
+            frame.error = Some(message.clone());
+            frame.closed = true;
+            frame.cleanup_complete = true;
+        }
         Self { message }
     }
 
@@ -58,6 +65,9 @@ impl VideoWindow {
         bail!("{}", self.message)
     }
 
+    pub async fn close_wait(&self) -> Result<()> {
+        self.close()
+    }
     pub fn close(&self) -> Result<()> {
         Ok(())
     }

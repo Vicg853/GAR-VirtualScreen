@@ -18,6 +18,8 @@ const SERVICE: &str = "_airbridge._udp.local.";
 pub struct DiscoveredHost {
     pub name: String,
     pub addresses: Vec<SocketAddr>,
+    pub screen_id: u32,
+    pub host_id: String,
 }
 
 pub struct Advertiser {
@@ -26,6 +28,9 @@ pub struct Advertiser {
 
 impl Advertiser {
     pub fn new(name: &str) -> Result<Self> {
+        Self::screen(name, 1, "legacy")
+    }
+    pub fn screen(name: &str, screen_id: u32, host_id: &str) -> Result<Self> {
         let daemon = ServiceDaemon::new()?;
         let service = ServiceInfo::new(
             SERVICE,
@@ -33,7 +38,11 @@ impl Advertiser {
             "airbridge.local.",
             (),
             PORT,
-            &[("version", "1")][..],
+            &[
+                ("version", crate::protocol::VERSION.to_string()),
+                ("screen", screen_id.to_string()),
+                ("host", host_id.to_owned()),
+            ][..],
         )?
         .enable_addr_auto();
         daemon.register(service)?;
@@ -93,6 +102,14 @@ pub fn browse(cancel: Arc<AtomicBool>) -> Result<DiscoveryBrowser> {
                 break;
             }
             if let ServiceEvent::ServiceResolved(info) = event {
+                if info
+                    .get_property_val_str("version")
+                    .and_then(|v| v.parse::<u16>().ok())
+                    != Some(crate::protocol::VERSION)
+                {
+                    continue;
+                }
+
                 let mut addresses: Vec<_> = info
                     .get_addresses()
                     .iter()
@@ -108,6 +125,14 @@ pub fn browse(cancel: Arc<AtomicBool>) -> Result<DiscoveryBrowser> {
                     .send(DiscoveryEvent::Found(DiscoveredHost {
                         name: info.get_fullname().to_owned(),
                         addresses,
+                        screen_id: info
+                            .get_property_val_str("screen")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1),
+                        host_id: info
+                            .get_property_val_str("host")
+                            .unwrap_or("unknown")
+                            .to_owned(),
                     }))
                     .is_err()
                 {

@@ -12,19 +12,18 @@ mod app {
     use anyhow::{Result, bail};
     use bridge_core::{
         config::{
-            CodecOption, Preset, VideoSettings, built_in_presets, load_custom_presets, negotiate,
+            CodecOption, Preset, VideoSettings, built_in_presets, load_custom_presets,
             save_custom_presets,
         },
         diagnostics::Diagnostics,
         discovery::Advertiser,
         lifecycle::{ScreenNavigation, ScreenView},
         protocol::{
-            AddScreenRequest, ChangeScreenSettingsRequest, ClientHello, ClientMessage,
-            ConfigRevision, HostMessage, MAX_SCREENS, MediaLane, MediaState, MediaStreamHello,
-            PORT, RequestId, ScreenConfig, ScreenId, StreamGeneration, VERSION, control_reader,
-            receive_json, send_control, send_debug_media, send_json, send_media,
+            ClientMessage, ConfigRevision, HostMessage, MAX_SCREENS, MediaLane, MediaState,
+            MediaStreamHello, PORT, RequestId, ScreenConfig, ScreenId, StreamGeneration, VERSION,
+            control_reader, receive_json, send_control, send_debug_media, send_json, send_media,
         },
-        security::{authenticate_host, server_endpoint},
+        security::server_endpoint,
         telemetry::{Outcome, Stage, StatsView, StreamStats, Telemetry, TimingView, now_us},
     };
     use gpui::{
@@ -35,7 +34,7 @@ mod app {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
@@ -43,6 +42,9 @@ mod app {
 
     #[derive(Clone)]
     struct HostScreen {
+        pin: String,
+        viewers: Vec<ViewerPeer>,
+        stats_peer: Option<u64>,
         screen_id: ScreenId,
         name: String,
         revision: ConfigRevision,
@@ -60,52 +62,36 @@ mod app {
         viewer_stats: bool,
     }
 
+    #[derive(Clone)]
+    struct ViewerPeer {
+        id: u64,
+        name: String,
+        status: String,
+        telemetry: Arc<Telemetry>,
+    }
+
     impl HostScreen {
         fn instrumented(&self) -> bool {
             self.stats_view.open || self.viewer_stats
         }
     }
-    fn ingest_diagnostic_batch(
-        shared: &Arc<Mutex<State>>,
-        batch: bridge_core::telemetry::DiagnosticBatch,
-    ) {
-        if let Ok(state) = shared.lock() {
-            if let Some(screen) = state.screens.iter().find(|s| {
-                s.screen_id == batch.screen_id
-                    && s.generation == batch.generation
-                    && s.instrumented()
-            }) {
-                screen.telemetry.peer_lost(batch.lost_events);
-                if let Some(stats) = batch.stats {
-                    screen.telemetry.peer_stats(stats);
-                }
-                for e in batch.events {
-                    screen.telemetry.ingest(e);
-                }
-            }
-        }
-    }
-
     enum HostUiCommand {
         AddScreen(ScreenId),
         ChangeSettings(ScreenId, VideoSettings),
         RemoveScreen(ScreenId),
         Diagnostics(ScreenId, bool),
         Burst(ScreenId),
-        Disconnect,
+        DisconnectPeer(ScreenId, u64),
     }
 
     #[derive(Clone)]
     struct State {
-        pin: String,
-        viewer_name: Option<String>,
-        selected_stats_viewer: Option<String>,
         message: String,
         settings: VideoSettings,
         screens: Vec<HostScreen>,
         navigation: ScreenNavigation,
         next_screen_id: ScreenId,
-        session_commands: Option<mpsc::UnboundedSender<HostUiCommand>>,
+        session_commands: Option<mpsc::Sender<HostUiCommand>>,
         presets: Vec<Preset>,
         selected: usize,
         frames: u64,
@@ -166,8 +152,7 @@ mod app {
         if screen.removing {
             return None;
         }
-        screen.settings = settings.clone();
-        screen.revision = screen.revision.saturating_add(1);
+
         screen.status = if state.session_commands.is_some() {
             "Applying updated settings…"
         } else {
@@ -186,7 +171,17 @@ mod app {
         state.next_screen_id = state.next_screen_id.saturating_add(1);
         let name = format!("Screen {screen_id}");
         let diagnostics = Arc::new(Diagnostics::new(&format!("host-screen-{screen_id}")));
+        let pin = match random_pin() {
+            Ok(pin) => pin,
+            Err(error) => {
+                state.message = format!("Cannot generate screen PIN: {error}");
+                return None;
+            }
+        };
         state.screens.push(HostScreen {
+            pin,
+            viewers: Vec::new(),
+            stats_peer: None,
             screen_id,
             name: name.clone(),
             revision: 0,
@@ -214,14 +209,14 @@ mod app {
             .collect::<Vec<_>>();
         if let Some(commands) = &state.session_commands {
             for id in ids {
-                let _ = commands.send(HostUiCommand::Diagnostics(id, false));
+                let _ = commands.try_send(HostUiCommand::Diagnostics(id, false));
             }
         }
         state.navigation.open(screen_id);
         state.show_codecs = false;
         state.show_logs = false;
         if let Some(commands) = &state.session_commands {
-            let _ = commands.send(HostUiCommand::AddScreen(screen_id));
+            let _ = commands.try_send(HostUiCommand::AddScreen(screen_id));
         }
         state.message = format!("{name} prepared");
         Some(screen_id)
@@ -294,7 +289,8 @@ mod app {
                     if let (Some((screen_id, settings)), Some(commands)) =
                         (update, state.session_commands.as_ref())
                     {
-                        let _ = commands.send(HostUiCommand::ChangeSettings(screen_id, settings));
+                        let _ =
+                            commands.try_send(HostUiCommand::ChangeSettings(screen_id, settings));
                     }
                 }
                 cx.notify();
@@ -306,16 +302,31 @@ mod app {
             if let Ok(mut state) = self.state.lock() {
                 for s in &mut state.screens {
                     if s.stats_view.open {
-                        s.stats_view.refresh(&s.telemetry);
+                        let telemetry = s
+                            .viewers
+                            .iter()
+                            .find(|p| Some(p.id) == s.stats_peer)
+                            .map(|p| p.telemetry.clone())
+                            .unwrap_or_else(|| s.telemetry.clone());
+                        s.stats_view.refresh(&telemetry);
                     }
                 }
             }
             let state = self.state.lock().unwrap().clone();
-            let selected_screen = state
+            let mut selected_screen = state
                 .screens
                 .iter()
                 .find(|screen| Some(screen.screen_id) == state.navigation.selected)
                 .cloned();
+            if let Some(screen) = &mut selected_screen {
+                if let Some(peer) = screen
+                    .viewers
+                    .iter()
+                    .find(|p| Some(p.id) == screen.stats_peer)
+                {
+                    screen.telemetry = peer.telemetry.clone();
+                }
+            }
             let screen_cards = state
                 .screens
                 .iter()
@@ -427,8 +438,9 @@ mod app {
                                 if let (Some((screen_id, settings)), Some(commands)) =
                                     (update, state.session_commands.as_ref())
                                 {
-                                    let _ = commands
-                                        .send(HostUiCommand::ChangeSettings(screen_id, settings));
+                                    let _ = commands.try_send(HostUiCommand::ChangeSettings(
+                                        screen_id, settings,
+                                    ));
                                 }
                             }
                             cx.notify();
@@ -631,7 +643,7 @@ mod app {
                                         s.stats_view.frozen = None;
                                         if let Some(commands) = &state.session_commands {
                                             let _ = commands
-                                                .send(HostUiCommand::Diagnostics(id, enabled));
+                                                .try_send(HostUiCommand::Diagnostics(id, enabled));
                                         }
                                     }
                                 }
@@ -640,31 +652,15 @@ mod app {
                     );
                 if screen.stats_view.open {
                     panel = panel
-                        .child(
-                            div()
-                                .id("stats-viewer-choice")
-                                .px_2()
-                                .py_1()
-                                .bg(rgb(if state.selected_stats_viewer == state.viewer_name {
-                                    0x35517a
-                                } else {
-                                    0x28354b
-                                }))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Ok(mut state) = this.state.lock() {
-                                        state.selected_stats_viewer = state.viewer_name.clone();
-                                    }
-                                    cx.notify();
-                                }))
-                                .child(format!(
-                                    "Selected viewer: {}",
-                                    state
-                                        .viewer_name
-                                        .clone()
-                                        .unwrap_or_else(|| "None connected".into())
-                                )),
-                        )
+                        .child(format!(
+                            "Stats target: {}",
+                            screen
+                                .viewers
+                                .iter()
+                                .find(|p| Some(p.id) == screen.stats_peer)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "Shared source (select a viewer below)".into())
+                        ))
                         .child("Temporary diagnostics · opening/closing restarts this stream")
                         .child(
                             div()
@@ -778,7 +774,8 @@ mod app {
                                                     );
                                                 }
                                                 if let Some(commands) = &state.session_commands {
-                                                    let _ = commands.send(HostUiCommand::Burst(id));
+                                                    let _ =
+                                                        commands.try_send(HostUiCommand::Burst(id));
                                                 }
                                             }
                                             cx.notify();
@@ -912,7 +909,7 @@ mod app {
                             .collect::<Vec<_>>();
                         if let Some(commands) = &state.session_commands {
                             for id in ids {
-                                let _ = commands.send(HostUiCommand::Diagnostics(id, false));
+                                let _ = commands.try_send(HostUiCommand::Diagnostics(id, false));
                             }
                         }
                         state.navigation.back();
@@ -944,6 +941,9 @@ mod app {
                     .flex_col()
                     .gap_3()
                     .child(details_toggle)
+                    .child(selected_screen.as_ref().map(|screen|format!("SCREEN PIN · {}",screen.pin)).unwrap_or_default())
+                    .child(div().id("capture-permission").p_2().rounded_md().bg(rgb(0x28354b)).cursor_pointer().child("Screen Recording access")
+                        .on_click(cx.listener(|this,_,_,cx|{let granted=mac::request_capture_access();set_message(&this.state,if granted{"Screen Recording is granted · retry this screen"}else{"Grant Screen Recording access to the launched app/executable, restart it and retry"});cx.notify();})))
                     .child(
                         div()
                             .flex()
@@ -970,7 +970,7 @@ mod app {
                                                         state.navigation.selected,
                                                         &state.session_commands,
                                                     ) {
-                                                        let _ = commands.send(
+                                                        let _ = commands.try_send(
                                                             HostUiCommand::ChangeSettings(
                                                                 screen_id,
                                                                 state.settings.clone(),
@@ -1007,7 +1007,7 @@ mod app {
                                                 if let Some((id, commands)) = selected {
                                                     if let Some(commands) = commands {
                                                         let _ = commands
-                                                            .send(HostUiCommand::RemoveScreen(id));
+                                                            .try_send(HostUiCommand::RemoveScreen(id));
                                                     } else {
                                                         remove_host_screen(&this.state, id);
                                                     }
@@ -1061,6 +1061,13 @@ mod app {
                                 )
                                 .child(codec_panel)
                                 .child(stats_panel)
+                                .child("Connected viewers")
+                                .children(selected_screen.as_ref().map(|s|s.viewers.clone()).unwrap_or_default().into_iter().map(|peer|{
+                                    let id=peer.id;let screen_id=selected_screen.as_ref().map(|s|s.screen_id).unwrap_or(0);let selected=selected_screen.as_ref().is_some_and(|s|s.stats_peer==Some(id));
+                                    div().id(("connected-viewer",id as usize)).p_2().rounded_md().bg(rgb(if selected{0x35517a}else{0x28354b})).flex().justify_between()
+                                      .child(div().id(("peer-stats",id as usize)).cursor_pointer().child(format!("{} · {} · select stats",peer.name,peer.status)).on_click(cx.listener(move|this,_,_,cx|{if let Ok(mut state)=this.state.lock(){if let Some(s)=state.screens.iter_mut().find(|s|s.screen_id==screen_id){s.stats_peer=Some(id);s.stats_view.reset();}}cx.notify();})))
+                                      .child(div().id(("disconnect-peer",id as usize)).px_2().cursor_pointer().child("Disconnect").on_click(cx.listener(move|this,_,_,cx|{if let Ok(state)=this.state.lock(){if let Some(commands)=&state.session_commands{let _=commands.try_send(HostUiCommand::DisconnectPeer(screen_id,id));}}cx.notify();})))
+                                }))
                         },
                     )
                     .child(
@@ -1158,27 +1165,6 @@ mod app {
                         .bg(rgb(0x203149))
                         .child(state.message.clone()),
                 )
-                .when(state.session_commands.is_some(), |this| {
-                    this.child(
-                        div()
-                            .id("host-disconnect")
-                            .mx_3()
-                            .my_2()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x573846))
-                            .cursor_pointer()
-                            .child("Disconnect viewer")
-                            .on_click(cx.listener(|this, _, _, _| {
-                                if let Ok(state) = this.state.lock() {
-                                    if let Some(commands) = &state.session_commands {
-                                        let _ = commands.send(HostUiCommand::Disconnect);
-                                    }
-                                }
-                            })),
-                    )
-                })
                 .child(
                     div()
                         .id("host-settings-scroll")
@@ -1189,15 +1175,6 @@ mod app {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .when(state.session_commands.is_none(), |this| {
-                            this.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xa8b8cf))
-                                    .child("PAIRING PIN"),
-                            )
-                            .child(div().text_xl().child(state.pin.clone()))
-                        })
                         .child(screen_list_panel)
                         .child(screen_details),
                 )
@@ -1209,80 +1186,6 @@ mod app {
         let mut random = [0; 4];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
         Ok(format!("{:06}", u32::from_le_bytes(random) % 1_000_000))
-    }
-
-    fn run_server(shared: Arc<Mutex<State>>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        let result = runtime.block_on(async move {
-            let endpoint =
-                server_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT))?;
-            let _advertiser = Advertiser::new("AirBridge Mac")?;
-            set_message(&shared, "Ready for a Linux viewer");
-            loop {
-                let incoming = tokio::select! {
-                    _ = shutdown.changed() => break,
-                    incoming = endpoint.accept() => { let Some(incoming) = incoming else { break; }; incoming }
-                };
-                let accepted = tokio::select! { _ = shutdown.changed() => break, accepted = incoming => accepted };
-                let connection = match accepted {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        set_message(&shared, format!("Connection failed: {error}"));
-                        continue;
-                    }
-                };
-                let result = handle_connection(connection.clone(), shared.clone(), shutdown.clone()).await;
-                match result {
-                    Ok(()) => set_message(&shared, "Viewer disconnected. Ready to reconnect."),
-                    Err(error) => set_message(&shared, format!("Connection error: {error:#}")),
-                }
-                connection.close(0u32.into(), b"session ended");
-                if *shutdown.borrow() { break; }
-            }
-            endpoint.close(0u32.into(), b"host shutdown");
-            Ok(())
-        });
-        runtime.shutdown_timeout(Duration::from_secs(2));
-        result
-    }
-
-    enum HostSessionEvent {
-        Wire(HostMessage),
-        RestartFinished {
-            screen_id: ScreenId,
-            request_id: Option<RequestId>,
-            kind: RestartKind,
-            result: std::result::Result<ScreenConfig, String>,
-        },
-        RemoveFinished {
-            screen_id: ScreenId,
-            request_id: Option<RequestId>,
-            result: std::result::Result<(), String>,
-        },
-        Finished {
-            screen_id: ScreenId,
-            generation: StreamGeneration,
-            error: Option<String>,
-        },
-    }
-
-    struct RunningStream {
-        generation: StreamGeneration,
-        stop: Arc<AtomicBool>,
-        cancel: Option<oneshot::Sender<()>>,
-        task: tokio::task::JoinHandle<()>,
-    }
-
-    impl Drop for RunningStream {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Release);
-            if let Some(cancel) = self.cancel.take() {
-                let _ = cancel.send(());
-            }
-            self.task.abort();
-        }
     }
 
     fn remove_host_screen(shared: &Arc<Mutex<State>>, screen_id: ScreenId) {
@@ -1307,1026 +1210,14 @@ mod app {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn schedule_screen_removal(
-        screen_id: ScreenId,
-        request_id: Option<RequestId>,
-        streams: &mut std::collections::HashMap<ScreenId, RunningStream>,
-        restarting: &mut std::collections::HashSet<ScreenId>,
-        removing: &mut std::collections::HashMap<ScreenId, Option<RequestId>>,
-        pending: &mut std::collections::HashMap<ScreenId, std::collections::VecDeque<RestartPlan>>,
-        operations: &mut tokio::task::JoinSet<()>,
-        shared: Arc<Mutex<State>>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-    ) {
-        let exists = shared
-            .lock()
-            .map(|state| {
-                state
-                    .screens
-                    .iter()
-                    .any(|screen| screen.screen_id == screen_id)
-            })
-            .unwrap_or(false);
-        if !exists || removing.contains_key(&screen_id) {
-            let _ = events.send(HostSessionEvent::Wire(HostMessage::Error {
-                request_id,
-                screen_id: Some(screen_id),
-                message: if exists {
-                    "Screen removal is already pending"
-                } else {
-                    "Screen does not exist"
-                }
-                .into(),
-            }));
-            return;
-        }
-        removing.insert(screen_id, request_id);
-        pending.remove(&screen_id);
-        set_screen_message(&shared, screen_id, "Removing screen…");
-        if let Ok(mut state) = shared.lock() {
-            if let Some(screen) = state.screens.iter_mut().find(|s| s.screen_id == screen_id) {
-                screen.removing = true;
-            }
-        }
-        if let Some(generation) = shared.lock().ok().and_then(|state| {
-            state
-                .screens
-                .iter()
-                .find(|s| s.screen_id == screen_id)
-                .map(|s| s.generation)
-        }) {
-            let _ = events.send(HostSessionEvent::Wire(HostMessage::StreamStatus {
-                screen_id,
-                generation,
-                lane: MediaLane::Video,
-                state: MediaState::Stopped,
-                message: "Screen is being removed".into(),
-            }));
-        }
-        // A close during reconfiguration wins over restarting that screen.
-        if restarting.contains(&screen_id) {
-            return;
-        }
-        restarting.insert(screen_id);
-        let previous = streams.remove(&screen_id);
-        operations.spawn(async move {
-            let result = if let Some(mut stream) = previous {
-                stop_running_stream(screen_id, &mut stream).await
-            } else {
-                Ok(())
-            };
-            let _ = events.send(HostSessionEvent::RemoveFinished {
-                screen_id,
-                request_id,
-                result: result.map_err(|error| format!("{error:#}")),
-            });
-        });
-    }
-
-    #[derive(Clone, Copy)]
-    enum RestartKind {
-        Added,
-        SettingsApplied,
-    }
-
-    struct RestartPlan {
-        screen_id: ScreenId,
-        request_id: Option<RequestId>,
-        kind: RestartKind,
-        settings: VideoSettings,
-        codec: CodecOption,
-        revision: Option<ConfigRevision>,
-    }
-
-    fn install_screen_settings(
-        shared: &Arc<Mutex<State>>,
-        screen_id: ScreenId,
-        settings: VideoSettings,
-        codec: CodecOption,
-        requested_revision: Option<ConfigRevision>,
-    ) -> Result<ScreenConfig> {
-        settings.validate()?;
-        let mut settings = settings;
-        settings.audio = false;
-        let mut state = shared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Host state is unavailable"))?;
-        let (name, revision, generation) = {
-            let screen = state
-                .screens
-                .iter_mut()
-                .find(|screen| screen.screen_id == screen_id)
-                .ok_or_else(|| anyhow::anyhow!("Screen {screen_id} does not exist"))?;
-            if let Some(revision) = requested_revision {
-                if revision <= screen.revision {
-                    bail!("Settings revision {revision} is stale for screen {screen_id}");
-                }
-                screen.revision = revision;
-            } else {
-                screen.revision = screen.revision.saturating_add(1).max(1);
-            }
-            screen.generation = screen.generation.saturating_add(1).max(1);
-            screen.settings = settings.clone();
-            screen.codec = Some(codec);
-            screen.status = "Starting updated stream…".into();
-            screen.frames = 0;
-            screen.dropped = 0;
-            screen.bytes = 0;
-            (screen.name.clone(), screen.revision, screen.generation)
-        };
-        if state.navigation.selected == Some(screen_id) {
-            state.settings = settings.clone();
-        }
-        let instrumented = state
-            .screens
-            .iter()
-            .find(|s| s.screen_id == screen_id)
-            .is_some_and(|s| s.instrumented());
-        if let Some(screen) = state.screens.iter_mut().find(|s| s.screen_id == screen_id) {
-            screen.telemetry = Telemetry::new();
-            screen.stats_view.reset();
-        }
-        Ok(ScreenConfig {
-            instrumented,
-            screen_id,
-            name,
-            revision,
-            generation,
-            settings,
-            codec,
-        })
-    }
-
-    fn insert_screen(shared: &Arc<Mutex<State>>, settings: VideoSettings) -> Result<ScreenId> {
-        settings.validate()?;
-        let mut state = shared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Host state is unavailable"))?;
-        if state.screens.len() >= MAX_SCREENS {
-            bail!("A maximum of {MAX_SCREENS} screens is supported");
-        }
-        let screen_id = state.next_screen_id;
-        state.next_screen_id = state.next_screen_id.saturating_add(1);
-        let name = format!("Screen {screen_id}");
-        state.screens.push(HostScreen {
-            screen_id,
-            name,
-            revision: 0,
-            generation: 0,
-            settings: settings.clone(),
-            codec: None,
-            status: "Prepared · waiting for a viewer".into(),
-            removing: false,
-            frames: 0,
-            dropped: 0,
-            bytes: 0,
-            diagnostics: Arc::new(Diagnostics::new(&format!("host-screen-{screen_id}"))),
-            telemetry: Telemetry::new(),
-            stats_view: StatsView::default(),
-            viewer_stats: false,
-        });
-        state.navigation.open(screen_id);
-        state.show_codecs = false;
-        state.show_logs = false;
-        state.settings = settings;
-        state.navigation.view = ScreenView::Details;
-        Ok(screen_id)
-    }
-
-    fn current_screen_settings(
-        shared: &Arc<Mutex<State>>,
-        screen_id: ScreenId,
-    ) -> Result<VideoSettings> {
-        shared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Host state is unavailable"))?
-            .screens
-            .iter()
-            .find(|screen| screen.screen_id == screen_id)
-            .map(|screen| screen.settings.clone())
-            .ok_or_else(|| anyhow::anyhow!("Screen {screen_id} does not exist"))
-    }
-
-    struct StreamWorkerGuard {
-        abort: tokio::task::AbortHandle,
-        stop: Arc<AtomicBool>,
-    }
-    impl Drop for StreamWorkerGuard {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Release);
-            self.abort.abort();
-        }
-    }
-
-    fn spawn_reported_stream(
-        screen_id: ScreenId,
-        generation: StreamGeneration,
-        stop: Arc<AtomicBool>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-        work: impl std::future::Future<Output = Result<()>> + Send + 'static,
-    ) -> tokio::task::JoinHandle<()> {
-        let worker = tokio::spawn(work);
-        // Capture the guard before spawning the supervisor, so aborting even
-        // an unpolled supervisor also cancels its child and signals capture.
-        let guard = StreamWorkerGuard {
-            abort: worker.abort_handle(),
-            stop,
-        };
-        tokio::spawn(async move {
-            let _guard = guard;
-            let error = match worker.await {
-                Ok(result) => result.err().map(|error| format!("{error:#}")),
-                Err(error) => Some(format!("Video worker stopped unexpectedly: {error}")),
-            };
-            let _ = events.send(HostSessionEvent::Finished {
-                screen_id,
-                generation,
-                error,
-            });
-        })
-    }
-
-    fn start_screen_stream(
-        connection: quinn::Connection,
-        screen: ScreenConfig,
-        shared: Arc<Mutex<State>>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-    ) -> RunningStream {
-        let screen_id = screen.screen_id;
-        let generation = screen.generation;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_capture = stop.clone();
-        let (cancel, cancel_rx) = oneshot::channel();
-        let task_events = events.clone();
-        let task_stop = stop.clone();
-        let task = spawn_reported_stream(
-            screen_id,
-            generation,
-            task_stop,
-            task_events,
-            run_screen_stream(connection, screen, shared, events, cancel_rx, stop_capture),
-        );
-        RunningStream {
-            generation,
-            stop,
-            cancel: Some(cancel),
-            task,
-        }
-    }
-
-    async fn stop_running_stream(screen_id: ScreenId, stream: &mut RunningStream) -> Result<()> {
-        stream.stop.store(true, Ordering::Release);
-        if let Some(cancel) = stream.cancel.take() {
-            let _ = cancel.send(());
-        }
-        match tokio::time::timeout(Duration::from_secs(12), &mut stream.task).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(anyhow::anyhow!(
-                "Stream task for screen {screen_id} failed: {error}"
-            )),
-            Err(_) => {
-                stream.task.abort();
-                let _ = (&mut stream.task).await;
-                Err(anyhow::anyhow!(
-                    "Timed out while stopping screen {screen_id}"
-                ))
-            }
-        }
-    }
-
-    fn schedule_screen_restart(
-        plan: RestartPlan,
-        streams: &mut std::collections::HashMap<ScreenId, RunningStream>,
-        restarting: &mut std::collections::HashSet<ScreenId>,
-        pending: &mut std::collections::HashMap<ScreenId, std::collections::VecDeque<RestartPlan>>,
-        operations: &mut tokio::task::JoinSet<()>,
-        shared: Arc<Mutex<State>>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-    ) {
-        let screen_id = plan.screen_id;
-        if restarting.contains(&screen_id) {
-            pending.entry(screen_id).or_default().push_back(plan);
-            return;
-        }
-        if let Some(revision) = plan.revision {
-            let current_revision = shared.lock().ok().and_then(|state| {
-                state
-                    .screens
-                    .iter()
-                    .find(|screen| screen.screen_id == screen_id)
-                    .map(|screen| screen.revision)
-            });
-            let error = match current_revision {
-                Some(current) if revision <= current => Some(format!(
-                    "Settings revision {revision} is stale for screen {screen_id}; current revision is {current}"
-                )),
-                None => Some(format!("Screen {screen_id} does not exist")),
-                _ => None,
-            };
-            if let Some(error) = error {
-                let _ = events.send(HostSessionEvent::RestartFinished {
-                    screen_id,
-                    request_id: plan.request_id,
-                    kind: plan.kind,
-                    result: Err(error),
-                });
-                return;
-            }
-        }
-        restarting.insert(screen_id);
-        let previous = streams.remove(&screen_id);
-        operations.spawn(async move {
-            let result: Result<ScreenConfig> = async {
-                if let Some(mut stream) = previous {
-                    stop_running_stream(screen_id, &mut stream).await?;
-                }
-                install_screen_settings(
-                    &shared,
-                    screen_id,
-                    plan.settings,
-                    plan.codec,
-                    plan.revision,
-                )
-            }
-            .await;
-            let _ = events.send(HostSessionEvent::RestartFinished {
-                screen_id,
-                request_id: plan.request_id,
-                kind: plan.kind,
-                result: result.map_err(|error| format!("{error:#}")),
-            });
-        });
-    }
-
-    async fn run_screen_stream(
-        connection: quinn::Connection,
-        screen: ScreenConfig,
-        shared: Arc<Mutex<State>>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-        cancel: oneshot::Receiver<()>,
-        stop: Arc<AtomicBool>,
-    ) -> Result<()> {
-        if screen.instrumented {
-            run_screen_stream_impl::<true>(connection, screen, shared, events, cancel, stop).await
-        } else {
-            run_screen_stream_impl::<false>(connection, screen, shared, events, cancel, stop).await
-        }
-    }
-    async fn run_screen_stream_impl<const DEBUG: bool>(
-        connection: quinn::Connection,
-        screen: ScreenConfig,
-        shared: Arc<Mutex<State>>,
-        events: mpsc::UnboundedSender<HostSessionEvent>,
-        mut cancel: oneshot::Receiver<()>,
-        stop: Arc<AtomicBool>,
-    ) -> Result<()> {
-        let screen_id = screen.screen_id;
-        let generation = screen.generation;
-        set_screen_generation_message(
-            &shared,
-            screen_id,
-            generation,
-            "Opening independent video channel…",
-        );
-        let mut media_send = connection.open_uni().await?;
-        send_json(
-            &mut media_send,
-            &MediaStreamHello {
-                version: VERSION,
-                screen_id,
-                generation,
-                lane: MediaLane::Video,
-            },
-        )
-        .await?;
-        let _ = events.send(HostSessionEvent::Wire(HostMessage::StreamStatus {
-            screen_id,
-            generation,
-            lane: MediaLane::Video,
-            state: MediaState::Starting,
-            message: "Preparing video capture".into(),
-        }));
-
-        let (packet_send, mut packet_recv) = mpsc::channel::<mac::EncodedPacket>(4);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let settings = screen.settings.clone();
-        let codec = screen.codec;
-        let telemetry = shared
-            .lock()
-            .unwrap()
-            .screens
-            .iter()
-            .find(|s| s.screen_id == screen_id)
-            .unwrap()
-            .telemetry
-            .clone();
-        let capture_telemetry = telemetry.clone();
-        let capture_state = shared.clone();
-        let capture_stop = stop.clone();
-        let capture_dropped = dropped.clone();
-        let mut capture = tokio::task::spawn_blocking(move || {
-            mac::capture::<DEBUG>(
-                screen_id,
-                generation,
-                settings,
-                codec,
-                packet_send,
-                capture_stop,
-                capture_dropped,
-                capture_telemetry,
-                |progress| {
-                    set_screen_generation_message(&capture_state, screen_id, generation, progress)
-                },
-            )
-        });
-
-        let mut first_frame = true;
-        let mut capture_result = None;
-        let mut stream_error = None;
-        let mut stats_timer = tokio::time::interval(Duration::from_secs(1));
-        stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_stats_at = tokio::time::Instant::now();
-        let mut last_stats_bytes = 0u64;
-        let mut last_stats_frames = 0;
-        let mut last_rtt = 0u64;
-        loop {
-            tokio::select! {
-                _ = &mut cancel => break,
-                _ = connection.closed() => break,
-                stopped = media_send.stopped() => {
-                    stream_error = Some(anyhow::anyhow!("Viewer closed the video lane: {stopped:?}"));
-                    break;
-                }
-                result = &mut capture, if capture_result.is_none() => {
-                    capture_result = Some(result);
-                    break;
-                }
-                packet = packet_recv.recv(), if capture_result.is_none() => {
-                    let Some(packet) = packet else { break; };
-                    if packet.header.screen_id != screen_id || packet.header.generation != generation {
-                        stream_error = Some(anyhow::anyhow!("Capture emitted a packet for a different screen generation"));
-                        break;
-                    }
-                    let generation_is_current = shared.lock().map(|state| {
-                        state.screens.iter().any(|entry| {
-                            entry.screen_id == screen_id && entry.generation == generation
-                        })
-                    }).unwrap_or(false);
-                    if !generation_is_current {
-                        break;
-                    }
-                    let write_start=if DEBUG {now_us()} else {0};
-                    if DEBUG {if let Some(t)=&packet.trace {t.mark(Stage::SendQueue,packet.queued_us,Some(write_start),Outcome::Complete,""); t.mark(Stage::Write,write_start,None,Outcome::Pending,"");}}
-                    let send = async {
-                        if DEBUG {send_debug_media(&mut media_send,&packet.header,packet.trace.as_ref().map(|t|t.capture_us),write_start,&packet.bytes).await}
-                        else {send_media(&mut media_send,&packet.header,&packet.bytes).await}
-                    };
-                    let sent = tokio::select! {
-                        _ = &mut cancel => break,
-                        _ = connection.closed() => break,
-                        result = tokio::time::timeout(Duration::from_secs(5), send) => {
-                            result.map_err(|_| anyhow::anyhow!("Viewer stopped accepting video for five seconds")).and_then(|result| result)
-                        }
-                    };
-                    if DEBUG {if let Some(t)=&packet.trace {t.mark(Stage::Write,write_start,Some(now_us()),if sent.is_ok(){Outcome::Complete}else{Outcome::Failed},&sent.as_ref().err().map(|e|e.to_string()).unwrap_or_default());}}
-                    if let Err(error) = sent {
-                        stream_error = Some(error);
-                        break;
-                    }
-                    if let Ok(mut state) = shared.lock() {
-                        if let Some(entry) = state.screens.iter_mut().find(|entry| entry.screen_id == screen_id && entry.generation == generation) {
-                            entry.bytes = entry.bytes.saturating_add(packet.bytes.len() as u64);
-                            entry.frames = entry.frames.saturating_add(1);
-                            entry.dropped = dropped.load(Ordering::Relaxed);
-
-                        }
-                    }
-                    if first_frame {
-                        first_frame = false;
-                        set_screen_generation_message(&shared, screen_id, generation, "Streaming video");
-                        let _ = events.send(HostSessionEvent::Wire(HostMessage::StreamStatus {
-                            screen_id,
-                            generation,
-                            lane: MediaLane::Video,
-                            state: MediaState::Ready,
-                            message: "Video frames are flowing".into(),
-                        }));
-                    }
-                }
-                _ = stats_timer.tick() => {
-                    let (frames, bytes) = shared.lock().ok()
-                        .and_then(|state| state.screens.iter().find(|entry| entry.screen_id == screen_id)
-                            .map(|entry| (entry.frames, entry.bytes)))
-                        .unwrap_or_default();
-                    let elapsed = last_stats_at.elapsed().as_secs_f64().max(0.001);
-                    let bitrate_kbps = (((bytes.saturating_sub(last_stats_bytes) as f64 * 8.0) / elapsed) / 1000.0)
-                        .round().clamp(0.0, u32::MAX as f64) as u32;
-                    if DEBUG {
-                        let rtt=connection.rtt().as_micros() as u64;
-                        let transport=connection.stats();
-                        telemetry.stats(StreamStats {at_us:now_us(),bitrate_kbps:bitrate_kbps as f64,fps:frames.saturating_sub(last_stats_frames) as f64/elapsed,frames,dropped:dropped.load(Ordering::Relaxed),rtt_us:rtt,jitter_us:rtt.abs_diff(last_rtt),lost_packets:transport.path.lost_packets,congestion_events:transport.path.congestion_events,send_queue:Some((packet_recv.max_capacity()-packet_recv.capacity()) as u32),..Default::default()});
-                        telemetry.expire(now_us() as i64,"Stage did not conclude within five seconds");
-                        last_rtt=rtt; last_stats_frames=frames;
-                    }
-                    last_stats_at = tokio::time::Instant::now();
-                    last_stats_bytes = bytes;
-                    let _ = events.send(HostSessionEvent::Wire(HostMessage::Stats {
-                        screen_id,
-                        generation,
-                        frames_sent: frames,
-                        frames_dropped: dropped.load(Ordering::Relaxed),
-                        bitrate_kbps,
-                    }));
-                }
-            }
-        }
-
-        stop.store(true, Ordering::Release);
-        drop(packet_recv);
-        if capture_result.is_none() {
-            capture_result = Some(capture.await);
-        }
-        if DEBUG {
-            let reason = stream_error
-                .as_ref()
-                .map(|e| e.to_string())
-                .or_else(|| {
-                    capture_result.as_ref().and_then(|r| match r {
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(e) => Some(e.to_string()),
-                        _ => None,
-                    })
-                })
-                .unwrap_or_else(|| "Stream stopped or restarted".into());
-            telemetry.finish(now_us() as i64, &reason);
-        }
-        let _ = media_send.finish();
-        if let Some(error) = stream_error {
-            return Err(error);
-        }
-        match capture_result.expect("capture task result is set") {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error.context(format!("Capture failed for screen {screen_id}"))),
-            Err(error) => Err(anyhow::anyhow!(
-                "Capture task for screen {screen_id} failed: {error}"
-            )),
-        }
-    }
-
-    async fn handle_connection(
-        connection: quinn::Connection,
-        shared: Arc<Mutex<State>>,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        set_message(&shared, "Authenticating viewer…");
-        let pin = shared.lock().unwrap().pin.clone();
-        let setup = async {
-            let authentication = tokio::time::timeout(
-                Duration::from_secs(12),
-                authenticate_host(&connection, &pin),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("PIN entry timed out"))?;
-            if authentication.is_err() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            authentication?;
-            let (control_send, mut control_recv) =
-                tokio::time::timeout(Duration::from_secs(8), connection.accept_bi())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Viewer did not open a control channel"))??;
-            let hello: ClientMessage =
-                tokio::time::timeout(Duration::from_secs(8), receive_json(&mut control_recv))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Viewer did not start a session"))??;
-            Ok::<_, anyhow::Error>((control_send, control_recv, hello))
-        };
-        let (mut control_send, control_recv, hello) = tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
-            result = setup => result?,
-        };
-        let ClientHello {
-            version,
-            codecs: viewer_options,
-            initial_settings: requested_settings,
-        } = match hello {
-            ClientMessage::Hello(hello) => hello,
-            _ => bail!("Expected a viewer greeting"),
-        };
-        if version != VERSION {
-            bail!("Viewer uses protocol version {version}; this host requires {VERSION}");
-        }
-        if viewer_options.is_empty() {
-            bail!("Viewer did not advertise any usable video codecs");
-        }
-        let (ui_commands, mut ui_rx) = mpsc::unbounded_channel::<HostUiCommand>();
-        let primary_id = match shared
-            .lock()
-            .ok()
-            .and_then(|state| state.screens.first().map(|screen| screen.screen_id))
-        {
-            Some(id) => id,
-            None => insert_screen(&shared, built_in_presets()[1].settings.clone())?,
-        };
-        let mut settings = match requested_settings {
-            Some(settings) => settings,
-            None => current_screen_settings(&shared, primary_id)?,
-        };
-        let audio_requested = settings.audio;
-        settings.audio = false;
-        settings.validate()?;
-        let host_options = mac::available_codecs();
-        let option = negotiate(&host_options, &viewer_options, settings.preferred_codec)?;
-        let primary = install_screen_settings(&shared, primary_id, settings.clone(), option, None)?;
-        send_control(
-            &mut control_send,
-            &HostMessage::Accepted {
-                screen: primary.clone(),
-            },
-        )
-        .await?;
-        if let Ok(mut state) = shared.lock() {
-            state.settings = settings.clone();
-            state.session_commands = Some(ui_commands);
-            state.viewer_name = Some(connection.remote_address().to_string());
-            state.selected_stats_viewer = state.viewer_name.clone();
-            state.frames = 0;
-            state.dropped = 0;
-            state.bytes = 0;
-            state.audio_notice =
-                audio_requested.then(|| "Audio unavailable · continuing with video only".into());
-            if let Some(notice) = &state.audio_notice {
-                state.diagnostics.record("host", notice);
-            }
-        }
-
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<HostSessionEvent>();
-        let mut streams = std::collections::HashMap::<ScreenId, RunningStream>::new();
-        let mut restarting = std::collections::HashSet::<ScreenId>::new();
-        let mut removing = std::collections::HashMap::<ScreenId, Option<RequestId>>::new();
-        let mut pending_restarts =
-            std::collections::HashMap::<ScreenId, std::collections::VecDeque<RestartPlan>>::new();
-        streams.insert(
-            primary_id,
-            start_screen_stream(
-                connection.clone(),
-                primary,
-                shared.clone(),
-                event_tx.clone(),
-            ),
-        );
-
-        let stats_state = shared.clone();
-        let diagnostic_send = tokio::spawn(bridge_core::telemetry_transport::send_batches(
-            connection.clone(),
-            move || {
-                stats_state
-                    .lock()
-                    .map(|s| {
-                        s.screens
-                            .iter()
-                            .filter(|s| s.stats_view.open || s.viewer_stats)
-                            .map(|s| (s.screen_id, s.generation, s.telemetry.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            },
-        ));
-        let diagnostic_connection = connection.clone();
-        let diagnostic_state = shared.clone();
-        let diagnostic_receive = tokio::spawn(async move {
-            while let Ok(mut stream) = diagnostic_connection.accept_uni().await {
-                let hello = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    receive_json::<_, MediaStreamHello>(&mut stream),
-                )
-                .await;
-                if !matches!(
-                    hello,
-                    Ok(Ok(MediaStreamHello {
-                        version: VERSION,
-                        lane: MediaLane::Diagnostics,
-                        ..
-                    }))
-                ) {
-                    let _ = stream.stop(0u32.into());
-                    continue;
-                }
-                let state = diagnostic_state.clone();
-                let _ = bridge_core::telemetry_transport::receive_batches(stream, move |batch| {
-                    ingest_diagnostic_batch(&state, batch)
-                })
-                .await;
-            }
-        });
-        let (mut control_messages, control_task) = control_reader::<_, ClientMessage>(control_recv);
-        let mut operations = tokio::task::JoinSet::new();
-        // Every fallible session operation is inside this block so cleanup always runs.
-        let session_result: Result<()> = async {
-        // Screens prepared before the viewer connected are announced and
-        // started independently on their own QUIC video streams.
-        let prepared_ids = shared
-            .lock()
-            .map(|state| {
-                state
-                    .screens
-                    .iter()
-                    .map(|screen| screen.screen_id)
-                    .filter(|id| *id != primary_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for screen_id in prepared_ids {
-            let prepared = current_screen_settings(&shared, screen_id).and_then(|settings| {
-                let codec = negotiate(&host_options, &viewer_options, settings.preferred_codec)?;
-                install_screen_settings(&shared, screen_id, settings, codec, None)
-            });
-            match prepared {
-                Ok(screen) => {
-                    send_control(
-                        &mut control_send,
-                        &HostMessage::ScreenAdded {
-                            request_id: None,
-                            screen: screen.clone(),
-                        },
-                    )
-                    .await?;
-                    streams.insert(
-                        screen_id,
-                        start_screen_stream(
-                            connection.clone(),
-                            screen,
-                            shared.clone(),
-                            event_tx.clone(),
-                        ),
-                    );
-                }
-                Err(error) => {
-                    let detail = format!("Prepared stream unavailable: {error:#}");
-                    set_screen_message(&shared, screen_id, &detail);
-                    send_control(
-                        &mut control_send,
-                        &HostMessage::Error {
-                            request_id: None,
-                            screen_id: Some(screen_id),
-                            message: detail,
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        set_message(&shared, format!("Streaming {} screen(s)", streams.len()));
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => break Ok(()),
-                reason = connection.closed() => break Err(anyhow::anyhow!("Viewer disconnected: {reason}")),
-                completed = operations.join_next(), if !operations.is_empty() => {
-                    if let Some(Err(error)) = completed { break Err(anyhow::anyhow!("Screen operation task failed: {error}")); }
-                }
-                event = event_rx.recv() => {
-                    match event {
-                        Some(HostSessionEvent::Wire(message)) => send_control(&mut control_send, &message).await?,
-                        Some(HostSessionEvent::RestartFinished { screen_id, request_id, kind, result }) => {
-                            restarting.remove(&screen_id);
-                            if let Some(request_id) = removing.remove(&screen_id) {
-                                pending_restarts.remove(&screen_id);
-                                remove_host_screen(&shared, screen_id);
-                                send_control(&mut control_send, &HostMessage::ScreenRemoved { request_id, screen_id }).await?;
-                                continue;
-                            }
-                            match result {
-                                Ok(screen) => {
-                                    let response = match kind {
-                                        RestartKind::Added => HostMessage::ScreenAdded { request_id, screen: screen.clone() },
-                                        RestartKind::SettingsApplied => HostMessage::ScreenSettingsApplied { request_id, screen: screen.clone() },
-                                    };
-                                    send_control(&mut control_send, &response).await?;
-                                    streams.insert(screen_id, start_screen_stream(connection.clone(), screen, shared.clone(), event_tx.clone()));
-                                }
-                                Err(error) => {
-                                    set_screen_message(&shared, screen_id, &format!("Stream update failed: {error}"));
-                                    if matches!(kind, RestartKind::Added) {
-                                        if let Ok(mut state) = shared.lock() {
-                                            state.screens.retain(|screen| screen.screen_id != screen_id);
-                                            let fallback = state.screens.first().map(|screen| screen.screen_id);
-                                            state.navigation.remove(screen_id, fallback);
-                                        }
-                                    }
-                                    send_control(&mut control_send, &HostMessage::Error {
-                                        request_id,
-                                        screen_id: Some(screen_id),
-                                        message: format!("Stream update failed: {error}"),
-                                    }).await?;
-                                }
-                            }
-                            let next = pending_restarts.get_mut(&screen_id).and_then(|queue| queue.pop_front());
-                            if pending_restarts.get(&screen_id).is_some_and(|queue| queue.is_empty()) {
-                                pending_restarts.remove(&screen_id);
-                            }
-                            if let Some(plan) = next {
-                                schedule_screen_restart(plan, &mut streams, &mut restarting, &mut pending_restarts, &mut operations, shared.clone(), event_tx.clone());
-                            }
-                        }
-                        Some(HostSessionEvent::RemoveFinished { screen_id, request_id, result }) => {
-                            restarting.remove(&screen_id);
-                            removing.remove(&screen_id);
-                            match result {
-                                Ok(()) => {
-                                    remove_host_screen(&shared, screen_id);
-                                    send_control(&mut control_send, &HostMessage::ScreenRemoved { request_id, screen_id }).await?;
-                                }
-                                Err(error) => {
-                                    if let Ok(mut state) = shared.lock() { if let Some(screen) = state.screens.iter_mut().find(|s| s.screen_id == screen_id) { screen.removing = false; screen.status = format!("Could not remove screen: {error}"); } }
-                                    send_control(&mut control_send, &HostMessage::Error { request_id, screen_id: Some(screen_id), message: format!("Could not remove screen: {error}") }).await?;
-                                }
-                            }
-                        }
-                        Some(HostSessionEvent::Finished { screen_id, generation, error }) => {
-                            let current = streams.get(&screen_id).is_some_and(|stream| stream.generation == generation);
-                            if current {
-                                if let Some(mut stream) = streams.remove(&screen_id) {
-                                    let _ = (&mut stream.task).await;
-                                }
-                                let (state, message) = match error {
-                                    Some(error) => (MediaState::Failed, format!("Video stream failed: {error}")),
-                                    None => (MediaState::Stopped, "Video stream stopped".into()),
-                                };
-                                set_screen_message(&shared, screen_id, &message);
-                                send_control(&mut control_send, &HostMessage::StreamStatus {
-                                    screen_id, generation, lane: MediaLane::Video, state, message,
-                                }).await?;
-                            }
-                        }
-                        None => {},
-                    }
-                }
-                ui_command = ui_rx.recv() => {
-                    match ui_command {
-                        Some(HostUiCommand::AddScreen(screen_id)) => {
-                            if !streams.contains_key(&screen_id) && !restarting.contains(&screen_id) {
-                                match current_screen_settings(&shared, screen_id)
-                                    .and_then(|settings| {
-                                        let option = negotiate(&host_options, &viewer_options, settings.preferred_codec)?;
-                                        Ok((settings, option))
-                                    }) {
-                                    Ok((settings, option)) => {
-                                        schedule_screen_restart(
-                                            RestartPlan { screen_id, request_id: None, kind: RestartKind::Added, settings, codec: option, revision: None },
-                                            &mut streams, &mut restarting, &mut pending_restarts, &mut operations,
-                                            shared.clone(), event_tx.clone(),
-                                        );
-                                    }
-                                    Err(error) => send_control(&mut control_send, &HostMessage::Error { request_id: None, screen_id: Some(screen_id), message: format!("Cannot prepare screen: {error:#}") }).await?,
-                                }
-                            }
-                        }
-                        Some(HostUiCommand::ChangeSettings(screen_id, settings)) => {
-                            if removing.contains_key(&screen_id) { continue; }
-                            let result = settings.validate().and_then(|()| {
-                                negotiate(&host_options, &viewer_options, settings.preferred_codec)
-                            });
-                            match result {
-                                Ok(codec) => schedule_screen_restart(
-                                    RestartPlan { screen_id, request_id: None, kind: RestartKind::SettingsApplied, settings, codec, revision: None },
-                                    &mut streams, &mut restarting, &mut pending_restarts, &mut operations,
-                                    shared.clone(), event_tx.clone(),
-                                ),
-                                Err(error) => send_control(&mut control_send, &HostMessage::Error { request_id: None, screen_id: Some(screen_id), message: format!("Settings change failed: {error:#}") }).await?,
-                            }
-                        }
-                        Some(HostUiCommand::RemoveScreen(screen_id)) => {
-                            schedule_screen_removal(screen_id, None, &mut streams, &mut restarting,
-                                &mut removing, &mut pending_restarts, &mut operations, shared.clone(), event_tx.clone());
-                        }
-                        Some(HostUiCommand::Diagnostics(screen_id,enabled)) => {
-                            if removing.contains_key(&screen_id) {continue;}
-                            let restart=shared.lock().ok().and_then(|mut state|{let s=state.screens.iter_mut().find(|s|s.screen_id==screen_id)?;s.stats_view.open=enabled;Some((s.settings.clone(),s.codec?))});
-                            if let Some((settings,codec))=restart {schedule_screen_restart(RestartPlan{screen_id,request_id:None,kind:RestartKind::SettingsApplied,settings,codec,revision:None},&mut streams,&mut restarting,&mut pending_restarts,&mut operations,shared.clone(),event_tx.clone());}
-                        }
-                        Some(HostUiCommand::Burst(id))=>{if let Ok(state)=shared.lock(){if let Some(s)=state.screens.iter().find(|s|s.screen_id==id){s.telemetry.burst();}}}
-                        Some(HostUiCommand::Disconnect) => break Ok(()),
-                        None => break Ok(()),
-                    }
-                }
-                command = control_messages.recv() => {
-                    match command {
-                        Some(Ok(ClientMessage::ClockProbe{t1}))=>{let t2=now_us();send_control(&mut control_send,&HostMessage::ClockReply{t1,t2,t3:now_us()}).await?;}
-                        Some(Ok(ClientMessage::TraceBurst{screen_id}))=>{if let Ok(state)=shared.lock(){if let Some(s)=state.screens.iter().find(|s|s.screen_id==screen_id){s.telemetry.burst();}}}
-                        Some(Ok(ClientMessage::Diagnostics{screen_id,enabled}))=>{
-                            if removing.contains_key(&screen_id) {continue;}
-                            let restart=shared.lock().ok().and_then(|mut state|{let s=state.screens.iter_mut().find(|s|s.screen_id==screen_id)?;s.viewer_stats=enabled;Some((s.settings.clone(),s.codec?))});
-                            if let Some((settings,codec))=restart{schedule_screen_restart(RestartPlan{screen_id,request_id:None,kind:RestartKind::SettingsApplied,settings,codec,revision:None},&mut streams,&mut restarting,&mut pending_restarts,&mut operations,shared.clone(),event_tx.clone());}
-                        }
-                        Some(Ok(ClientMessage::Stop)) => break Ok(()),
-                        Some(Ok(ClientMessage::AddScreen(AddScreenRequest { request_id, settings }))) => {
-                            let mut settings = settings.unwrap_or_else(|| shared.lock().map(|state| state.settings.clone()).unwrap_or_else(|_| built_in_presets()[1].settings.clone()));
-                            settings.audio = false;
-                            let result = settings.validate().and_then(|()| {
-                                negotiate(&host_options, &viewer_options, settings.preferred_codec)
-                            });
-                            match result {
-                                Ok(codec) => match insert_screen(&shared, settings.clone()) {
-                                    Ok(screen_id) => schedule_screen_restart(
-                                        RestartPlan { screen_id, request_id: Some(request_id), kind: RestartKind::Added, settings, codec, revision: None },
-                                        &mut streams, &mut restarting, &mut pending_restarts, &mut operations,
-                                        shared.clone(), event_tx.clone(),
-                                    ),
-                                    Err(error) => send_control(&mut control_send, &HostMessage::Error { request_id: Some(request_id), screen_id: None, message: format!("Cannot add screen: {error:#}") }).await?,
-                                },
-                                Err(error) => send_control(&mut control_send, &HostMessage::Error { request_id: Some(request_id), screen_id: None, message: format!("Cannot add screen: {error:#}") }).await?,
-                            }
-                        }
-                        Some(Ok(ClientMessage::ChangeScreenSettings(ChangeScreenSettingsRequest { request_id, screen_id, revision, mut settings }))) => {
-                            settings.audio = false;
-                            if removing.contains_key(&screen_id) {
-                                send_control(&mut control_send, &HostMessage::Error { request_id: Some(request_id), screen_id: Some(screen_id), message: "The screen is being removed".into() }).await?;
-                                continue;
-                            }
-                            let result = settings.validate().and_then(|()| {
-                                negotiate(&host_options, &viewer_options, settings.preferred_codec)
-                            });
-                            match result {
-                                Ok(codec) => schedule_screen_restart(
-                                    RestartPlan { screen_id, request_id: Some(request_id), kind: RestartKind::SettingsApplied, settings, codec, revision: Some(revision) },
-                                    &mut streams, &mut restarting, &mut pending_restarts, &mut operations,
-                                    shared.clone(), event_tx.clone(),
-                                ),
-                                Err(error) => send_control(&mut control_send, &HostMessage::Error { request_id: Some(request_id), screen_id: Some(screen_id), message: format!("Settings change failed: {error:#}") }).await?,
-                            }
-                        }
-                        Some(Ok(ClientMessage::RemoveScreen { request_id, screen_id })) => {
-                            schedule_screen_removal(screen_id, Some(request_id), &mut streams, &mut restarting,
-                                &mut removing, &mut pending_restarts, &mut operations, shared.clone(), event_tx.clone());
-                        }
-                        Some(Ok(ClientMessage::Hello(_))) => send_control(&mut control_send, &HostMessage::Error { request_id: None, screen_id: None, message: "Hello may only be sent once".into() }).await?,
-                        Some(Err(error)) => break Err(anyhow::anyhow!("Viewer control channel closed: {error}")),
-                        None => break Err(anyhow::anyhow!("Viewer control channel ended")),
-                    }
-                }
-            }
-        }
-        }.await;
-        // Notify the peer immediately, even if an OS capture callback takes time to stop.
-        connection.close(0u32.into(), b"host session ended");
-        // Cancelling owned operations drops their stream guards and stops capture.
-        operations.abort_all();
-        while operations.join_next().await.is_some() {}
-        diagnostic_send.abort();
-        diagnostic_receive.abort();
-        let _ = diagnostic_send.await;
-        let _ = diagnostic_receive.await;
-        control_task.abort();
-        let _ = control_task.await;
-        let active_streams = std::mem::take(&mut streams);
-        let mut cleanup = tokio::task::JoinSet::new();
-        for (screen_id, mut stream) in active_streams {
-            cleanup.spawn(async move {
-                let result = stop_running_stream(screen_id, &mut stream).await;
-                (screen_id, result)
-            });
-        }
-        while let Some(result) = cleanup.join_next().await {
-            match result {
-                Ok((screen_id, Err(error))) => {
-                    set_screen_message(&shared, screen_id, &format!("Stream cleanup: {error:#}"));
-                }
-                Err(error) => set_message(&shared, format!("Stream cleanup task failed: {error}")),
-                _ => {}
-            }
-        }
-        if let Ok(mut state) = shared.lock() {
-            state.session_commands = None;
-            state.viewer_name = None;
-            state.selected_stats_viewer = None;
-            state.navigation.back();
-            state.show_codecs = false;
-            state.show_logs = false;
-            state.frames = 0;
-            state.dropped = 0;
-            state.bytes = 0;
-            for screen in &mut state.screens {
-                screen.status = "Prepared · waiting for a viewer".into();
-                screen.removing = false;
-                screen.frames = 0;
-                screen.dropped = 0;
-                screen.bytes = 0;
-            }
-        }
-        session_result?;
-        Ok(())
-    }
-
     fn initial_state(presets: Vec<Preset>, pin: String) -> State {
         State {
-            pin,
-            viewer_name: None,
-            selected_stats_viewer: None,
             message: "Starting…".into(),
             settings: presets[1].settings.clone(),
             screens: vec![HostScreen {
+                pin: pin.clone(),
+                viewers: Vec::new(),
+                stats_peer: None,
                 screen_id: 1,
                 name: "Screen 1".into(),
                 revision: 0,
@@ -2440,197 +1331,25 @@ mod app {
         let _ = shutdown.send(true);
         let _ = server_thread.join();
     }
+    include!("service.rs");
+    fn run_server(shared: Arc<Mutex<State>>, shutdown: watch::Receiver<bool>) -> Result<()> {
+        service::run(shared, shutdown)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
-        fn state() -> Arc<Mutex<State>> {
-            Arc::new(Mutex::new(initial_state(
-                built_in_presets(),
-                "123456".into(),
-            )))
-        }
         #[test]
-        fn stats_owners_are_independent_and_restarts_change_generation() {
-            let shared = state();
-            let settings = current_screen_settings(&shared, 1).unwrap();
-            let codec = mac::available_codecs()[0];
-            let normal =
-                install_screen_settings(&shared, 1, settings.clone(), codec, None).unwrap();
-            assert!(!normal.instrumented);
-            shared.lock().unwrap().screens[0].stats_view.open = true;
-            let debug = install_screen_settings(&shared, 1, settings.clone(), codec, None).unwrap();
-            assert!(debug.instrumented);
-            assert!(debug.generation > normal.generation);
-            {
-                let mut state = shared.lock().unwrap();
-                state.screens[0].viewer_stats = true;
-                state.screens[0].stats_view.open = false;
-            }
-            assert!(
-                install_screen_settings(&shared, 1, settings.clone(), codec, None)
-                    .unwrap()
-                    .instrumented
-            );
-            shared.lock().unwrap().screens[0].viewer_stats = false;
-            assert!(
-                !install_screen_settings(&shared, 1, settings, codec, None)
-                    .unwrap()
-                    .instrumented
-            );
-        }
-
-        #[test]
-        fn removing_selected_and_last_host_screen_repairs_navigation() {
-            let shared = state();
-            let second = insert_screen(&shared, built_in_presets()[0].settings.clone()).unwrap();
-            {
-                let mut state = shared.lock().unwrap();
-                state.show_codecs = true;
-                state.show_logs = true;
-            }
-            remove_host_screen(&shared, second);
-            {
-                let state = shared.lock().unwrap();
-                assert_eq!(state.navigation.selected, Some(1));
-                assert_eq!(state.navigation.view, ScreenView::List);
-                assert!(!state.show_logs && !state.show_codecs);
-            }
+        fn screen_pins_and_selection_are_independent() {
+            let mut s = initial_state(built_in_presets(), "123456".into());
+            assert_eq!(s.screens[0].pin, "123456");
+            let id = add_host_screen(&mut s).unwrap();
+            assert_eq!(s.navigation.selected, Some(id));
+            assert_eq!(s.screens.len(), 2);
+            assert_eq!(s.screens[1].pin.len(), 6);
+            let shared = Arc::new(Mutex::new(s));
             remove_host_screen(&shared, 1);
-            remove_host_screen(&shared, 1);
-            let state = shared.lock().unwrap();
-            assert!(state.screens.is_empty());
-            assert_eq!(state.navigation.selected, None);
-        }
-        #[tokio::test]
-        async fn dropping_stream_guard_stops_capture_and_aborts_task() {
-            let stop = Arc::new(AtomicBool::new(false));
-            let (cancel, cancelled) = oneshot::channel();
-            let task = tokio::spawn(std::future::pending::<()>());
-            let aborted = task.abort_handle();
-            drop(RunningStream {
-                generation: 1,
-                stop: stop.clone(),
-                cancel: Some(cancel),
-                task,
-            });
-            assert!(stop.load(Ordering::Acquire));
-            assert!(cancelled.await.is_ok());
-            tokio::task::yield_now().await;
-            assert!(aborted.is_finished());
-        }
-        #[tokio::test]
-        async fn aborting_the_supervisor_also_drops_its_media_worker() {
-            struct Dropped(Option<oneshot::Sender<()>>);
-            impl Drop for Dropped {
-                fn drop(&mut self) {
-                    if let Some(send) = self.0.take() {
-                        let _ = send.send(());
-                    }
-                }
-            }
-            let stop = Arc::new(AtomicBool::new(false));
-            let (send, _receive) = mpsc::unbounded_channel();
-            let (dropped, did_drop) = oneshot::channel();
-            let notify = Dropped(Some(dropped));
-            let task = spawn_reported_stream(4, 9, stop.clone(), send, async move {
-                let _notify = notify;
-                std::future::pending::<()>().await;
-                Ok(())
-            });
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            tokio::time::timeout(Duration::from_secs(1), did_drop)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(stop.load(Ordering::Acquire));
-        }
-
-        #[tokio::test]
-        async fn worker_panic_reports_its_screen_and_generation_and_stops_capture() {
-            let stop = Arc::new(AtomicBool::new(false));
-            let (send, mut receive) = mpsc::unbounded_channel();
-            let task = spawn_reported_stream(4, 9, stop.clone(), send, async {
-                panic!("simulated video worker failure")
-            });
-            task.await.unwrap();
-            match receive.recv().await.unwrap() {
-                HostSessionEvent::Finished {
-                    screen_id,
-                    generation,
-                    error,
-                } => {
-                    assert_eq!((screen_id, generation), (4, 9));
-                    assert!(error.unwrap().contains("panicked"));
-                }
-                _ => panic!("unexpected event"),
-            }
-            assert!(stop.load(Ordering::Acquire));
-        }
-
-        #[tokio::test]
-        async fn removal_during_restart_discards_queued_restarts() {
-            let shared = state();
-            let mut streams = std::collections::HashMap::new();
-            let mut restarting = std::collections::HashSet::from([1]);
-            let mut removing = std::collections::HashMap::new();
-            let mut pending = std::collections::HashMap::new();
-            let codec = CodecOption {
-                codec: bridge_core::config::Codec::H264,
-                acceleration: bridge_core::config::Acceleration::Software,
-            };
-            pending.insert(
-                1,
-                std::collections::VecDeque::from([RestartPlan {
-                    screen_id: 1,
-                    request_id: Some(11),
-                    kind: RestartKind::SettingsApplied,
-                    settings: built_in_presets()[1].settings.clone(),
-                    codec,
-                    revision: Some(3),
-                }]),
-            );
-            let mut operations = tokio::task::JoinSet::new();
-            let (send, mut receive) = mpsc::unbounded_channel();
-            schedule_screen_removal(
-                1,
-                Some(12),
-                &mut streams,
-                &mut restarting,
-                &mut removing,
-                &mut pending,
-                &mut operations,
-                shared.clone(),
-                send.clone(),
-            );
-            assert_eq!(removing.get(&1), Some(&Some(12)));
-            assert!(pending.is_empty());
-            assert!(operations.is_empty());
-            assert!(matches!(
-                receive.recv().await,
-                Some(HostSessionEvent::Wire(HostMessage::StreamStatus {
-                    state: MediaState::Stopped,
-                    ..
-                }))
-            ));
-            schedule_screen_removal(
-                1,
-                Some(13),
-                &mut streams,
-                &mut restarting,
-                &mut removing,
-                &mut pending,
-                &mut operations,
-                shared,
-                send,
-            );
-            assert!(matches!(
-                receive.recv().await,
-                Some(HostSessionEvent::Wire(HostMessage::Error {
-                    request_id: Some(13),
-                    ..
-                }))
-            ));
+            assert_eq!(shared.lock().unwrap().screens.len(), 1);
         }
     }
 }

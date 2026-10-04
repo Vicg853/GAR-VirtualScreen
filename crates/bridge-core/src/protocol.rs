@@ -14,7 +14,8 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
+pub const MAX_VIEWERS_PER_SCREEN: usize = 8;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
 pub const MAX_MEDIA: usize = 8 * 1024 * 1024;
@@ -78,12 +79,22 @@ pub enum ClientMessage {
     ClockProbe {
         t1: u64,
     },
+    VideoStopped {
+        screen_id: ScreenId,
+        generation: StreamGeneration,
+    },
     Stop,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum HostMessage {
+    SessionAccepted {
+        host_id: String,
+        viewer_id: u64,
+        screen: ScreenConfig,
+    },
+    Failure(crate::failure::Failure),
     ClockReply {
         t1: u64,
         t2: u64,
@@ -139,6 +150,9 @@ pub enum MediaLane {
 #[serde(rename_all = "snake_case")]
 pub enum MediaState {
     Starting,
+    WaitingForFirstFrame,
+    Restarting,
+    Stopping,
     Ready,
     Failed,
     Stopped,

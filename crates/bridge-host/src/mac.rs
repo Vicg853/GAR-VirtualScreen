@@ -25,6 +25,7 @@ use videotoolbox::{
 
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
     fn airbridge_display_create(
         width: u32,
         height: u32,
@@ -32,6 +33,7 @@ unsafe extern "C" {
         display_id: *mut u32,
     ) -> *mut c_void;
     fn airbridge_display_release(display: *mut c_void);
+    fn airbridge_display_update(display: *mut c_void, width: u32, height: u32, fps: u32) -> bool;
     fn airbridge_video_stream_start(
         display_id: u32,
         width: u32,
@@ -41,6 +43,7 @@ unsafe extern "C" {
         callback: extern "C" fn(*mut c_void, *const u8, usize, usize),
         error_code: *mut i32,
     ) -> *mut c_void;
+    #[cfg(not(test))]
     fn airbridge_video_stream_stop(stream: *mut c_void) -> bool;
 }
 
@@ -55,10 +58,20 @@ pub fn capture_permission_diagnostic() -> String {
     )
 }
 
-struct VirtualDisplay(*mut c_void);
+static DISPLAY_OPERATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static QUARANTINED: AtomicBool = AtomicBool::new(false);
+pub(crate) struct VirtualDisplay(*mut c_void);
 
 impl VirtualDisplay {
-    fn new(settings: &VideoSettings) -> Result<(Self, u32)> {
+    pub(crate) fn new(settings: &VideoSettings) -> Result<(Self, u32)> {
+        let _serial = DISPLAY_OPERATIONS
+            .lock()
+            .map_err(|_| anyhow!("Display manager unavailable"))?;
+        if QUARANTINED.load(Ordering::Acquire) {
+            bail!(
+                "Capture cleanup was not confirmed; restart the host before creating another display"
+            );
+        }
         let mut id = 0;
         let ptr = unsafe {
             airbridge_display_create(settings.width, settings.height, settings.fps, &mut id)
@@ -72,8 +85,40 @@ impl VirtualDisplay {
     }
 }
 
+impl VirtualDisplay {
+    pub(crate) fn update(&self, settings: &VideoSettings) -> Result<()> {
+        let _serial = DISPLAY_OPERATIONS
+            .lock()
+            .map_err(|_| anyhow!("Display manager unavailable"))?;
+        if QUARANTINED.load(Ordering::Acquire) {
+            bail!("Capture cleanup unconfirmed; restart the host before reconfiguring");
+        }
+        if !unsafe {
+            airbridge_display_update(self.0, settings.width, settings.height, settings.fps)
+        } {
+            bail!("macOS could not update virtual display settings");
+        }
+        Ok(())
+    }
+}
+pub(crate) fn quarantine_capture() {
+    QUARANTINED.store(true, Ordering::Release);
+}
+
+pub(crate) fn capture_allowed() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
 impl Drop for VirtualDisplay {
     fn drop(&mut self) {
+        let Ok(_serial) = DISPLAY_OPERATIONS.lock() else {
+            quarantine_capture();
+            return;
+        };
+        if QUARANTINED.load(Ordering::Acquire) {
+            eprintln!("[host] Retaining display because native capture callbacks did not stop");
+            return;
+        }
         unsafe {
             airbridge_display_release(self.0);
         }
@@ -193,11 +238,24 @@ impl VideoStream {
         };
         if ptr.is_null() {
             unsafe { drop(Box::from_raw(context)) };
+            if error_code == -2 {
+                bail!("CoreGraphics capture API symbols unavailable on this macOS version");
+            }
             bail!(
-                "CoreGraphics video-only display stream could not start (CGError {error_code}). Screen Recording access or this macOS version may prevent capture."
+                "CoreGraphics stream creation returned NULL (wrapper code {error_code}, display {display_id}, permission preflight {}). No capture producer was created.",
+                if capture_allowed() {
+                    "granted"
+                } else {
+                    "denied"
+                }
             );
         }
-        Ok(Self { ptr, context })
+        let mut stream = Self { ptr, context };
+        if error_code != 0 {
+            let cleanup = stream.stop();
+            bail!("CoreGraphics stream start failed (CGError {error_code}); cleanup: {cleanup:?}");
+        }
+        Ok(stream)
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -205,13 +263,14 @@ impl VideoStream {
             return Ok(());
         }
         let stopped = unsafe { airbridge_video_stream_stop(self.ptr) };
-        self.ptr = std::ptr::null_mut();
         if stopped {
+            self.ptr = std::ptr::null_mut();
             unsafe { drop(Box::from_raw(self.context)) };
             self.context = std::ptr::null_mut();
             Ok(())
         } else {
-            // Keep the callback data alive rather than risk a callback using
+            QUARANTINED.store(true, Ordering::Release);
+            // Keep the entire native producer and callback data alive rather than risk a callback using
             // freed memory if macOS never confirmed the stopped event.
             bail!("CoreGraphics did not confirm that video callbacks stopped")
         }
@@ -245,7 +304,8 @@ pub fn available_codecs() -> Vec<CodecOption> {
         .collect()
 }
 
-pub fn capture<const DEBUG: bool>(
+pub(crate) fn capture_display<const DEBUG: bool>(
+    display_id: u32,
     screen_id: u32,
     generation: u64,
     settings: VideoSettings,
@@ -256,12 +316,16 @@ pub fn capture<const DEBUG: bool>(
     telemetry: Arc<Telemetry>,
     progress: impl Fn(&str),
 ) -> Result<()> {
-    settings.validate()?;
-    if option.codec != BridgeCodec::H264 {
-        bail!("The requested encoder is not available on this Mac");
+    if QUARANTINED.load(Ordering::Acquire) {
+        bail!("Capture cleanup unconfirmed; restart host before retrying");
     }
-    progress("Creating virtual display…");
-    let (_display, display_id) = VirtualDisplay::new(&settings)?;
+    if option.codec != BridgeCodec::H264 {
+        bail!("Requested encoder unavailable");
+    }
+    settings.validate()?;
+    if !capture_allowed() {
+        bail!("Screen Recording permission not granted for this executable");
+    }
     let (captured_tx, mut captured_rx) = mpsc::channel(4);
     progress("Preparing VideoToolbox encoder…");
     let mut encoder_builder =
@@ -294,9 +358,6 @@ pub fn capture<const DEBUG: bool>(
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    if stop.load(Ordering::Relaxed) {
-        return Ok(());
-    }
     progress(&format!(
         "Starting CoreGraphics video-only stream on display {display_id}…"
     ));
@@ -310,8 +371,17 @@ pub fn capture<const DEBUG: bool>(
     progress("Video-only stream started; waiting for the first frame…");
     let capture_started = Instant::now();
     let mut received_first_frame = false;
+    let mut permission_check = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
+        if permission_check.elapsed() >= Duration::from_secs(1) {
+            permission_check = Instant::now();
+            if !capture_allowed() {
+                stream.stop()?;
+                bail!("Screen Recording permission was revoked during capture");
+            }
+        }
+
         let packet = match captured_rx.try_recv() {
             Ok(packet) => packet,
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -490,4 +560,44 @@ pub fn capture<const DEBUG: bool>(
     }
     stream.stop()?;
     Ok(())
+}
+
+pub(crate) fn request_capture_access() -> bool {
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+#[cfg(test)]
+static MOCK_CALLBACKS_STOPPED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+unsafe fn airbridge_video_stream_stop(_stream: *mut c_void) -> bool {
+    MOCK_CALLBACKS_STOPPED.load(Ordering::Acquire)
+}
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn callback_context_is_retained_until_native_quiescence_is_confirmed() {
+        let (tx, _rx) = mpsc::channel(1);
+        let context = Box::into_raw(Box::new(FrameContext {
+            output: tx,
+            started: Instant::now(),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sequence: AtomicU64::new(0),
+            telemetry: Telemetry::new(),
+        }));
+        let mut lease = VideoStream {
+            ptr: std::ptr::dangling_mut::<u8>().cast(),
+            context,
+        };
+        MOCK_CALLBACKS_STOPPED.store(false, Ordering::Release);
+        assert!(lease.stop().is_err());
+        assert!(!lease.ptr.is_null());
+        assert_eq!(lease.context, context);
+        assert!(QUARANTINED.load(Ordering::Acquire));
+        MOCK_CALLBACKS_STOPPED.store(true, Ordering::Release);
+        lease.stop().unwrap();
+        assert!(lease.ptr.is_null());
+        assert!(lease.context.is_null());
+        lease.stop().unwrap(); // duplicate cleanup has no callback/free
+    }
 }

@@ -173,3 +173,33 @@ async fn pin_authentication_and_codec_selection() {
     ];
     assert_eq!(negotiate(&options, &options, None).unwrap(), options[1]);
 }
+
+#[tokio::test]
+async fn screen_pin_is_bound_to_target_and_missing_screen_is_rejected() {
+    use bridge_core::security::{authenticate_host_screen, authenticate_viewer_screen};
+    for (target, pin, expected) in [
+        (1, "123456", true),
+        (2, "123456", false),
+        (2, "654321", true),
+        (99, "123456", false),
+    ] {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_h, _c, sender, viewer) = connection_pair().await;
+            let (host, client) = tokio::join!(
+                authenticate_host_screen(&sender, |id| match id {
+                    1 => Some("123456".into()),
+                    2 => Some("654321".into()),
+                    _ => None,
+                }),
+                authenticate_viewer_screen(&viewer, pin, target)
+            );
+            assert_eq!(host.is_ok(), expected);
+            assert_eq!(client.is_ok(), expected);
+            if expected {
+                assert_eq!(host.unwrap(), target);
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

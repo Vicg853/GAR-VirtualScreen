@@ -7,3 +7,9 @@ pub mod security;
 
 pub mod telemetry;
 pub mod telemetry_transport;
+
+pub mod failure;
+
+pub mod worker;
+
+pub mod fanout;

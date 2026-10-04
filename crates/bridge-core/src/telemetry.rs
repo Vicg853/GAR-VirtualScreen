@@ -12,7 +12,7 @@ use std::{
 
 pub const FRAME_LIMIT: usize = 20;
 pub const HISTORY_LIMIT: usize = 60;
-pub const STAGE_COUNT: usize = 15;
+pub const STAGE_COUNT: usize = 16;
 pub const EVENT_LIMIT: usize = 1024;
 pub fn now_us() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -28,6 +28,7 @@ pub enum Stage {
     Write,
     Transfer,
     Receive,
+    IpcQueue,
     DecodeQueue,
     Decode,
     RenderQueue,
@@ -46,6 +47,7 @@ impl Stage {
         Self::Write,
         Self::Transfer,
         Self::Receive,
+        Self::IpcQueue,
         Self::DecodeQueue,
         Self::Decode,
         Self::RenderQueue,
@@ -64,6 +66,7 @@ impl Stage {
             Self::Write => "QUIC write accepted",
             Self::Transfer => "Transfer + reception",
             Self::Receive => "Complete reception",
+            Self::IpcQueue => "Native worker IPC queue",
             Self::DecodeQueue => "Decoder queue",
             Self::Decode => "Decode",
             Self::RenderQueue => "Decoded frame queue",
