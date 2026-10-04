@@ -6,6 +6,7 @@ use apple_cf::{
 use bridge_core::{
     config::{Acceleration, Codec as BridgeCodec, CodecOption, H264Profile, VideoSettings},
     protocol::{MediaHeader, MediaKind, VERSION},
+    telemetry::{Outcome, Stage, Telemetry, TraceToken, now_us},
 };
 use std::{
     ffi::c_void,
@@ -84,6 +85,9 @@ enum Captured {
         bytes: Vec<u8>,
         row_bytes: usize,
         timestamp_us: u64,
+        sequence: u64,
+        trace: Option<TraceToken>,
+        queued_us: u64,
     },
 }
 
@@ -91,19 +95,65 @@ struct FrameContext {
     output: mpsc::Sender<Captured>,
     started: Instant,
     dropped: Arc<AtomicU64>,
+    sequence: AtomicU64,
+    telemetry: Arc<Telemetry>,
 }
 
-extern "C" fn frame_callback(context: *mut c_void, bytes: *const u8, len: usize, row_bytes: usize) {
+extern "C" fn frame_callback<const DEBUG: bool>(
+    context: *mut c_void,
+    bytes: *const u8,
+    len: usize,
+    row_bytes: usize,
+) {
     // No unwind may cross the Objective-C callback boundary.
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let context = unsafe { &*(context.cast::<FrameContext>()) };
+        let sequence = context.sequence.fetch_add(1, Ordering::Relaxed);
+        let trace = if DEBUG {
+            let capture_us = now_us();
+            context.telemetry.sample(capture_us).then(|| TraceToken {
+                sequence,
+                capture_us,
+                offset_us: 0,
+                uncertainty_us: None,
+                telemetry: context.telemetry.clone(),
+            })
+        } else {
+            None
+        };
         let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
         let packet = Captured::Video {
             bytes: bytes.to_vec(),
             row_bytes,
             timestamp_us: context.started.elapsed().as_micros() as u64,
+            sequence,
+            trace: trace.clone(),
+            queued_us: if DEBUG { now_us() } else { 0 },
         };
+        if DEBUG {
+            if let Some(t) = &trace {
+                t.mark(
+                    Stage::Capture,
+                    t.capture_us,
+                    Some(now_us()),
+                    Outcome::Complete,
+                    "Callback detected updated display pixels; source compositor time unavailable",
+                );
+                t.mark(Stage::CaptureQueue, now_us(), None, Outcome::Pending, "");
+            }
+        }
         if context.output.try_send(packet).is_err() {
+            if DEBUG {
+                if let Some(t) = &trace {
+                    t.mark(
+                        Stage::CaptureQueue,
+                        t.capture_us,
+                        Some(now_us()),
+                        Outcome::Dropped,
+                        "Capture queue full",
+                    );
+                }
+            }
             context.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }));
@@ -115,16 +165,19 @@ struct VideoStream {
 }
 
 impl VideoStream {
-    fn start(
+    fn start<const DEBUG: bool>(
         display_id: u32,
         settings: &VideoSettings,
         output: mpsc::Sender<Captured>,
         dropped: Arc<AtomicU64>,
+        telemetry: Arc<Telemetry>,
     ) -> Result<Self> {
         let context = Box::into_raw(Box::new(FrameContext {
             output,
             started: Instant::now(),
             dropped,
+            sequence: AtomicU64::new(0),
+            telemetry,
         }));
         let mut error_code = 0;
         let ptr = unsafe {
@@ -134,7 +187,7 @@ impl VideoStream {
                 settings.height,
                 settings.fps,
                 context.cast(),
-                frame_callback,
+                frame_callback::<DEBUG>,
                 &mut error_code,
             )
         };
@@ -176,6 +229,8 @@ impl Drop for VideoStream {
 pub struct EncodedPacket {
     pub header: MediaHeader,
     pub bytes: Vec<u8>,
+    pub trace: Option<TraceToken>,
+    pub queued_us: u64,
 }
 
 pub fn available_codecs() -> Vec<CodecOption> {
@@ -190,7 +245,7 @@ pub fn available_codecs() -> Vec<CodecOption> {
         .collect()
 }
 
-pub fn capture(
+pub fn capture<const DEBUG: bool>(
     screen_id: u32,
     generation: u64,
     settings: VideoSettings,
@@ -198,6 +253,7 @@ pub fn capture(
     output: mpsc::Sender<EncodedPacket>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    telemetry: Arc<Telemetry>,
     progress: impl Fn(&str),
 ) -> Result<()> {
     settings.validate()?;
@@ -244,12 +300,17 @@ pub fn capture(
     progress(&format!(
         "Starting CoreGraphics video-only stream on display {display_id}…"
     ));
-    let mut stream = VideoStream::start(display_id, &settings, captured_tx, dropped.clone())?;
+    let mut stream = VideoStream::start::<DEBUG>(
+        display_id,
+        &settings,
+        captured_tx,
+        dropped.clone(),
+        telemetry,
+    )?;
     progress("Video-only stream started; waiting for the first frame…");
     let capture_started = Instant::now();
     let mut received_first_frame = false;
 
-    let mut sequence = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let packet = match captured_rx.try_recv() {
             Ok(packet) => packet,
@@ -271,12 +332,28 @@ pub fn capture(
             received_first_frame = true;
             progress("First video frame captured; encoding with VideoToolbox…");
         }
-        let (header, bytes) = match packet {
+        let (header, bytes, trace) = match packet {
             Captured::Video {
                 bytes,
                 row_bytes,
                 timestamp_us,
+                sequence,
+                trace,
+                queued_us,
             } => {
+                let encode_start = if DEBUG { now_us() } else { 0 };
+                if DEBUG {
+                    if let Some(t) = &trace {
+                        t.mark(
+                            Stage::CaptureQueue,
+                            queued_us,
+                            Some(encode_start),
+                            Outcome::Complete,
+                            "",
+                        );
+                        t.mark(Stage::Encode, encode_start, None, Outcome::Pending, "");
+                    }
+                }
                 let mut guard = surface
                     .lock(IOSurfaceLockOptions::NONE)
                     .map_err(|code| anyhow!("IOSurface lock error {code}"))?;
@@ -297,8 +374,35 @@ pub fn capture(
                 }
                 drop(guard);
                 let encoded =
-                    encoder.encode(&surface, CMTime::new(timestamp_us as i64, 1_000_000))?;
+                    match encoder.encode(&surface, CMTime::new(timestamp_us as i64, 1_000_000)) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            if DEBUG {
+                                if let Some(t) = &trace {
+                                    t.mark(
+                                        Stage::Encode,
+                                        encode_start,
+                                        Some(now_us()),
+                                        Outcome::Failed,
+                                        &error.to_string(),
+                                    );
+                                }
+                            }
+                            return Err(error.into());
+                        }
+                    };
                 if encoded.data.is_empty() {
+                    if DEBUG {
+                        if let Some(t) = &trace {
+                            t.mark(
+                                Stage::Encode,
+                                encode_start,
+                                Some(now_us()),
+                                Outcome::Dropped,
+                                "Encoder returned no frame",
+                            );
+                        }
+                    }
                     continue;
                 }
                 let keyframe = encoded
@@ -330,6 +434,18 @@ pub fn capture(
                     annex_b.extend_from_slice(&encoded.data[offset..offset + size]);
                     offset += size;
                 }
+                if DEBUG {
+                    if let Some(t) = &trace {
+                        t.mark(
+                            Stage::Encode,
+                            encode_start,
+                            Some(now_us()),
+                            Outcome::Complete,
+                            "",
+                        );
+                        t.mark(Stage::SendQueue, now_us(), None, Outcome::Pending, "");
+                    }
+                }
                 (
                     MediaHeader {
                         screen_id,
@@ -344,14 +460,31 @@ pub fn capture(
                         channels: 0,
                     },
                     annex_b,
+                    trace,
                 )
             }
         };
-        sequence += 1;
+        let token = if DEBUG { trace.clone() } else { None };
         if output
-            .blocking_send(EncodedPacket { header, bytes })
+            .blocking_send(EncodedPacket {
+                header,
+                bytes,
+                trace,
+                queued_us: if DEBUG { now_us() } else { 0 },
+            })
             .is_err()
         {
+            if DEBUG {
+                if let Some(t) = token {
+                    t.mark(
+                        Stage::SendQueue,
+                        now_us(),
+                        Some(now_us()),
+                        Outcome::Cancelled,
+                        "Sender stopped",
+                    );
+                }
+            }
             break;
         }
     }

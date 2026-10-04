@@ -4,3 +4,6 @@ pub mod discovery;
 pub mod lifecycle;
 pub mod protocol;
 pub mod security;
+
+pub mod telemetry;
+pub mod telemetry_transport;

@@ -14,7 +14,7 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
 pub const MAX_MEDIA: usize = 8 * 1024 * 1024;
@@ -38,6 +38,8 @@ pub struct ScreenConfig {
     pub generation: StreamGeneration,
     pub settings: VideoSettings,
     pub codec: CodecOption,
+    #[serde(default)]
+    pub instrumented: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,12 +68,27 @@ pub enum ClientMessage {
         request_id: RequestId,
         screen_id: ScreenId,
     },
+    Diagnostics {
+        screen_id: ScreenId,
+        enabled: bool,
+    },
+    TraceBurst {
+        screen_id: ScreenId,
+    },
+    ClockProbe {
+        t1: u64,
+    },
     Stop,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum HostMessage {
+    ClockReply {
+        t1: u64,
+        t2: u64,
+        t3: u64,
+    },
     Accepted {
         screen: ScreenConfig,
     },
@@ -111,6 +128,7 @@ pub enum HostMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaLane {
+    Diagnostics,
     Video,
     Audio,
     Input,
@@ -240,6 +258,66 @@ pub async fn receive_media<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(Medi
     Ok((header, data))
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugMediaHeader {
+    pub header: MediaHeader,
+    pub capture_us: Option<u64>,
+    pub send_start_us: u64,
+}
+
+pub async fn send_debug_media<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    header: &MediaHeader,
+    capture_us: Option<u64>,
+    send_start_us: u64,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() > MAX_MEDIA {
+        bail!("Media packet exceeds size limit");
+    }
+    send_json(
+        stream,
+        &DebugMediaHeader {
+            header: header.clone(),
+            capture_us,
+            send_start_us,
+        },
+    )
+    .await?;
+    stream.write_u32(payload.len() as u32).await?;
+    stream.write_all(payload).await?;
+    Ok(())
+}
+pub async fn receive_debug_media_or_end<R: AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Option<(MediaHeader, Option<u64>, u64, Vec<u8>)>> {
+    let mut length = [0; 4];
+    if stream.read(&mut length[..1]).await? == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut length[1..]).await?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_CONTROL {
+        bail!("Media header exceeds size limit");
+    }
+    let mut header = vec![0; length];
+    stream.read_exact(&mut header).await?;
+    let header: DebugMediaHeader =
+        serde_json::from_slice(&header).context("Invalid diagnostic media header")?;
+    let length = stream.read_u32().await? as usize;
+    if length > MAX_MEDIA {
+        bail!("Media packet exceeds size limit");
+    }
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload).await?;
+    Ok(Some((
+        header.header,
+        header.capture_us,
+        header.send_start_us,
+        payload,
+    )))
+}
+
 /// A FIN between packets is a graceful lane end; a FIN inside a packet is an error.
 pub async fn receive_media_or_end<R: AsyncRead + Unpin>(
     stream: &mut R,
@@ -269,6 +347,46 @@ pub async fn receive_media_or_end<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn debug_framing_is_distinct_and_fin_is_checked() {
+        let header = MediaHeader {
+            screen_id: 1,
+            generation: 2,
+            kind: MediaKind::Video,
+            sequence: 42,
+            timestamp_us: 10,
+            keyframe: true,
+            width: 1920,
+            height: 1080,
+            sample_rate: 0,
+            channels: 0,
+        };
+        let mut data = Vec::new();
+        send_debug_media(&mut data, &header, Some(100), 200, b"video")
+            .await
+            .unwrap();
+        let mut reader = data.as_slice();
+        let (h, capture, send, bytes) = receive_debug_media_or_end(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.sequence, 42);
+        assert_eq!(capture, Some(100));
+        assert_eq!(send, 200);
+        assert_eq!(bytes, b"video");
+        assert!(
+            receive_debug_media_or_end(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(receive_media_or_end(&mut data.as_slice()).await.is_err());
+        assert!(
+            receive_debug_media_or_end(&mut &data[..data.len() - 1])
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn control_framing_survives_other_ready_select_branches() {
         let (mut writer, reader) = tokio::io::duplex(4);
@@ -404,6 +522,7 @@ mod tests {
                     audio: false,
                     preferred_codec: None,
                 },
+                instrumented: false,
                 codec: crate::config::CodecOption {
                     codec: crate::config::Codec::H264,
                     acceleration: crate::config::Acceleration::Hardware,

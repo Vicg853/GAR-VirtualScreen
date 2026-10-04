@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write,
     path::PathBuf,
     sync::Mutex,
@@ -10,7 +10,7 @@ use std::{
 /// Small, bounded diagnostic history shared by the UI and worker threads.
 pub struct Diagnostics {
     entries: Mutex<VecDeque<String>>,
-    file: Mutex<Option<File>>,
+    writer: std::sync::mpsc::SyncSender<String>,
     path: Option<PathBuf>,
 }
 
@@ -28,9 +28,21 @@ impl Diagnostics {
             }
             OpenOptions::new().create(true).append(true).open(path).ok()
         });
+        let (writer, receiver) = std::sync::mpsc::sync_channel::<String>(200);
+        let _ = std::thread::Builder::new()
+            .name("airbridge-log-writer".into())
+            .spawn(move || {
+                let mut file = file;
+                while let Ok(line) = receiver.recv() {
+                    eprintln!("{line}");
+                    if let Some(file) = file.as_mut() {
+                        let _ = writeln!(file, "{line}");
+                    }
+                }
+            });
         Self {
             entries: Mutex::new(VecDeque::new()),
-            file: Mutex::new(file),
+            writer,
             path,
         }
     }
@@ -51,12 +63,7 @@ impl Diagnostics {
             time % 60,
             message.as_ref()
         );
-        eprintln!("{line}");
-        if let Ok(mut file) = self.file.lock() {
-            if let Some(file) = file.as_mut() {
-                let _ = writeln!(file, "{line}");
-            }
-        }
+        let _ = self.writer.try_send(line.clone());
         if let Ok(mut entries) = self.entries.lock() {
             entries.push_back(line);
             if entries.len() > 200 {

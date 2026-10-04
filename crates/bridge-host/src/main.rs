@@ -22,9 +22,10 @@ mod app {
             AddScreenRequest, ChangeScreenSettingsRequest, ClientHello, ClientMessage,
             ConfigRevision, HostMessage, MAX_SCREENS, MediaLane, MediaState, MediaStreamHello,
             PORT, RequestId, ScreenConfig, ScreenId, StreamGeneration, VERSION, control_reader,
-            receive_json, send_control, send_json, send_media,
+            receive_json, send_control, send_debug_media, send_json, send_media,
         },
         security::{authenticate_host, server_endpoint},
+        telemetry::{Outcome, Stage, StatsView, StreamStats, Telemetry, TimingView, now_us},
     };
     use gpui::{
         App, Application, Bounds, Context, MouseButton, ResizeEdge, Window, WindowBounds,
@@ -54,18 +55,51 @@ mod app {
         dropped: u64,
         bytes: u64,
         diagnostics: Arc<Diagnostics>,
+        telemetry: Arc<Telemetry>,
+        stats_view: StatsView,
+        viewer_stats: bool,
+    }
+
+    impl HostScreen {
+        fn instrumented(&self) -> bool {
+            self.stats_view.open || self.viewer_stats
+        }
+    }
+    fn ingest_diagnostic_batch(
+        shared: &Arc<Mutex<State>>,
+        batch: bridge_core::telemetry::DiagnosticBatch,
+    ) {
+        if let Ok(state) = shared.lock() {
+            if let Some(screen) = state.screens.iter().find(|s| {
+                s.screen_id == batch.screen_id
+                    && s.generation == batch.generation
+                    && s.instrumented()
+            }) {
+                screen.telemetry.peer_lost(batch.lost_events);
+                if let Some(stats) = batch.stats {
+                    screen.telemetry.peer_stats(stats);
+                }
+                for e in batch.events {
+                    screen.telemetry.ingest(e);
+                }
+            }
+        }
     }
 
     enum HostUiCommand {
         AddScreen(ScreenId),
         ChangeSettings(ScreenId, VideoSettings),
         RemoveScreen(ScreenId),
+        Diagnostics(ScreenId, bool),
+        Burst(ScreenId),
         Disconnect,
     }
 
     #[derive(Clone)]
     struct State {
         pin: String,
+        viewer_name: Option<String>,
+        selected_stats_viewer: Option<String>,
         message: String,
         settings: VideoSettings,
         screens: Vec<HostScreen>,
@@ -165,7 +199,24 @@ mod app {
             dropped: 0,
             bytes: 0,
             diagnostics,
+            telemetry: Telemetry::new(),
+            stats_view: StatsView::default(),
+            viewer_stats: false,
         });
+        let ids = state
+            .screens
+            .iter_mut()
+            .filter(|s| s.stats_view.open)
+            .map(|s| {
+                s.stats_view.open = false;
+                s.screen_id
+            })
+            .collect::<Vec<_>>();
+        if let Some(commands) = &state.session_commands {
+            for id in ids {
+                let _ = commands.send(HostUiCommand::Diagnostics(id, false));
+            }
+        }
         state.navigation.open(screen_id);
         state.show_codecs = false;
         state.show_logs = false;
@@ -252,6 +303,13 @@ mod app {
 
     impl Render for HostView {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if let Ok(mut state) = self.state.lock() {
+                for s in &mut state.screens {
+                    if s.stats_view.open {
+                        s.stats_view.refresh(&s.telemetry);
+                    }
+                }
+            }
             let state = self.state.lock().unwrap().clone();
             let selected_screen = state
                 .screens
@@ -543,6 +601,233 @@ mod app {
             } else {
                 div()
             };
+            let stats_panel = if let Some(screen) = &selected_screen {
+                let id = screen.screen_id;
+                let mut panel = div()
+                    .id("host-stats-panel")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("host-stats-toggle")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x28354b))
+                            .cursor_pointer()
+                            .child(if screen.stats_view.open {
+                                "Stats ▴ · instrumented stream"
+                            } else {
+                                "Stats ▾"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Ok(mut state) = this.state.lock() {
+                                    if let Some(s) =
+                                        state.screens.iter_mut().find(|s| s.screen_id == id)
+                                    {
+                                        let enabled = !s.stats_view.open;
+                                        s.stats_view.open = enabled;
+                                        s.stats_view.frozen = None;
+                                        if let Some(commands) = &state.session_commands {
+                                            let _ = commands
+                                                .send(HostUiCommand::Diagnostics(id, enabled));
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    );
+                if screen.stats_view.open {
+                    panel = panel
+                        .child(
+                            div()
+                                .id("stats-viewer-choice")
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(if state.selected_stats_viewer == state.viewer_name {
+                                    0x35517a
+                                } else {
+                                    0x28354b
+                                }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Ok(mut state) = this.state.lock() {
+                                        state.selected_stats_viewer = state.viewer_name.clone();
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(format!(
+                                    "Selected viewer: {}",
+                                    state
+                                        .viewer_name
+                                        .clone()
+                                        .unwrap_or_else(|| "None connected".into())
+                                )),
+                        )
+                        .child("Temporary diagnostics · opening/closing restarts this stream")
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("host-timing-frames")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(if screen.stats_view.mode == TimingView::Frames {
+                                            0x35517a
+                                        } else {
+                                            0x28354b
+                                        }))
+                                        .cursor_pointer()
+                                        .child("Frame rows")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.screen_id == id)
+                                                {
+                                                    s.stats_view.mode = TimingView::Frames;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("host-timing-averages")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(
+                                            if screen.stats_view.mode == TimingView::Averages {
+                                                0x35517a
+                                            } else {
+                                                0x28354b
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .child("Stage averages")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.screen_id == id)
+                                                {
+                                                    s.stats_view.mode = TimingView::Averages;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("host-timing-freeze")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x28354b))
+                                        .cursor_pointer()
+                                        .child(if screen.stats_view.frozen.is_some() {
+                                            "Resume"
+                                        } else {
+                                            "Freeze"
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.screen_id == id)
+                                                {
+                                                    s.stats_view.frozen =
+                                                        if s.stats_view.frozen.is_some() {
+                                                            None
+                                                        } else {
+                                                            Some(s.telemetry.snapshot())
+                                                        };
+                                                    s.stats_view.freeze_after = None;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("host-timing-burst")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x28354b))
+                                        .cursor_pointer()
+                                        .child("Capture next 20")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.screen_id == id)
+                                                {
+                                                    s.stats_view.frozen = None;
+                                                    s.stats_view.freeze_after = Some(
+                                                        s.telemetry.snapshot().averages
+                                                            [Stage::Capture as usize]
+                                                            .count
+                                                            + 20,
+                                                    );
+                                                }
+                                                if let Some(commands) = &state.session_commands {
+                                                    let _ = commands.send(HostUiCommand::Burst(id));
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .children(
+                            screen
+                                .stats_view
+                                .lines(&screen.telemetry)
+                                .into_iter()
+                                .map(|line| div().text_sm().child(line)),
+                        )
+                        .child(
+                            div()
+                                .id("host-timing-table")
+                                .h(px(220.))
+                                .overflow_scroll()
+                                .text_sm()
+                                .children(
+                                    screen
+                                        .stats_view
+                                        .table(&screen.telemetry)
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(index, row)| {
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .bg(rgb(if index == 0 {
+                                                    0x28354b
+                                                } else {
+                                                    0x0d1420
+                                                }))
+                                                .children(row.into_iter().map(|cell| {
+                                                    div()
+                                                        .w(px(175.))
+                                                        .flex_shrink_0()
+                                                        .p_1()
+                                                        .child(cell)
+                                                }))
+                                        }),
+                                ),
+                        );
+                }
+                panel
+            } else {
+                div().id("host-stats-none")
+            };
             let logs = if state.show_logs {
                 div()
                     .id("host-logs-scroll")
@@ -616,6 +901,20 @@ mod app {
                 .child("← Screen list")
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
+                        let ids = state
+                            .screens
+                            .iter_mut()
+                            .filter(|s| s.stats_view.open)
+                            .map(|s| {
+                                s.stats_view.open = false;
+                                s.screen_id
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(commands) = &state.session_commands {
+                            for id in ids {
+                                let _ = commands.send(HostUiCommand::Diagnostics(id, false));
+                            }
+                        }
                         state.navigation.back();
                         state.show_codecs = false;
                         state.show_logs = false;
@@ -761,6 +1060,7 @@ mod app {
                                         })),
                                 )
                                 .child(codec_panel)
+                                .child(stats_panel)
                         },
                     )
                     .child(
@@ -1138,7 +1438,17 @@ mod app {
         if state.navigation.selected == Some(screen_id) {
             state.settings = settings.clone();
         }
+        let instrumented = state
+            .screens
+            .iter()
+            .find(|s| s.screen_id == screen_id)
+            .is_some_and(|s| s.instrumented());
+        if let Some(screen) = state.screens.iter_mut().find(|s| s.screen_id == screen_id) {
+            screen.telemetry = Telemetry::new();
+            screen.stats_view.reset();
+        }
         Ok(ScreenConfig {
+            instrumented,
             screen_id,
             name,
             revision,
@@ -1172,6 +1482,9 @@ mod app {
             dropped: 0,
             bytes: 0,
             diagnostics: Arc::new(Diagnostics::new(&format!("host-screen-{screen_id}"))),
+            telemetry: Telemetry::new(),
+            stats_view: StatsView::default(),
+            viewer_stats: false,
         });
         state.navigation.open(screen_id);
         state.show_codecs = false;
@@ -1351,6 +1664,20 @@ mod app {
         screen: ScreenConfig,
         shared: Arc<Mutex<State>>,
         events: mpsc::UnboundedSender<HostSessionEvent>,
+        cancel: oneshot::Receiver<()>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        if screen.instrumented {
+            run_screen_stream_impl::<true>(connection, screen, shared, events, cancel, stop).await
+        } else {
+            run_screen_stream_impl::<false>(connection, screen, shared, events, cancel, stop).await
+        }
+    }
+    async fn run_screen_stream_impl<const DEBUG: bool>(
+        connection: quinn::Connection,
+        screen: ScreenConfig,
+        shared: Arc<Mutex<State>>,
+        events: mpsc::UnboundedSender<HostSessionEvent>,
         mut cancel: oneshot::Receiver<()>,
         stop: Arc<AtomicBool>,
     ) -> Result<()> {
@@ -1385,11 +1712,21 @@ mod app {
         let dropped = Arc::new(AtomicU64::new(0));
         let settings = screen.settings.clone();
         let codec = screen.codec;
+        let telemetry = shared
+            .lock()
+            .unwrap()
+            .screens
+            .iter()
+            .find(|s| s.screen_id == screen_id)
+            .unwrap()
+            .telemetry
+            .clone();
+        let capture_telemetry = telemetry.clone();
         let capture_state = shared.clone();
         let capture_stop = stop.clone();
         let capture_dropped = dropped.clone();
         let mut capture = tokio::task::spawn_blocking(move || {
-            mac::capture(
+            mac::capture::<DEBUG>(
                 screen_id,
                 generation,
                 settings,
@@ -1397,6 +1734,7 @@ mod app {
                 packet_send,
                 capture_stop,
                 capture_dropped,
+                capture_telemetry,
                 |progress| {
                     set_screen_generation_message(&capture_state, screen_id, generation, progress)
                 },
@@ -1410,6 +1748,8 @@ mod app {
         stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_stats_at = tokio::time::Instant::now();
         let mut last_stats_bytes = 0u64;
+        let mut last_stats_frames = 0;
+        let mut last_rtt = 0u64;
         loop {
             tokio::select! {
                 _ = &mut cancel => break,
@@ -1436,13 +1776,20 @@ mod app {
                     if !generation_is_current {
                         break;
                     }
+                    let write_start=if DEBUG {now_us()} else {0};
+                    if DEBUG {if let Some(t)=&packet.trace {t.mark(Stage::SendQueue,packet.queued_us,Some(write_start),Outcome::Complete,""); t.mark(Stage::Write,write_start,None,Outcome::Pending,"");}}
+                    let send = async {
+                        if DEBUG {send_debug_media(&mut media_send,&packet.header,packet.trace.as_ref().map(|t|t.capture_us),write_start,&packet.bytes).await}
+                        else {send_media(&mut media_send,&packet.header,&packet.bytes).await}
+                    };
                     let sent = tokio::select! {
                         _ = &mut cancel => break,
                         _ = connection.closed() => break,
-                        result = tokio::time::timeout(Duration::from_secs(5), send_media(&mut media_send, &packet.header, &packet.bytes)) => {
+                        result = tokio::time::timeout(Duration::from_secs(5), send) => {
                             result.map_err(|_| anyhow::anyhow!("Viewer stopped accepting video for five seconds")).and_then(|result| result)
                         }
                     };
+                    if DEBUG {if let Some(t)=&packet.trace {t.mark(Stage::Write,write_start,Some(now_us()),if sent.is_ok(){Outcome::Complete}else{Outcome::Failed},&sent.as_ref().err().map(|e|e.to_string()).unwrap_or_default());}}
                     if let Err(error) = sent {
                         stream_error = Some(error);
                         break;
@@ -1452,12 +1799,7 @@ mod app {
                             entry.bytes = entry.bytes.saturating_add(packet.bytes.len() as u64);
                             entry.frames = entry.frames.saturating_add(1);
                             entry.dropped = dropped.load(Ordering::Relaxed);
-                            if entry.frames == 1 || entry.frames % 120 == 0 {
-                                entry.diagnostics.record(
-                                    "stream",
-                                    format!("Sent {} frames · {:.1} MB", entry.frames, entry.bytes as f64 / 1_000_000.0),
-                                );
-                            }
+
                         }
                     }
                     if first_frame {
@@ -1480,6 +1822,13 @@ mod app {
                     let elapsed = last_stats_at.elapsed().as_secs_f64().max(0.001);
                     let bitrate_kbps = (((bytes.saturating_sub(last_stats_bytes) as f64 * 8.0) / elapsed) / 1000.0)
                         .round().clamp(0.0, u32::MAX as f64) as u32;
+                    if DEBUG {
+                        let rtt=connection.rtt().as_micros() as u64;
+                        let transport=connection.stats();
+                        telemetry.stats(StreamStats {at_us:now_us(),bitrate_kbps:bitrate_kbps as f64,fps:frames.saturating_sub(last_stats_frames) as f64/elapsed,frames,dropped:dropped.load(Ordering::Relaxed),rtt_us:rtt,jitter_us:rtt.abs_diff(last_rtt),lost_packets:transport.path.lost_packets,congestion_events:transport.path.congestion_events,send_queue:Some((packet_recv.max_capacity()-packet_recv.capacity()) as u32),..Default::default()});
+                        telemetry.expire(now_us() as i64,"Stage did not conclude within five seconds");
+                        last_rtt=rtt; last_stats_frames=frames;
+                    }
                     last_stats_at = tokio::time::Instant::now();
                     last_stats_bytes = bytes;
                     let _ = events.send(HostSessionEvent::Wire(HostMessage::Stats {
@@ -1497,6 +1846,20 @@ mod app {
         drop(packet_recv);
         if capture_result.is_none() {
             capture_result = Some(capture.await);
+        }
+        if DEBUG {
+            let reason = stream_error
+                .as_ref()
+                .map(|e| e.to_string())
+                .or_else(|| {
+                    capture_result.as_ref().and_then(|r| match r {
+                        Ok(Err(e)) => Some(e.to_string()),
+                        Err(e) => Some(e.to_string()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| "Stream stopped or restarted".into());
+            telemetry.finish(now_us() as i64, &reason);
         }
         let _ = media_send.finish();
         if let Some(error) = stream_error {
@@ -1586,6 +1949,8 @@ mod app {
         if let Ok(mut state) = shared.lock() {
             state.settings = settings.clone();
             state.session_commands = Some(ui_commands);
+            state.viewer_name = Some(connection.remote_address().to_string());
+            state.selected_stats_viewer = state.viewer_name.clone();
             state.frames = 0;
             state.dropped = 0;
             state.bytes = 0;
@@ -1612,6 +1977,49 @@ mod app {
             ),
         );
 
+        let stats_state = shared.clone();
+        let diagnostic_send = tokio::spawn(bridge_core::telemetry_transport::send_batches(
+            connection.clone(),
+            move || {
+                stats_state
+                    .lock()
+                    .map(|s| {
+                        s.screens
+                            .iter()
+                            .filter(|s| s.stats_view.open || s.viewer_stats)
+                            .map(|s| (s.screen_id, s.generation, s.telemetry.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+        ));
+        let diagnostic_connection = connection.clone();
+        let diagnostic_state = shared.clone();
+        let diagnostic_receive = tokio::spawn(async move {
+            while let Ok(mut stream) = diagnostic_connection.accept_uni().await {
+                let hello = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    receive_json::<_, MediaStreamHello>(&mut stream),
+                )
+                .await;
+                if !matches!(
+                    hello,
+                    Ok(Ok(MediaStreamHello {
+                        version: VERSION,
+                        lane: MediaLane::Diagnostics,
+                        ..
+                    }))
+                ) {
+                    let _ = stream.stop(0u32.into());
+                    continue;
+                }
+                let state = diagnostic_state.clone();
+                let _ = bridge_core::telemetry_transport::receive_batches(stream, move |batch| {
+                    ingest_diagnostic_batch(&state, batch)
+                })
+                .await;
+            }
+        });
         let (mut control_messages, control_task) = control_reader::<_, ClientMessage>(control_recv);
         let mut operations = tokio::task::JoinSet::new();
         // Every fallible session operation is inside this block so cleanup always runs.
@@ -1793,12 +2201,25 @@ mod app {
                             schedule_screen_removal(screen_id, None, &mut streams, &mut restarting,
                                 &mut removing, &mut pending_restarts, &mut operations, shared.clone(), event_tx.clone());
                         }
+                        Some(HostUiCommand::Diagnostics(screen_id,enabled)) => {
+                            if removing.contains_key(&screen_id) {continue;}
+                            let restart=shared.lock().ok().and_then(|mut state|{let s=state.screens.iter_mut().find(|s|s.screen_id==screen_id)?;s.stats_view.open=enabled;Some((s.settings.clone(),s.codec?))});
+                            if let Some((settings,codec))=restart {schedule_screen_restart(RestartPlan{screen_id,request_id:None,kind:RestartKind::SettingsApplied,settings,codec,revision:None},&mut streams,&mut restarting,&mut pending_restarts,&mut operations,shared.clone(),event_tx.clone());}
+                        }
+                        Some(HostUiCommand::Burst(id))=>{if let Ok(state)=shared.lock(){if let Some(s)=state.screens.iter().find(|s|s.screen_id==id){s.telemetry.burst();}}}
                         Some(HostUiCommand::Disconnect) => break Ok(()),
                         None => break Ok(()),
                     }
                 }
                 command = control_messages.recv() => {
                     match command {
+                        Some(Ok(ClientMessage::ClockProbe{t1}))=>{let t2=now_us();send_control(&mut control_send,&HostMessage::ClockReply{t1,t2,t3:now_us()}).await?;}
+                        Some(Ok(ClientMessage::TraceBurst{screen_id}))=>{if let Ok(state)=shared.lock(){if let Some(s)=state.screens.iter().find(|s|s.screen_id==screen_id){s.telemetry.burst();}}}
+                        Some(Ok(ClientMessage::Diagnostics{screen_id,enabled}))=>{
+                            if removing.contains_key(&screen_id) {continue;}
+                            let restart=shared.lock().ok().and_then(|mut state|{let s=state.screens.iter_mut().find(|s|s.screen_id==screen_id)?;s.viewer_stats=enabled;Some((s.settings.clone(),s.codec?))});
+                            if let Some((settings,codec))=restart{schedule_screen_restart(RestartPlan{screen_id,request_id:None,kind:RestartKind::SettingsApplied,settings,codec,revision:None},&mut streams,&mut restarting,&mut pending_restarts,&mut operations,shared.clone(),event_tx.clone());}
+                        }
                         Some(Ok(ClientMessage::Stop)) => break Ok(()),
                         Some(Ok(ClientMessage::AddScreen(AddScreenRequest { request_id, settings }))) => {
                             let mut settings = settings.unwrap_or_else(|| shared.lock().map(|state| state.settings.clone()).unwrap_or_else(|_| built_in_presets()[1].settings.clone()));
@@ -1853,6 +2274,10 @@ mod app {
         // Cancelling owned operations drops their stream guards and stops capture.
         operations.abort_all();
         while operations.join_next().await.is_some() {}
+        diagnostic_send.abort();
+        diagnostic_receive.abort();
+        let _ = diagnostic_send.await;
+        let _ = diagnostic_receive.await;
         control_task.abort();
         let _ = control_task.await;
         let active_streams = std::mem::take(&mut streams);
@@ -1874,6 +2299,8 @@ mod app {
         }
         if let Ok(mut state) = shared.lock() {
             state.session_commands = None;
+            state.viewer_name = None;
+            state.selected_stats_viewer = None;
             state.navigation.back();
             state.show_codecs = false;
             state.show_logs = false;
@@ -1895,6 +2322,8 @@ mod app {
     fn initial_state(presets: Vec<Preset>, pin: String) -> State {
         State {
             pin,
+            viewer_name: None,
+            selected_stats_viewer: None,
             message: "Starting…".into(),
             settings: presets[1].settings.clone(),
             screens: vec![HostScreen {
@@ -1910,6 +2339,9 @@ mod app {
                 dropped: 0,
                 bytes: 0,
                 diagnostics: Arc::new(Diagnostics::new("host-screen-1")),
+                telemetry: Telemetry::new(),
+                stats_view: StatsView::default(),
+                viewer_stats: false,
             }],
             navigation: ScreenNavigation {
                 selected: Some(1),
@@ -2017,6 +2449,36 @@ mod app {
                 "123456".into(),
             )))
         }
+        #[test]
+        fn stats_owners_are_independent_and_restarts_change_generation() {
+            let shared = state();
+            let settings = current_screen_settings(&shared, 1).unwrap();
+            let codec = mac::available_codecs()[0];
+            let normal =
+                install_screen_settings(&shared, 1, settings.clone(), codec, None).unwrap();
+            assert!(!normal.instrumented);
+            shared.lock().unwrap().screens[0].stats_view.open = true;
+            let debug = install_screen_settings(&shared, 1, settings.clone(), codec, None).unwrap();
+            assert!(debug.instrumented);
+            assert!(debug.generation > normal.generation);
+            {
+                let mut state = shared.lock().unwrap();
+                state.screens[0].viewer_stats = true;
+                state.screens[0].stats_view.open = false;
+            }
+            assert!(
+                install_screen_settings(&shared, 1, settings.clone(), codec, None)
+                    .unwrap()
+                    .instrumented
+            );
+            shared.lock().unwrap().screens[0].viewer_stats = false;
+            assert!(
+                !install_screen_settings(&shared, 1, settings, codec, None)
+                    .unwrap()
+                    .instrumented
+            );
+        }
+
         #[test]
         fn removing_selected_and_last_host_screen_repairs_navigation() {
             let shared = state();

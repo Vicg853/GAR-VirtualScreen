@@ -30,7 +30,7 @@ cargo run -p bridge-viewer --release
 
 Start the Mac host, then start the viewer. Select the discovered Mac, type the PIN shown in the host window, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
 
-The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 3. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
+The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 4. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
 
 The host's video-only path uses CoreGraphics display streams, so it does not construct a ScreenCaptureKit stream. ScreenCaptureKit initialized a CoreAudio clock even with audio capture disabled and stalled for about 150 seconds on one Mac. The CoreGraphics display-stream API is marked obsolete by the macOS 15+ SDK and may be removed in a future macOS release; the host reports a visible error if this API is unavailable.
 
@@ -50,13 +50,13 @@ Closing a native video window removes that screen on the host. Removing a screen
 
 The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
 
-## Wire protocol v3
+## Wire protocol v4
 
 The viewer opens one bidirectional control stream after TLS/PIN authentication and sends a versioned `ClientHello` with supported codec options and optional initial settings. The host replies with the primary screen's complete `ScreenConfig`. Later control messages are typed and role-specific: add, change settings, remove, status, stats, and scoped errors. Requests carry request IDs; errors and acknowledgements echo them when applicable.
 
 Each `ScreenConfig` has a stable session-local screen ID, a monotonically increasing settings revision, a stream generation, the screen name, negotiated codec, and full video settings. Settings edits apply immediately: the host rebuilds only that screen's capture/encoder pipeline and increments its generation. The viewer resets only that screen's decoder. Media from an older generation is discarded, so delayed packets cannot be mistaken for the replacement stream.
 
-Every media QUIC stream starts with a `MediaStreamHello` containing the protocol version, screen ID, generation, and lane (`video`, `audio`, `input`, or `output`). Video packets repeat their screen ID and generation in `MediaHeader`, along with sequence, timestamp, keyframe, and frame metadata. This gives the receiver enough information to validate channel identity and reject stale or mismatched packets. The control stream carries per-screen capture status and periodic sent-frame, drop, and bitrate statistics; media payload never shares the control stream.
+Every media QUIC stream starts with a `MediaStreamHello` containing the protocol version, screen ID, generation, and lane (`video`, `audio`, `input`, `output`, or `diagnostics`). Video packets repeat their screen ID and generation in `MediaHeader`, along with sequence, timestamp, keyframe, and frame metadata. This gives the receiver enough information to validate channel identity and reject stale or mismatched packets. The control stream carries per-screen capture status and periodic sent-frame, drop, and bitrate statistics; media payload never shares the control stream.
 
 ## Lifecycle and cleanup
 
@@ -84,3 +84,13 @@ The current session sends video packets with sequence numbers and timestamps; th
 - The Linux build and a two machine streaming session still need validation on Fedora hardware. The viewer has been compiled and launched on macOS to check the shared Rust and GPUI code paths.
 
 The host's TLS certificate and private key are kept under the local `airbridge` configuration directory. The private key is mode `0600` on Unix. PIN authentication uses SPAKE2 and confirms the result against the QUIC TLS exporter before starting the media stream.
+
+## Temporary stream diagnostics
+
+In stream details, open **Stats** below Video settings. Opening requests a new instrumented stream generation; closing returns to the normal compiled path unless the other peer still has Stats open. Return to the list also closes the local subscription. Both apps must be rebuilt for protocol v4. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
+
+Stats retain 60 one-second samples with compact bitrate/FPS/RTT history charts. RTT jitter is the change between successive RTT samples, not RTP interarrival jitter; QUIC loss/congestion counters are connection-wide. Audio fields are reserved and unavailable. **Frame rows** retain at most 20 sampled frames (about one per second); **Stage averages** update fixed-size incremental accumulators without using the frame history. Freeze/Resume holds a readable snapshot, and Capture next 20 requests consecutive capture callbacks, then freezes after the observed stages conclude. In overloaded diagnostics queues, observations may be discarded and the loss counter increases; video never waits for diagnostics delivery.
+
+Times use monotonic clocks. Four-timestamp probes every two seconds estimate the host-relative timeline, with RTT/2 uncertainty plus a conservative drift allowance; unsynchronized cross-machine starts are unavailable. Each traced frame keeps its clock mapping for its entire lifetime. Transfer timing includes QUIC writing, network transit and receiver scheduling, not pure wire latency. A successful QUIC write means accepted by the transport, not delivered. GPU completion is callback observation, and presentation submission means queued to the compositor: actual monitor scanout and partial rendering are explicitly unavailable. Five-second pending-stage timeouts and cancellation/failure reasons remain visible.
+
+The current server still accepts one viewer session at a time. The host identifies that authenticated viewer by its connection address; this change does not implement shared-display fanout to multiple viewers.

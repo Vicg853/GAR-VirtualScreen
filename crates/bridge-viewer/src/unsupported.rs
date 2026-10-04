@@ -20,6 +20,22 @@ pub struct VideoWindow {
 }
 
 impl VideoWindow {
+    pub fn spawn_mode(
+        target: Arc<Mutex<VideoFrame>>,
+        diagnostics: Arc<Diagnostics>,
+        _instrumented: bool,
+    ) -> Result<Self> {
+        Self::spawn(target, diagnostics)
+    }
+    pub async fn submit_debug(
+        &self,
+        _bytes: Vec<u8>,
+        _keyframe: bool,
+        _sequence: u64,
+        _trace: Option<bridge_core::telemetry::TraceToken>,
+    ) -> Result<()> {
+        bail!("{}", self.message)
+    }
     pub fn spawn(target: Arc<Mutex<VideoFrame>>, diagnostics: Arc<Diagnostics>) -> Result<Self> {
         let message = "The native video display backend is currently implemented for Linux only";
         diagnostics.record("video-window", message);

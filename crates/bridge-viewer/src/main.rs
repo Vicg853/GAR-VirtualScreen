@@ -18,10 +18,14 @@ mod app {
         protocol::{
             AddScreenRequest, ChangeScreenSettingsRequest, ClientHello, ClientMessage, HostMessage,
             MAX_SCREENS, MediaKind, MediaLane, MediaState, MediaStreamHello, RequestId,
-            ScreenConfig, ScreenId, StreamGeneration, VERSION, control_reader, receive_json,
-            receive_media_or_end, send_control,
+            ScreenConfig, ScreenId, StreamGeneration, VERSION, control_reader,
+            receive_debug_media_or_end, receive_json, receive_media_or_end, send_control,
         },
         security::{authenticate_viewer, client_endpoint},
+        telemetry::{
+            ClockEstimate, Outcome, Stage, StatsView, StreamStats, Telemetry, TimingView,
+            TraceToken, now_us,
+        },
     };
     use gpui::{
         App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, ResizeEdge,
@@ -46,6 +50,8 @@ mod app {
         ChangeScreenSettings(ScreenId, u64, VideoSettings),
         RemoveScreen(ScreenId),
         RetryScreen(ScreenId),
+        Diagnostics(ScreenId, bool),
+        Burst(ScreenId),
     }
 
     enum PendingAction {
@@ -101,10 +107,34 @@ mod app {
         host_frames_sent: u64,
         host_frames_dropped: u64,
         bitrate_kbps: u32,
+        telemetry: Arc<Telemetry>,
+        stats_view: StatsView,
+    }
+
+    fn ingest_diagnostic_batch(
+        shared: &Arc<Mutex<State>>,
+        batch: bridge_core::telemetry::DiagnosticBatch,
+    ) {
+        if let Ok(state) = shared.lock() {
+            if let Some(screen) = state.screens.iter().find(|s| {
+                s.config.screen_id == batch.screen_id
+                    && s.config.generation == batch.generation
+                    && s.config.instrumented
+            }) {
+                screen.telemetry.peer_lost(batch.lost_events);
+                if let Some(stats) = batch.stats {
+                    screen.telemetry.peer_stats(stats);
+                }
+                for e in batch.events {
+                    screen.telemetry.ingest(e);
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
     struct State {
+        clock: ClockEstimate,
         hosts: Vec<DiscoveredHost>,
         selected_host: usize,
         pin: String,
@@ -317,6 +347,13 @@ mod app {
                             window.window_bounds().get_bounds()
                         ),
                     );
+                }
+            }
+            if let Ok(mut state) = self.state.lock() {
+                for s in &mut state.screens {
+                    if s.stats_view.open {
+                        s.stats_view.refresh(&s.telemetry);
+                    }
                 }
             }
             let state = self.state.lock().unwrap().clone();
@@ -667,6 +704,204 @@ mod app {
                 .as_ref()
                 .map(|screen| screen.diagnostics.clone())
                 .unwrap_or_else(|| state.diagnostics.clone());
+            let stats_panel = if let Some(screen) = &active_screen {
+                let id = screen.config.screen_id;
+                let mut panel = div()
+                    .id("viewer-stats-panel")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("viewer-stats-toggle")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(0x28354b))
+                            .cursor_pointer()
+                            .child(if screen.stats_view.open {
+                                "Stats ▴ · instrumented stream"
+                            } else {
+                                "Stats ▾"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Ok(mut state) = this.state.lock() {
+                                    if let Some(s) =
+                                        state.screens.iter_mut().find(|s| s.config.screen_id == id)
+                                    {
+                                        let enabled = !s.stats_view.open;
+                                        s.stats_view.open = enabled;
+                                        s.stats_view.frozen = None;
+                                        let _ =
+                                            this.commands.send(Command::Diagnostics(id, enabled));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    );
+                if screen.stats_view.open {
+                    panel = panel
+                        .child("Temporary diagnostics · opening/closing restarts this stream")
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("viewer-timing-frames")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(if screen.stats_view.mode == TimingView::Frames {
+                                            0x35517a
+                                        } else {
+                                            0x28354b
+                                        }))
+                                        .cursor_pointer()
+                                        .child("Frame rows")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.config.screen_id == id)
+                                                {
+                                                    s.stats_view.mode = TimingView::Frames;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("viewer-timing-averages")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(
+                                            if screen.stats_view.mode == TimingView::Averages {
+                                                0x35517a
+                                            } else {
+                                                0x28354b
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .child("Stage averages")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.config.screen_id == id)
+                                                {
+                                                    s.stats_view.mode = TimingView::Averages;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("viewer-timing-freeze")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x28354b))
+                                        .cursor_pointer()
+                                        .child(if screen.stats_view.frozen.is_some() {
+                                            "Resume"
+                                        } else {
+                                            "Freeze"
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.config.screen_id == id)
+                                                {
+                                                    s.stats_view.frozen =
+                                                        if s.stats_view.frozen.is_some() {
+                                                            None
+                                                        } else {
+                                                            Some(s.telemetry.snapshot())
+                                                        };
+                                                    s.stats_view.freeze_after = None;
+                                                }
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("viewer-timing-burst")
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x28354b))
+                                        .cursor_pointer()
+                                        .child("Capture next 20")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                if let Some(s) = state
+                                                    .screens
+                                                    .iter_mut()
+                                                    .find(|s| s.config.screen_id == id)
+                                                {
+                                                    s.stats_view.frozen = None;
+                                                    s.stats_view.freeze_after = Some(
+                                                        s.telemetry.snapshot().averages
+                                                            [Stage::Capture as usize]
+                                                            .count
+                                                            + 20,
+                                                    );
+                                                }
+                                                let _ = this.commands.send(Command::Burst(id));
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .children(
+                            screen
+                                .stats_view
+                                .lines(&screen.telemetry)
+                                .into_iter()
+                                .map(|line| div().text_sm().child(line)),
+                        )
+                        .child(
+                            div()
+                                .id("viewer-timing-table")
+                                .h(px(220.))
+                                .overflow_scroll()
+                                .text_sm()
+                                .children(
+                                    screen
+                                        .stats_view
+                                        .table(&screen.telemetry)
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(index, row)| {
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .bg(rgb(if index == 0 {
+                                                    0x28354b
+                                                } else {
+                                                    0x0d1420
+                                                }))
+                                                .children(row.into_iter().map(|cell| {
+                                                    div()
+                                                        .w(px(175.))
+                                                        .flex_shrink_0()
+                                                        .p_1()
+                                                        .child(cell)
+                                                }))
+                                        }),
+                                ),
+                        );
+                }
+                panel
+            } else {
+                div().id("viewer-stats-none")
+            };
             let logs = if state.show_logs {
                 div()
                     .id("viewer-logs-scroll")
@@ -734,6 +969,18 @@ mod app {
                 .child("← Stream list")
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
+                        let ids = state
+                            .screens
+                            .iter_mut()
+                            .filter(|s| s.stats_view.open)
+                            .map(|s| {
+                                s.stats_view.open = false;
+                                s.config.screen_id
+                            })
+                            .collect::<Vec<_>>();
+                        for id in ids {
+                            let _ = this.commands.send(Command::Diagnostics(id, false));
+                        }
                         state.navigation.back();
                         state.show_codecs = false;
                         state.show_logs = false;
@@ -853,6 +1100,7 @@ mod app {
                             })),
                     )
                     .child(codec_panel)
+                    .child(stats_panel)
 )
                     .child(format!("Received {} · host sent {} · host drops {} · decoded {} · skipped {} · {} · {:.1} MB · {} kbps{}", active_screen.as_ref().map(|screen| screen.received_frames).unwrap_or(state.received_frames), active_screen.as_ref().map(|screen| screen.host_frames_sent).unwrap_or_default(), active_screen.as_ref().map(|screen| screen.host_frames_dropped).unwrap_or_default(), decoded, skipped, if decoder.is_empty() { "decoder initializing" } else { decoder.as_str() }, active_screen.as_ref().map(|screen| screen.bytes).unwrap_or(state.bytes) as f64 / 1_000_000.0, active_screen.as_ref().map(|screen| screen.bitrate_kbps).unwrap_or_default(),
                         frame_error.map(|e| format!(" · {e}")).unwrap_or_default()))
@@ -1080,10 +1328,12 @@ mod app {
         let screen_id = config.screen_id;
         let diagnostics = Arc::new(Diagnostics::new(&format!("viewer-screen-{screen_id}")));
         let frame = Arc::new(Mutex::new(VideoFrame::default()));
+        let telemetry = Telemetry::new();
+        let instrumented = config.instrumented;
         let window_frame = frame.clone();
         let window_diagnostics = diagnostics.clone();
         let spawned = tokio::task::spawn_blocking(move || {
-            VideoWindow::spawn(window_frame, window_diagnostics)
+            VideoWindow::spawn_mode(window_frame, window_diagnostics, instrumented)
         })
         .await;
         let video_window = match spawned {
@@ -1117,6 +1367,8 @@ mod app {
             host_frames_sent: 0,
             host_frames_dropped: 0,
             bitrate_kbps: 0,
+            telemetry,
+            stats_view: StatsView::default(),
         }
     }
 
@@ -1153,7 +1405,8 @@ mod app {
         }
         let mut screen = match existing {
             Some(screen)
-                if !screen.terminal
+                if screen.config.instrumented == config.instrumented
+                    && !screen.terminal
                     && !screen
                         .frame
                         .lock()
@@ -1168,6 +1421,7 @@ mod app {
                 let mut replacement = new_client_screen(config.clone(), shared).await;
                 replacement.requested_revision = screen.requested_revision;
                 replacement.desired_settings = screen.desired_settings;
+                replacement.stats_view = screen.stats_view;
                 replacement
             }
             None => new_client_screen(config.clone(), shared).await,
@@ -1179,6 +1433,8 @@ mod app {
             screen.requested_revision = config.revision;
             screen.desired_settings = config.settings.clone();
         }
+        screen.telemetry = Telemetry::new();
+        screen.stats_view.reset();
         screen.config = config.clone();
         screen.status = "Rebuilding decoder and waiting for a keyframe…".into();
         screen.bytes = 0;
@@ -1370,6 +1626,10 @@ mod app {
             Some(screen)
         });
         if let Some(screen) = screen {
+            let clock = shared.lock().map(|s| s.clock).unwrap_or_default();
+            screen
+                .telemetry
+                .finish(now_us() as i64 + clock.offset_us, &detail);
             screen.cancel.send_replace(true);
             let _ = screen.video_window.close();
         }
@@ -1400,6 +1660,19 @@ mod app {
     }
 
     async fn receive_video_lane(
+        media_recv: quinn::RecvStream,
+        screen: ClientScreen,
+        generation: StreamGeneration,
+        shared: Arc<Mutex<State>>,
+        events: mpsc::UnboundedSender<LaneNotice>,
+    ) -> Result<()> {
+        if screen.config.instrumented {
+            receive_video_lane_impl::<true>(media_recv, screen, generation, shared, events).await
+        } else {
+            receive_video_lane_impl::<false>(media_recv, screen, generation, shared, events).await
+        }
+    }
+    async fn receive_video_lane_impl<const DEBUG: bool>(
         mut media_recv: quinn::RecvStream,
         screen: ClientScreen,
         generation: StreamGeneration,
@@ -1414,11 +1687,20 @@ mod app {
                 let _ = media_recv.stop(0u32.into());
                 return Ok(());
             }
+            let receive = async {
+                if DEBUG {
+                    receive_debug_media_or_end(&mut media_recv).await
+                } else {
+                    Ok(receive_media_or_end(&mut media_recv)
+                        .await?
+                        .map(|(h, b)| (h, None, 0, b)))
+                }
+            };
             let packet = tokio::select! {
                 _ = cancel.changed() => { let _ = media_recv.stop(0u32.into()); return Ok(()); }
-                packet = receive_media_or_end(&mut media_recv) => packet?,
+                packet = receive => packet?,
             };
-            let Some((header, bytes)) = packet else {
+            let Some((header, capture_us, send_start_us, bytes)) = packet else {
                 return Ok(());
             };
             if !matches!(&header.kind, MediaKind::Video) {
@@ -1448,23 +1730,64 @@ mod app {
                     }
                     entry.bytes = entry.bytes.saturating_add(bytes.len() as u64);
                     entry.received_frames = entry.received_frames.saturating_add(1);
-                    if entry.received_frames == 1 || entry.received_frames % 120 == 0 {
-                        entry.diagnostics.record(
-                            "video",
-                            format!(
-                                "Received {} frames · {:.1} MB",
-                                entry.received_frames,
-                                entry.bytes as f64 / 1_000_000.0
-                            ),
-                        );
-                    }
                     state.bytes = state.bytes.saturating_add(bytes.len() as u64);
                     state.received_frames = state.received_frames.saturating_add(1);
                 }
             }
+            let trace = if DEBUG {
+                capture_us.map(|capture_us| {
+                    let clock = shared.lock().map(|s| s.clock).unwrap_or_default();
+                    let t = TraceToken {
+                        sequence: header.sequence,
+                        capture_us,
+                        offset_us: clock.offset_us,
+                        uncertainty_us: Some(if clock.measured_at_us == 0 {
+                            u64::MAX
+                        } else {
+                            clock.uncertainty_us
+                                + now_us().saturating_sub(clock.measured_at_us) / 1000
+                        }),
+                        telemetry: screen.telemetry.clone(),
+                    };
+                    let arrival=now_us();
+                    if clock.measured_at_us!=0 {
+                        let end=arrival as i128+clock.offset_us as i128;
+                        if end>=send_start_us as i128 {t.mark(Stage::Transfer,send_start_us.saturating_sub_signed(clock.offset_us),Some(arrival),Outcome::Complete,"QUIC write + network + receiver scheduling; estimated clock mapping");}
+                        else{t.mark(Stage::Transfer,arrival,None,Outcome::Unavailable,"Clock uncertainty exceeds observed transfer interval");}
+                    }else{t.mark(Stage::Transfer,arrival,None,Outcome::Unavailable,"Clock synchronization pending");}
+                    t.mark(
+                        Stage::Receive,
+                        now_us(),
+                        None,
+                        Outcome::Complete,
+                        "Complete packet received, not first network byte",
+                    );
+                    t.mark(Stage::DecodeQueue, now_us(), None, Outcome::Pending, "");
+                    t.mark(
+                        Stage::Presentation,
+                        now_us(),
+                        None,
+                        Outcome::Unavailable,
+                        "Monitor scanout and partial rendering feedback unavailable",
+                    );
+                    t
+                })
+            } else {
+                None
+            };
+            let submit = async {
+                if DEBUG {
+                    screen
+                        .video_window
+                        .submit_debug(bytes, header.keyframe, header.sequence, trace.clone())
+                        .await
+                } else {
+                    screen.video_window.submit(bytes, header.keyframe).await
+                }
+            };
             tokio::select! {
-                _ = cancel.changed() => { let _ = media_recv.stop(0u32.into()); return Ok(()); }
-                result = screen.video_window.submit(bytes, header.keyframe) => result?,
+                _ = cancel.changed() => { if DEBUG {if let Some(t)=&trace {t.mark(Stage::DecodeQueue,now_us(),Some(now_us()),Outcome::Cancelled,"Stream replaced or closed");}} let _ = media_recv.stop(0u32.into()); return Ok(()); }
+                result = submit => {if DEBUG {if let (Some(t),Err(e))=(&trace,&result){t.mark(Stage::DecodeQueue,now_us(),Some(now_us()),Outcome::Failed,&e.to_string());}} result?},
             }
             if first_frame {
                 first_frame = false;
@@ -1500,6 +1823,11 @@ mod app {
                         if hello.version != VERSION {
                             return (screen_id, generation, lane, Err(anyhow::anyhow!("Incompatible media protocol version {}", hello.version)));
                         }
+                        if lane == MediaLane::Diagnostics {
+                            let state=shared.clone();
+                            let _=bridge_core::telemetry_transport::receive_batches(stream,move |batch| ingest_diagnostic_batch(&state,batch)).await;
+                            return (0,0,lane,Ok(()));
+                        }
                         if lane != MediaLane::Video {
                             let _ = stream.stop(0u32.into());
                             return (screen_id, generation, lane, Err(anyhow::anyhow!("The {lane:?} lane is not implemented yet")));
@@ -1525,7 +1853,7 @@ mod app {
                 finished = tasks.join_next(), if !tasks.is_empty() => {
                     match finished {
                         Some(Ok((screen_id, generation, lane, outcome))) => match outcome {
-                            Ok(()) => { let _ = events.send(LaneNotice::Closed(screen_id, generation, lane)); },
+                            Ok(()) => { if lane!=MediaLane::Diagnostics {let _ = events.send(LaneNotice::Closed(screen_id, generation, lane));} },
                             Err(error) => { let _ = events.send(LaneNotice::Failed(screen_id, generation, lane, format!("{error:#}"))); },
                         },
                         Some(Err(error)) => {
@@ -1637,6 +1965,7 @@ mod app {
             return Ok(());
         }
         if let Ok(mut state) = shared.lock() {
+            state.clock = ClockEstimate::default();
             state.connected = true;
             state.connecting = false;
             state.override_host = false;
@@ -1662,17 +1991,51 @@ mod app {
             shared.clone(),
             lane_events,
         ));
+        let stats_state = shared.clone();
+        let diagnostic_send = tokio::spawn(bridge_core::telemetry_transport::send_batches(
+            connection.clone(),
+            move || {
+                stats_state
+                    .lock()
+                    .map(|s| {
+                        s.screens
+                            .iter()
+                            .filter(|s| s.config.instrumented)
+                            .map(|s| (s.config.screen_id, s.config.generation, s.telemetry.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+        ));
+        let mut probes = std::collections::VecDeque::<u64>::new();
+        let mut clock_timer = tokio::time::interval(Duration::from_secs(2));
+        clock_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (mut control_messages, control_task) = control_reader::<_, HostMessage>(control_recv);
         let mut watchdog = tokio::time::interval(Duration::from_millis(100));
+        let mut last_stats = now_us();
+        let mut counters = HashMap::<ScreenId, (u64, u64, u64, u64)>::new();
         let mut pending_requests = HashMap::<RequestId, PendingAction>::new();
         let session_result: Result<()> = async {
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     reason = connection.closed() => bail!("Host disconnected: {reason}"),
+                    _=clock_timer.tick()=>{
+                        let t1=now_us(); if probes.len()==8 {probes.pop_front();} probes.push_back(t1);
+                        send_control(&mut control_send,&ClientMessage::ClockProbe{t1}).await?;
+                    }
                     _ = watchdog.tick() => {
                         let screens = shared.lock().map(|state| state.screens.clone()).unwrap_or_default();
+                        counters.retain(|id,_|screens.iter().any(|s|s.config.screen_id==*id));
+                        let stats_now=now_us(); let collect=stats_now.saturating_sub(last_stats)>=1_000_000;
                         for screen in screens {
+                            if collect && screen.config.instrumented {
+                                let (decoded,skipped)=screen.frame.lock().map(|s|(s.frames,s.skipped)).unwrap_or_default();
+                                let previous=counters.insert(screen.config.screen_id,(screen.bytes,screen.received_frames,decoded,connection.rtt().as_micros() as u64)).unwrap_or_default();
+                                let elapsed=stats_now.saturating_sub(last_stats) as f64/1_000_000.;let rtt=connection.rtt().as_micros() as u64;let transport=connection.stats();
+                                screen.telemetry.stats(StreamStats{at_us:stats_now,bitrate_kbps:screen.bytes.saturating_sub(previous.0) as f64*8./elapsed/1000.,fps:screen.received_frames.saturating_sub(previous.1) as f64/elapsed,decoded_fps:Some(decoded.saturating_sub(previous.2) as f64/elapsed),frames:screen.received_frames,dropped:skipped+screen.host_frames_dropped,rtt_us:rtt,jitter_us:rtt.abs_diff(previous.3),lost_packets:transport.path.lost_packets,congestion_events:transport.path.congestion_events,..Default::default()});
+                                let clock=shared.lock().map(|s|s.clock).unwrap_or_default();screen.telemetry.expire(stats_now as i64+clock.offset_us,"Stage did not conclude within five seconds");
+                            }
                             if screen.removing { continue; }
                             let (closed, user_closed, error) = screen.frame.lock().map(|frame| (frame.closed, frame.user_closed, frame.error.clone())).unwrap_or((true, false, Some("Frame state unavailable".into())));
                             if user_closed {
@@ -1682,11 +2045,17 @@ mod app {
                                     error.unwrap_or_else(|| "The display backend stopped".into()));
                             }
                         }
+                        if collect {last_stats=stats_now;}
                     }
                     command = async {
                         if let Some(command) = queued_commands.pop_front() { Some(command) } else { commands.recv().await }
                     } => {
                         match command {
+                            Some(Command::Diagnostics(id,enabled))=>{
+                                if let Ok(mut state)=shared.lock(){if let Some(s)=state.screens.iter_mut().find(|s|s.config.screen_id==id){s.stats_view.open=enabled;s.stats_view.frozen=None;}}
+                                send_control(&mut control_send,&ClientMessage::Diagnostics{screen_id:id,enabled}).await?;
+                            }
+                            Some(Command::Burst(id))=>{send_control(&mut control_send,&ClientMessage::TraceBurst{screen_id:id}).await?;}
                             Some(Command::Disconnect) | None => break,
                             Some(Command::RemoveScreen(screen_id)) => {
                                 request_remove_screen(&shared, &mut control_send, screen_id, &mut pending_requests).await?;
@@ -1796,7 +2165,7 @@ mod app {
                                         screen.host_frames_dropped = frames_dropped;
                                         screen.bitrate_kbps = bitrate_kbps;
                                         if frames_dropped > 0 {
-                                            screen.diagnostics.record("stats", format!("Host dropped {frames_dropped} frames"));
+
                                         }
                                     }
                                 }
@@ -1835,6 +2204,10 @@ mod app {
                                     }
                                 }
                             }
+                            HostMessage::ClockReply{t1,t2,t3}=>{
+                                let t4=now_us();
+                                if let Some(index)=probes.iter().position(|p|*p==t1){probes.remove(index);if let Some(sample)=ClockEstimate::from_probe(t1,t2,t3,t4){if let Ok(mut state)=shared.lock(){state.clock.update(sample);}}}
+                            }
                             HostMessage::Accepted { .. } => message(&shared, "Host sent a second session acceptance; ignoring it"),
                         }
                     }
@@ -1848,6 +2221,8 @@ mod app {
             send_control(&mut control_send, &ClientMessage::Stop),
         )
         .await;
+        diagnostic_send.abort();
+        let _ = diagnostic_send.await;
         control_task.abort();
         let _ = control_task.await;
         lane_task.abort();
@@ -1881,6 +2256,7 @@ mod app {
 
     fn initial_state(presets: Vec<Preset>) -> State {
         State {
+            clock: ClockEstimate::default(),
             hosts: Vec::new(),
             selected_host: 0,
             pin: String::new(),
@@ -1982,6 +2358,7 @@ mod app {
                     revision: 2,
                     generation,
                     settings: built_in_presets()[1].settings.clone(),
+                    instrumented: false,
                     codec: CodecOption {
                         codec: Codec::H264,
                         acceleration: Acceleration::Software,
@@ -2001,8 +2378,41 @@ mod app {
                 host_frames_sent: 0,
                 host_frames_dropped: 0,
                 bitrate_kbps: 0,
+                telemetry: Telemetry::new(),
+                stats_view: StatsView::default(),
             }
         }
+        #[test]
+        fn late_diagnostic_batches_cannot_update_replacement_generation() {
+            let shared = state();
+            let mut s = screen(1, 7);
+            s.config.instrumented = true;
+            let telemetry = s.telemetry.clone();
+            shared.lock().unwrap().screens.push(s);
+            ingest_diagnostic_batch(
+                &shared,
+                bridge_core::telemetry::DiagnosticBatch {
+                    screen_id: 1,
+                    generation: 6,
+                    events: vec![],
+                    stats: None,
+                    lost_events: 100,
+                },
+            );
+            assert_eq!(telemetry.snapshot().peer_lost_events, 0);
+            ingest_diagnostic_batch(
+                &shared,
+                bridge_core::telemetry::DiagnosticBatch {
+                    screen_id: 1,
+                    generation: 7,
+                    events: vec![],
+                    stats: None,
+                    lost_events: 3,
+                },
+            );
+            assert_eq!(telemetry.snapshot().peer_lost_events, 3);
+        }
+
         #[test]
         fn visibility_tracks_connection_list_details_and_missing_selection() {
             let shared = state();
