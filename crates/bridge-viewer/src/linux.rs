@@ -1,3 +1,4 @@
+use crate::resource_lifecycle::{InputEpoch, ReleaseGuard, release_barrier};
 use anyhow::{Context, Result, anyhow, bail};
 use bridge_core::{
     diagnostics::Diagnostics,
@@ -43,6 +44,7 @@ pub struct VideoFrame {
     pub user_closed: bool,
 }
 
+static DISPLAY_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 static DISPLAY_PROXY: OnceLock<std::result::Result<EventLoopProxy<VideoEvent>, String>> =
     OnceLock::new();
 
@@ -59,6 +61,7 @@ impl Drop for WindowLease {
 #[derive(Clone)]
 pub struct VideoWindow {
     input: async_mpsc::Sender<VideoInput>,
+    epoch: InputEpoch,
     proxy: Option<EventLoopProxy<VideoEvent>>,
     unavailable: Option<String>,
     id: u64,
@@ -80,7 +83,7 @@ impl VideoWindow {
         let proxy = DISPLAY_PROXY
             .get_or_init(|| {
                 let (send, receive) = mpsc::sync_channel(1);
-                thread::Builder::new()
+                let worker = thread::Builder::new()
                     .name("airbridge-display-events".into())
                     .spawn(move || {
                         let mut builder = EventLoop::<VideoEvent>::with_user_event();
@@ -118,6 +121,7 @@ impl VideoWindow {
                         }
                     })
                     .map_err(|error| format!("Cannot start display events: {error}"))?;
+                let _ = DISPLAY_THREAD.set(Mutex::new(Some(worker)));
                 receive
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(|error| format!("Display event startup failed: {error}"))?
@@ -138,6 +142,7 @@ impl VideoWindow {
             .map_err(|_| anyhow!("The display event loop has stopped"))?;
         Ok(Self {
             input,
+            epoch: InputEpoch::default(),
             proxy: Some(proxy.clone()),
             unavailable: None,
             id,
@@ -151,6 +156,7 @@ impl VideoWindow {
         record_error(&target, message.clone());
         Self {
             input,
+            epoch: InputEpoch::default(),
             proxy: None,
             unavailable: Some(message),
             id: 0,
@@ -162,6 +168,14 @@ impl VideoWindow {
         if let Some(Ok(proxy)) = DISPLAY_PROXY.get() {
             let _ = proxy.send_event(VideoEvent::Shutdown);
         }
+        // Application return must not terminate the process while native
+        // decoder or GPU destruction is still running on the event thread.
+        if let Some(worker) = DISPLAY_THREAD
+            .get()
+            .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+        {
+            let _ = worker.join();
+        }
     }
 
     pub fn show(&self) -> Result<()> {
@@ -169,18 +183,30 @@ impl VideoWindow {
     }
 
     pub fn close(&self) -> Result<()> {
+        self.epoch.invalidate();
         self.send_event(VideoEvent::Close(self.id))
     }
 
-    pub async fn reset(&self, width: u32, height: u32) -> Result<()> {
-        self.send_input(VideoInput::Reset { width, height }).await
+    pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
+        let epoch = self.epoch.advance();
+        self.send_input(VideoInput::Reset {
+            width,
+            height,
+            epoch,
+        })
+        .await
     }
 
     pub async fn submit(&self, bytes: Vec<u8>, keyframe: bool) -> Result<()> {
         if bytes.is_empty() || bytes.len() > MAX_QUEUED_PACKET_BYTES {
             bail!("Video packet size is outside the supported range");
         }
+        let epoch = self
+            .epoch
+            .current()
+            .context("Video producer belongs to a replaced or closed stream")?;
         self.send_input(VideoInput::Packet {
+            epoch,
             bytes,
             keyframe,
             sequence: 0,
@@ -200,7 +226,12 @@ impl VideoWindow {
         if bytes.is_empty() || bytes.len() > MAX_QUEUED_PACKET_BYTES {
             bail!("Video packet size is outside the supported range");
         }
+        let epoch = self
+            .epoch
+            .current()
+            .context("Video producer belongs to a replaced or closed stream")?;
         self.send_input(VideoInput::Packet {
+            epoch,
             bytes,
             keyframe,
             sequence,
@@ -249,10 +280,12 @@ enum VideoEvent {
 #[derive(Debug)]
 enum VideoInput {
     Reset {
+        epoch: u64,
         width: u32,
         height: u32,
     },
     Packet {
+        epoch: u64,
         bytes: Vec<u8>,
         keyframe: bool,
         sequence: u64,
@@ -262,7 +295,7 @@ enum VideoInput {
 }
 
 enum DecodedFrame {
-    Reset,
+    Release(mpsc::Sender<std::result::Result<(), String>>),
     Video(DecodedVideoFrame, Option<TraceToken>, u64),
 }
 
@@ -327,6 +360,8 @@ struct VideoApp {
     renderer: Option<Renderer>,
     latest_frame: Option<PresentedFrame>,
     decoder_tx: Option<mpsc::SyncSender<VideoInput>>,
+    decoder_worker: Option<thread::JoinHandle<()>>,
+    decoder_release: Option<mpsc::Sender<()>>,
     decoded_rx: Option<mpsc::Receiver<DecodedFrame>>,
     initialized: bool,
     instrumented: bool,
@@ -353,6 +388,8 @@ impl VideoApp {
             renderer: None,
             latest_frame: None,
             decoder_tx: None,
+            decoder_worker: None,
+            decoder_release: None,
             decoded_rx: None,
             initialized: false,
             instrumented,
@@ -424,18 +461,37 @@ impl VideoApp {
         let diagnostics = self.diagnostics.clone();
         let proxy = self.proxy.clone();
         let instrumented = self.instrumented;
-        if let Err(error) = thread::Builder::new()
+        let (release, released) = mpsc::channel();
+        self.decoder_release = Some(release);
+        match thread::Builder::new()
             .name("airbridge-video-decoder".into())
             .spawn(move || {
                 if instrumented {
-                    decode_loop::<true>(decoder_rx, decoded_tx, target, diagnostics, proxy)
+                    decode_loop::<true>(
+                        decoder_rx,
+                        decoded_tx,
+                        target,
+                        diagnostics,
+                        proxy,
+                        released,
+                    )
                 } else {
-                    decode_loop::<false>(decoder_rx, decoded_tx, target, diagnostics, proxy)
+                    decode_loop::<false>(
+                        decoder_rx,
+                        decoded_tx,
+                        target,
+                        diagnostics,
+                        proxy,
+                        released,
+                    )
                 }
-            })
-        {
-            self.report_error(format!("Cannot start the video decoder worker: {error}"));
-            self.decoder_tx = None;
+            }) {
+            Ok(worker) => self.decoder_worker = Some(worker),
+            Err(error) => {
+                self.report_error(format!("Cannot start the video decoder worker: {error}"));
+                self.decoder_tx = None;
+                self.decoder_release = None;
+            }
         }
     }
 
@@ -454,7 +510,7 @@ impl VideoApp {
         let Some(input) = self.pending_input.take() else {
             return;
         };
-        if let VideoInput::Reset { width, height } = &input {
+        if let VideoInput::Reset { width, height, .. } = &input {
             self.latest_frame = None;
             if let Ok(mut status) = self.target.lock() {
                 status.width = *width;
@@ -481,12 +537,30 @@ impl VideoApp {
         }
     }
 
+    fn release_frames(&mut self) -> Result<()> {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.quiesce()?;
+            // Drop importer leases only after all submitted reads are complete.
+            renderer.frame_renderer = None;
+        }
+        self.latest_frame = None;
+        Ok(())
+    }
+
     fn collect_decoded<const DEBUG: bool>(&mut self) {
-        let Some(receiver) = &self.decoded_rx else {
-            return;
-        };
         let mut latest = None;
-        while let Ok(decoded) = receiver.try_recv() {
+        while let Some(decoded) = self.decoded_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            if let DecodedFrame::Release(ack) = decoded {
+                drop(latest.take());
+                let result = self.release_frames().map_err(|e| format!("{e:#}"));
+                if let Err(error) = &result {
+                    self.report_error(format!(
+                        "Could not release frames before decoder replacement: {error}"
+                    ));
+                }
+                let _ = ack.send(result);
+                continue;
+            }
             if DEBUG {
                 if let Some(DecodedFrame::Video(_, Some(t), queued_us)) = &latest {
                     t.mark(
@@ -502,9 +576,7 @@ impl VideoApp {
         }
         if let Some(decoded) = latest {
             match decoded {
-                DecodedFrame::Reset => {
-                    self.latest_frame = None;
-                }
+                DecodedFrame::Release(_) => unreachable!("release barrier handled above"),
                 decoded => {
                     let trace = if DEBUG {
                         match &decoded {
@@ -701,12 +773,6 @@ impl ApplicationHandler<VideoEvent> for DisplayManager {
             self.diagnostic_ids.remove(&id);
             self.update_wait_policy();
         }
-        self.apps.retain(|_, app| {
-            !app.target
-                .lock()
-                .map(|target| target.closed)
-                .unwrap_or(true)
-        });
         for app in self.apps.values_mut() {
             app.pump_input();
             (app.collect)(app);
@@ -719,16 +785,35 @@ impl Drop for VideoApp {
     fn drop(&mut self) {
         self.input_rx.close();
         self.pending_input = None;
-        self.decoded_rx = None;
+        // Stop packet admission first. The worker retains its native backend
+        // behind ReleaseGuard until every consumer below has been released.
         self.decoder_tx = None;
-        self.latest_frame = None;
-        self.renderer = None;
-        self.window = None;
         if let Ok(mut target) = self.target.lock() {
             target.closed = true;
         }
-        self.diagnostics
-            .record("video-window", "Display, frame queues and decoder released");
+        if let Err(error) = self.release_frames() {
+            self.diagnostics
+                .record("video-window", format!("GPU cleanup reported: {error:#}"));
+        }
+        // Disconnect output before joining: a producer waiting on a full queue
+        // or a replacement acknowledgement must be able to wake and exit.
+        self.decoded_rx = None;
+        self.latest_frame = None;
+        self.renderer = None;
+        if let Some(release) = self.decoder_release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.decoder_worker.take() {
+            if worker.join().is_err() {
+                self.diagnostics
+                    .record("video-window", "Decoder worker panicked during shutdown");
+            }
+        }
+        self.window = None;
+        self.diagnostics.record(
+            "video-window",
+            "GPU work finished; frames, decoder worker and display released",
+        );
     }
 }
 
@@ -796,8 +881,9 @@ fn decode_loop<const DEBUG: bool>(
     target: Arc<Mutex<VideoFrame>>,
     diagnostics: Arc<Diagnostics>,
     proxy: EventLoopProxy<VideoEvent>,
+    released: mpsc::Receiver<()>,
 ) {
-    let _exit = DecoderExit {
+    let exit = DecoderExit {
         target: target.clone(),
         proxy: proxy.clone(),
     };
@@ -838,6 +924,9 @@ fn decode_loop<const DEBUG: bool>(
         catalog,
         config: decoder_config,
     };
+    // Declared after backend: on every exit, consumers release first, then
+    // the native decoder is destroyed on this same worker thread.
+    let _release_guard = ReleaseGuard::new(released, move || drop(exit));
     diagnostics.record(
         "decoder",
         format!(
@@ -854,9 +943,18 @@ fn decode_loop<const DEBUG: bool>(
     let mut packet_count = 0u64;
     let mut error_count = 0u64;
     let mut pending = HashMap::<u64, (TraceToken, u64)>::new();
+    let mut active_epoch = 0;
     while let Ok(input) = receiver.recv() {
         match input {
-            VideoInput::Reset { width, height } => {
+            VideoInput::Reset {
+                width,
+                height,
+                epoch,
+            } => {
+                if epoch <= active_epoch {
+                    continue;
+                }
+                active_epoch = epoch;
                 if DEBUG {
                     for (_, (t, start)) in pending.drain() {
                         t.mark(
@@ -876,6 +974,9 @@ fn decode_loop<const DEBUG: bool>(
                     status.frames = 0;
                     status.skipped = 0;
                     status.error = None;
+                }
+                if !release_decoder_frames(&output, &proxy, &target) {
+                    return;
                 }
                 if let Err(error) = backend.reset() {
                     let message = format!("Could not reset the video decoder: {error:#}");
@@ -906,17 +1007,29 @@ fn decode_loop<const DEBUG: bool>(
                         return;
                     }
                 }
-                if output.send(DecodedFrame::Reset).is_err() {
-                    return;
-                }
             }
             VideoInput::Packet {
+                epoch,
                 bytes,
                 keyframe,
                 sequence,
                 trace,
                 queued_us,
             } => {
+                if epoch != active_epoch {
+                    if DEBUG {
+                        if let Some(t) = trace {
+                            t.mark(
+                                Stage::DecodeQueue,
+                                queued_us,
+                                Some(now_us()),
+                                Outcome::Cancelled,
+                                "Packet belongs to an obsolete decoder generation",
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let decode_start = if DEBUG { now_us() } else { 0 };
                 if DEBUG {
                     if let Some(t) = &trace {
@@ -1011,6 +1124,9 @@ fn decode_loop<const DEBUG: bool>(
                                 &target,
                                 format!("{message}; waiting for the next keyframe"),
                             );
+                            if !release_decoder_frames(&output, &proxy, &target) {
+                                return;
+                            }
                             match backend.fallback() {
                                 Ok(refused) => {
                                     let message = format!(
@@ -1053,6 +1169,9 @@ fn decode_loop<const DEBUG: bool>(
                                                     "{failed_backend} rejected the keyframe; trying the next decoder: {error:#}"
                                                 ),
                                             );
+                                            if !release_decoder_frames(&output, &proxy, &target) {
+                                                return;
+                                            }
                                             match backend.fallback() {
                                                 Ok(refused) => {
                                                     diagnostics.record(
@@ -1114,6 +1233,26 @@ fn decode_loop<const DEBUG: bool>(
     }
 }
 
+// This is a protocol barrier, not a delay: the renderer acknowledges only
+// after GPU completion and release of imported/queued frame resources.
+fn release_decoder_frames(
+    output: &mpsc::SyncSender<DecodedFrame>,
+    proxy: &EventLoopProxy<VideoEvent>,
+    target: &Arc<Mutex<VideoFrame>>,
+) -> bool {
+    match release_barrier(output, DecodedFrame::Release, || {
+        let _ = proxy.send_event(VideoEvent::Wake);
+    }) {
+        Ok(()) => true,
+        Err(error) => {
+            if !target.lock().map(|t| t.closed).unwrap_or(true) {
+                record_error(target, error);
+            }
+            false
+        }
+    }
+}
+
 fn publish_frame<const DEBUG: bool>(
     frame: DecodedFrame,
     output: &mpsc::SyncSender<DecodedFrame>,
@@ -1121,7 +1260,7 @@ fn publish_frame<const DEBUG: bool>(
 ) -> bool {
     let (width, height) = match &frame {
         DecodedFrame::Video(frame, _, _) => (frame.size().width, frame.size().height),
-        DecodedFrame::Reset => return true,
+        DecodedFrame::Release(_) => return true,
     };
     if width == 0
         || height == 0
@@ -1222,7 +1361,7 @@ struct Renderer {
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
     dummy_uv: wgpu::Texture,
-    frame_renderer: render::Renderer,
+    frame_renderer: Option<render::Renderer>,
     size: PhysicalSize<u32>,
 }
 
@@ -1356,9 +1495,19 @@ impl Renderer {
             sampler,
             uniform_buffer,
             dummy_uv,
-            frame_renderer,
+            frame_renderer: Some(frame_renderer),
             size,
         })
+    }
+
+    fn quiesce(&self) -> Result<()> {
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .context("Waiting for GPU frame work during cleanup")?;
+        Ok(())
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -1398,8 +1547,16 @@ impl Renderer {
                 {
                     bail!("Decoded frame exceeds the 7680×4320 presentation limit");
                 }
+                if self.frame_renderer.is_none() {
+                    self.frame_renderer = Some(
+                        render::Renderer::new(&self.device, &self.queue, render::Config::new())
+                            .context("Recreating frame importer after decoder reset")?,
+                    );
+                }
                 let rendered = self
                     .frame_renderer
+                    .as_mut()
+                    .context("Frame importer unavailable")?
                     .render(&frame)
                     .context("Cross-vendor GPU frame import/render failed")?;
                 let y_view = rendered.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1430,7 +1587,7 @@ impl Renderer {
                     },
                 )
             }
-            DecodedFrame::Reset => bail!("Reset is not a displayable video frame"),
+            DecodedFrame::Release(_) => bail!("Release barrier is not a displayable video frame"),
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&color));

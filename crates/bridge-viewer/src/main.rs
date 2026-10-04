@@ -3,6 +3,8 @@ mod linux;
 #[cfg(not(target_os = "linux"))]
 #[path = "unsupported.rs"]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+mod resource_lifecycle;
 
 mod app {
     use super::linux::{VideoFrame, VideoWindow};
