@@ -13,10 +13,14 @@ quinn.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["wayland", "x11"] }
+gpu-video = { path = "../../vendor/gpu-video" }
 bytemuck = { version = "1", features = ["derive"] }
-bytes = "1"
-hang = "0.21.8"
-moq-net = "0.3.7"
-moq-video = { version = "0.1.7", default-features = false, features = ["nvidia", "openh264", "render", "vaapi", "v4l2"] }
+openh264 = "0.9.8"
+h264-reader = "0.8"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 pollster = "0.4"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "x11"] }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "noop", "wgsl"] }

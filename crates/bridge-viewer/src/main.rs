@@ -7,6 +7,8 @@ mod linux;
 mod native_video;
 #[cfg(any(target_os = "linux", test))]
 mod resource_lifecycle;
+#[cfg(target_os = "linux")]
+mod stream_engine;
 
 mod app {
     use super::linux::{VideoFrame, VideoWindow};
@@ -2017,10 +2019,19 @@ mod app {
                 if DEBUG {
                     screen
                         .video_window
-                        .submit_debug(bytes, header.keyframe, header.sequence, trace.clone())
+                        .submit_debug(
+                            bytes,
+                            header.keyframe,
+                            header.sequence,
+                            header.timestamp_us,
+                            trace.clone(),
+                        )
                         .await
                 } else {
-                    screen.video_window.submit(bytes, header.keyframe).await
+                    screen
+                        .video_window
+                        .submit(bytes, header.keyframe, header.sequence, header.timestamp_us)
+                        .await
                 }
             };
             tokio::select! {
@@ -2070,6 +2081,9 @@ mod app {
                         if lane != MediaLane::Video {
                             let _ = stream.stop(0u32.into());
                             return (screen_id, generation, lane, Err(anyhow::anyhow!("The {lane:?} lane is not implemented yet")));
+                        }
+                        if let Err(error) = hello.video.ok_or_else(|| anyhow::anyhow!("Video format contract missing")).and_then(|format| format.validate()) {
+                            return (screen_id, generation, lane, Err(error));
                         }
                         let key = (screen_id, generation, lane);
                         if let Ok(mut active) = active.lock() {
@@ -2273,7 +2287,7 @@ mod app {
         let (mut control_messages, control_task) = control_reader::<_, HostMessage>(control_recv);
         let mut watchdog = tokio::time::interval(Duration::from_millis(100));
         let mut last_stats = now_us();
-        let mut counters = HashMap::<ScreenId, (u64, u64, u64, u64)>::new();
+        let mut counters = HashMap::<ScreenId, (u64, u64, u64, u64, u64)>::new();
         let mut pending_requests = HashMap::<RequestId, PendingAction>::new();
         let session_result: Result<()> = async {
             loop {
@@ -2290,10 +2304,10 @@ mod app {
                         let stats_now=now_us(); let collect=stats_now.saturating_sub(last_stats)>=1_000_000;
                         for screen in screens {
                             if collect && screen.config.instrumented {
-                                let (decoded,skipped)=screen.frame.lock().map(|s|(s.frames,s.skipped)).unwrap_or_default();
-                                let previous=counters.insert(screen.config.screen_id,(screen.bytes,screen.received_frames,decoded,connection.rtt().as_micros() as u64)).unwrap_or_default();
+                                let (decoded,skipped,presented,memory,in_flight,age,engine)=screen.frame.lock().map(|s|(s.frames,s.skipped,s.presented,s.gpu_memory_bytes,s.gpu_in_flight,s.frame_age_us,s.decoder.clone())).unwrap_or_default();
+                                let previous=counters.insert(screen.config.screen_id,(screen.bytes,screen.received_frames,decoded,connection.rtt().as_micros() as u64,presented)).unwrap_or_default();
                                 let elapsed=stats_now.saturating_sub(last_stats) as f64/1_000_000.;let rtt=connection.rtt().as_micros() as u64;let transport=connection.stats();
-                                screen.telemetry.stats(StreamStats{at_us:stats_now,bitrate_kbps:screen.bytes.saturating_sub(previous.0) as f64*8./elapsed/1000.,fps:screen.received_frames.saturating_sub(previous.1) as f64/elapsed,decoded_fps:Some(decoded.saturating_sub(previous.2) as f64/elapsed),frames:screen.received_frames,dropped:skipped+screen.host_frames_dropped,rtt_us:rtt,jitter_us:rtt.abs_diff(previous.3),lost_packets:transport.path.lost_packets,congestion_events:transport.path.congestion_events,..Default::default()});
+                                screen.telemetry.stats(StreamStats{at_us:stats_now,bitrate_kbps:screen.bytes.saturating_sub(previous.0) as f64*8./elapsed/1000.,fps:screen.received_frames.saturating_sub(previous.1) as f64/elapsed,decoded_fps:Some(decoded.saturating_sub(previous.2) as f64/elapsed),presented_fps:Some(presented.saturating_sub(previous.4) as f64/elapsed),gpu_memory_bytes:Some(memory),gpu_in_flight:Some(in_flight),frame_age_us:age,engine:Some(engine),frames:screen.received_frames,dropped:skipped+screen.host_frames_dropped,rtt_us:rtt,jitter_us:rtt.abs_diff(previous.3),lost_packets:transport.path.lost_packets,congestion_events:transport.path.congestion_events,..Default::default()});
                                 let clock=shared.lock().map(|s|s.clock).unwrap_or_default();screen.telemetry.expire(stats_now as i64+clock.offset_us,"Stage did not conclude within five seconds");
                             }
                             if screen.terminal && !screen.cleanup_reported && screen.frame.lock().map(|f|f.cleanup_complete).unwrap_or(false){

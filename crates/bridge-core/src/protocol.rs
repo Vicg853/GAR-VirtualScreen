@@ -14,7 +14,7 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const MAX_VIEWERS_PER_SCREEN: usize = 8;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
@@ -158,6 +158,37 @@ pub enum MediaState {
     Stopped,
 }
 
+/// Explicit video contract; profile, crop and color remain in inline SPS/PPS.
+/// v6 currently supports complete Annex-B H264 access units, 8-bit 4:2:0 SDR,
+/// no picture reordering. timestamp_us is the source monotonic PTS in microseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoFormat {
+    pub codec: crate::config::Codec,
+    pub annex_b: bool,
+    pub bit_depth: u8,
+    pub chroma_420: bool,
+    pub max_reorder_frames: u8,
+}
+impl Default for VideoFormat {
+    fn default() -> Self {
+        Self {
+            codec: crate::config::Codec::H264,
+            annex_b: true,
+            bit_depth: 8,
+            chroma_420: true,
+            max_reorder_frames: 0,
+        }
+    }
+}
+impl VideoFormat {
+    pub fn validate(self) -> Result<()> {
+        if self != Self::default() {
+            bail!("Unsupported video engine contract: {self:?}");
+        }
+        Ok(())
+    }
+}
+
 /// Sent at the start of every QUIC unidirectional media stream.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct MediaStreamHello {
@@ -165,6 +196,7 @@ pub struct MediaStreamHello {
     pub screen_id: ScreenId,
     pub generation: StreamGeneration,
     pub lane: MediaLane,
+    pub video: Option<VideoFormat>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -565,12 +597,38 @@ mod tests {
     }
 
     #[test]
+    fn engine_contract_rejects_unsupported_formats() {
+        assert!(VideoFormat::default().validate().is_ok());
+        for format in [
+            VideoFormat {
+                bit_depth: 10,
+                ..VideoFormat::default()
+            },
+            VideoFormat {
+                max_reorder_frames: 1,
+                ..VideoFormat::default()
+            },
+            VideoFormat {
+                annex_b: false,
+                ..VideoFormat::default()
+            },
+            VideoFormat {
+                chroma_420: false,
+                ..VideoFormat::default()
+            },
+        ] {
+            assert!(format.validate().is_err());
+        }
+    }
+
+    #[test]
     fn media_lane_preamble_and_packets_are_scoped_to_screen_generation() {
         let preamble = MediaStreamHello {
             version: VERSION,
             screen_id: 3,
             generation: 9,
             lane: MediaLane::Video,
+            video: Some(VideoFormat::default()),
         };
         let encoded = serde_json::to_value(preamble).unwrap();
         assert_eq!(encoded["screen_id"], 3);

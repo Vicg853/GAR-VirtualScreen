@@ -9,7 +9,8 @@ use std::{
 
 /// Small, bounded diagnostic history shared by the UI and worker threads.
 pub struct Diagnostics {
-    entries: Mutex<VecDeque<String>>,
+    entries: Mutex<VecDeque<(u64, String)>>,
+    next: std::sync::atomic::AtomicU64,
     writer: std::sync::mpsc::SyncSender<String>,
     path: Option<PathBuf>,
 }
@@ -42,6 +43,7 @@ impl Diagnostics {
             });
         Self {
             entries: Mutex::new(VecDeque::new()),
+            next: std::sync::atomic::AtomicU64::new(1),
             writer,
             path,
         }
@@ -65,17 +67,33 @@ impl Diagnostics {
         );
         let _ = self.writer.try_send(line.clone());
         if let Ok(mut entries) = self.entries.lock() {
-            entries.push_back(line);
+            let sequence = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            entries.push_back((sequence, line));
             if entries.len() > 200 {
                 entries.pop_front();
             }
         }
     }
 
+    /// Bounded lifecycle/error export for the native worker; no media packet logs.
+    pub fn since(&self, cursor: u64, limit: usize) -> Vec<(u64, String)> {
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, _)| *id > cursor)
+                    .take(limit.min(24))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn recent(&self) -> Vec<String> {
         self.entries
             .lock()
-            .map(|entries| entries.iter().cloned().collect())
+            .map(|entries| entries.iter().map(|(_, line)| line.clone()).collect())
             .unwrap_or_default()
     }
 }

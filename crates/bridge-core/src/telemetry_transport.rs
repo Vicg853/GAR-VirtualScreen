@@ -19,6 +19,7 @@ pub async fn send_batches(
             screen_id: 0,
             generation: 0,
             lane: MediaLane::Diagnostics,
+            video: None,
         },
     )
     .await

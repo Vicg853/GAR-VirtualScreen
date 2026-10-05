@@ -28,6 +28,10 @@ pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub frames: u64,
+    pub presented: u64,
+    pub gpu_memory_bytes: u64,
+    pub gpu_in_flight: u32,
+    pub frame_age_us: Option<u64>,
     pub skipped: u64,
     pub decoder: String,
     pub error: Option<String>,
@@ -189,13 +193,20 @@ impl VideoWindow {
         })
         .await
     }
-    pub async fn submit(&self, bytes: Vec<u8>, keyframe: bool) -> Result<()> {
+    pub async fn submit(
+        &self,
+        bytes: Vec<u8>,
+        keyframe: bool,
+        sequence: u64,
+        timestamp_us: u64,
+    ) -> Result<()> {
         let epoch = self.epoch.current().context("Obsolete video producer")?;
         self.send(Input {
             epoch,
             message: Message::Packet {
                 keyframe,
-                sequence: 0,
+                sequence,
+                timestamp_us,
                 trace: None,
             },
             payload: bytes,
@@ -207,6 +218,7 @@ impl VideoWindow {
         bytes: Vec<u8>,
         keyframe: bool,
         sequence: u64,
+        timestamp_us: u64,
         trace: Option<TraceToken>,
     ) -> Result<()> {
         let epoch = self.epoch.current().context("Obsolete video producer")?;
@@ -220,6 +232,7 @@ impl VideoWindow {
             message: Message::Packet {
                 keyframe,
                 sequence,
+                timestamp_us,
                 trace: trace.map(|t| TraceSeed {
                     capture_us: t.capture_us,
                     offset_us: t.offset_us,
@@ -430,6 +443,10 @@ fn launch_using(
                             s.width = status.width;
                             s.height = status.height;
                             s.frames = status.frames;
+                            s.presented = status.presented;
+                            s.gpu_memory_bytes = status.gpu_memory_bytes;
+                            s.gpu_in_flight = status.gpu_in_flight;
+                            s.frame_age_us = status.frame_age_us;
                             s.skipped = status.skipped;
                             s.decoder = status.decoder;
                             s.user_closed = status.user_closed;
@@ -440,6 +457,7 @@ fn launch_using(
                         }
                     }
                     Message::Error(message) => fail(&target, &diagnostics, message),
+                    Message::Log(line) => diagnostics.record("native-worker", line),
                     Message::Diagnostics { events, lost } => {
                         if let Some(t) = telemetry.lock().ok().and_then(|t| t.clone()) {
                             t.peer_lost(lost);
@@ -643,7 +661,9 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
     let tick_output = output.clone();
     let tick_frame = frame.clone();
     let tick_telemetry = telemetry.clone();
+    let tick_logs = diagnostics.clone();
     let events = thread::spawn(move || {
+        let mut log_cursor = 0;
         while !tick_done.load(Ordering::Acquire) {
             let status = tick_frame
                 .lock()
@@ -651,6 +671,10 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                     width: s.width,
                     height: s.height,
                     frames: s.frames,
+                    presented: s.presented,
+                    gpu_memory_bytes: s.gpu_memory_bytes,
+                    gpu_in_flight: s.gpu_in_flight,
+                    frame_age_us: s.frame_age_us,
                     skipped: s.skipped,
                     decoder: s.decoder.clone(),
                     error: s.error.clone(),
@@ -661,6 +685,15 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
             if let Ok(mut socket) = tick_output.lock() {
                 if worker::write(&mut *socket, &Message::Status(status), &[]).is_err() {
                     break;
+                }
+                for (id, line) in tick_logs.since(log_cursor, 16) {
+                    worker::write(
+                        &mut *socket,
+                        &Message::Log(line.chars().take(512).collect()),
+                        &[],
+                    )
+                    .ok();
+                    log_cursor = id;
                 }
                 let batch = tick_telemetry.drain(0, 0);
                 for chunk in batch.events.chunks(24) {
@@ -688,6 +721,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
         &crate::native_video::VideoWindow,
         Vec<u8>,
         bool,
+        u64,
         u64,
         Option<TraceSeed>,
         Arc<Telemetry>,
@@ -717,6 +751,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                 Message::Packet {
                     keyframe,
                     sequence,
+                    timestamp_us,
                     trace,
                 } => {
                     if window.is_none() {
@@ -738,6 +773,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                         payload,
                         keyframe,
                         sequence,
+                        timestamp_us,
                         trace,
                         telemetry.clone(),
                     )?;
@@ -791,6 +827,7 @@ fn child_submit<const DEBUG: bool>(
     payload: Vec<u8>,
     keyframe: bool,
     sequence: u64,
+    timestamp_us: u64,
     trace: Option<TraceSeed>,
     telemetry: Arc<Telemetry>,
 ) -> Result<()> {
@@ -818,9 +855,9 @@ fn child_submit<const DEBUG: bool>(
                 telemetry: telemetry.clone(),
             }
         });
-        runtime.block_on(window.submit_debug(payload, keyframe, sequence, token))
+        runtime.block_on(window.submit_debug(payload, keyframe, sequence, timestamp_us, token))
     } else {
-        runtime.block_on(window.submit(payload, keyframe))
+        runtime.block_on(window.submit(payload, keyframe, sequence, timestamp_us))
     }
 }
 
@@ -900,6 +937,7 @@ mod tests {
             &Message::Packet {
                 keyframe: true,
                 sequence: 1,
+                timestamp_us: 1234,
                 trace: None,
             },
             b"compressed",

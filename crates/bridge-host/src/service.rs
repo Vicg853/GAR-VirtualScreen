@@ -372,6 +372,7 @@ mod service {
                 screen_id: screen.screen_id,
                 generation: screen.generation,
                 lane: MediaLane::Video,
+                video: Some(bridge_core::protocol::VideoFormat::default()),
             },
         )
         .await?;

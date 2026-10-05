@@ -7,6 +7,10 @@ pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub frames: u64,
+    pub presented: u64,
+    pub gpu_memory_bytes: u64,
+    pub gpu_in_flight: u32,
+    pub frame_age_us: Option<u64>,
     pub skipped: u64,
     pub decoder: String,
     pub error: Option<String>,
@@ -33,6 +37,7 @@ impl VideoWindow {
         _bytes: Vec<u8>,
         _keyframe: bool,
         _sequence: u64,
+        _timestamp_us: u64,
         _trace: Option<bridge_core::telemetry::TraceToken>,
     ) -> Result<()> {
         bail!("{}", self.message)
@@ -76,7 +81,13 @@ impl VideoWindow {
         bail!("{}", self.message)
     }
 
-    pub async fn submit(&self, _bytes: Vec<u8>, _keyframe: bool) -> Result<()> {
+    pub async fn submit(
+        &self,
+        _bytes: Vec<u8>,
+        _keyframe: bool,
+        _sequence: u64,
+        _timestamp_us: u64,
+    ) -> Result<()> {
         bail!("{}", self.message)
     }
 }

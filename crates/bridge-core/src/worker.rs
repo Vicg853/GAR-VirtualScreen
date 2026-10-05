@@ -5,6 +5,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+
+/// Local IPC evolves independently from the network protocol.
+pub const VERSION: u16 = 1;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TraceSeed {
     pub capture_us: u64,
@@ -17,6 +20,10 @@ pub struct Status {
     pub width: u32,
     pub height: u32,
     pub frames: u64,
+    pub presented: u64,
+    pub gpu_memory_bytes: u64,
+    pub gpu_in_flight: u32,
+    pub frame_age_us: Option<u64>,
     pub skipped: u64,
     pub decoder: String,
     pub error: Option<String>,
@@ -43,6 +50,7 @@ pub enum Message {
     Packet {
         keyframe: bool,
         sequence: u64,
+        timestamp_us: u64,
         trace: Option<TraceSeed>,
     },
     Stop,
@@ -53,6 +61,7 @@ pub enum Message {
     },
     Stopped,
     Error(String),
+    Log(String),
 }
 pub fn write<W: Write>(writer: &mut W, message: &Message, payload: &[u8]) -> io::Result<()> {
     let json = serde_json::to_vec(message).map_err(io::Error::other)?;
@@ -62,7 +71,7 @@ pub fn write<W: Write>(writer: &mut W, message: &Message, payload: &[u8]) -> io:
     {
         return Err(io::Error::other("Invalid worker message size"));
     }
-    writer.write_all(&crate::protocol::VERSION.to_be_bytes())?;
+    writer.write_all(&VERSION.to_be_bytes())?;
     writer.write_all(&(json.len() as u32).to_be_bytes())?;
     writer.write_all(&(payload.len() as u32).to_be_bytes())?;
     writer.write_all(&json)?;
@@ -72,7 +81,7 @@ pub fn write<W: Write>(writer: &mut W, message: &Message, payload: &[u8]) -> io:
 pub fn read<R: Read>(reader: &mut R) -> io::Result<(Message, Vec<u8>)> {
     let mut version = [0; 2];
     reader.read_exact(&mut version)?;
-    if u16::from_be_bytes(version) != crate::protocol::VERSION {
+    if u16::from_be_bytes(version) != VERSION {
         return Err(io::Error::other("Worker protocol version mismatch"));
     }
     let mut lengths = [0; 8];
@@ -87,6 +96,11 @@ pub fn read<R: Read>(reader: &mut R) -> io::Result<(Message, Vec<u8>)> {
     let message: Message = serde_json::from_slice(&json).map_err(io::Error::other)?;
     if !matches!(message, Message::Packet { .. }) && bytes != 0 {
         return Err(io::Error::other("Unexpected worker payload"));
+    }
+    if let Message::Log(line) = &message {
+        if line.len() > 2048 {
+            return Err(io::Error::other("Oversized worker log"));
+        }
     }
     if let Message::Diagnostics { events, .. } = &message {
         if events.len() > 24 {
@@ -105,6 +119,12 @@ mod tests {
         assert!(read(&mut 0u16.to_be_bytes().as_slice()).is_err());
     }
     #[test]
+    fn worker_logs_are_bounded() {
+        let mut wire = vec![];
+        write(&mut wire, &Message::Log("x".repeat(2049)), &[]).unwrap();
+        assert!(read(&mut wire.as_slice()).is_err());
+    }
+    #[test]
     fn ipc_bounds_and_truncation() {
         let mut wire = vec![];
         write(
@@ -112,16 +132,26 @@ mod tests {
             &Message::Packet {
                 keyframe: true,
                 sequence: 1,
+                timestamp_us: 1234,
                 trace: None,
             },
             b"h264",
         )
         .unwrap();
-        assert_eq!(read(&mut wire.as_slice()).unwrap().1, b"h264");
+        let (message, payload) = read(&mut wire.as_slice()).unwrap();
+        assert_eq!(payload, b"h264");
+        assert!(matches!(
+            message,
+            Message::Packet {
+                timestamp_us: 1234,
+                sequence: 1,
+                ..
+            }
+        ));
         wire.pop();
         assert!(read(&mut wire.as_slice()).is_err());
         assert!(write(&mut vec![], &Message::Stop, b"bad").is_err());
-        let mut bad = crate::protocol::VERSION.to_be_bytes().to_vec();
+        let mut bad = VERSION.to_be_bytes().to_vec();
         bad.extend_from_slice(&(MAX_CONTROL as u32 + 1).to_be_bytes());
         bad.extend_from_slice(&0u32.to_be_bytes());
         assert!(read(&mut bad.as_slice()).is_err());

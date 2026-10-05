@@ -1,0 +1,20 @@
+[package]
+name = "airbridge-engine-native-check"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+bridge-core = { path = "../../crates/bridge-core" }
+gpu-video = { path = "../../vendor/gpu-video", features = ["vulkan-typecheck"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+bytemuck = { version = "1", features = ["derive"] }
+openh264 = "0.9.8"
+h264-reader = "0.8"
+wgpu = { version = "30.0.1", features = ["vulkan-portability", "noop"] }
+pollster = "0.4"
+winit = "0.30"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
+
+[workspace]

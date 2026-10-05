@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/bridge-core", "crates/bridge-host", "crates/bridge-viewer"]
+exclude = ["vendor/gpu-video"]
 resolver = "2"
 
 [workspace.package]

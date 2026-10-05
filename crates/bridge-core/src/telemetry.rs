@@ -12,7 +12,7 @@ use std::{
 
 pub const FRAME_LIMIT: usize = 20;
 pub const HISTORY_LIMIT: usize = 60;
-pub const STAGE_COUNT: usize = 16;
+pub const STAGE_COUNT: usize = 23;
 pub const EVENT_LIMIT: usize = 1024;
 pub fn now_us() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -37,6 +37,13 @@ pub enum Stage {
     GpuComplete,
     PresentSubmit,
     Presentation,
+    CpuParse,
+    GpuInput,
+    DecodeSubmit,
+    SurfaceAcquire,
+    GpuRender,
+    SoftwareDecode,
+    SoftwareUpload,
 }
 impl Stage {
     pub const ALL: [Self; STAGE_COUNT] = [
@@ -56,6 +63,13 @@ impl Stage {
         Self::GpuComplete,
         Self::PresentSubmit,
         Self::Presentation,
+        Self::CpuParse,
+        Self::GpuInput,
+        Self::DecodeSubmit,
+        Self::SurfaceAcquire,
+        Self::GpuRender,
+        Self::SoftwareDecode,
+        Self::SoftwareUpload,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -70,11 +84,18 @@ impl Stage {
             Self::DecodeQueue => "Decoder queue",
             Self::Decode => "Decode",
             Self::RenderQueue => "Decoded frame queue",
-            Self::Upload => "GPU prepare/upload",
+            Self::Upload => "GPU view preparation",
             Self::Submit => "GPU submission",
             Self::GpuComplete => "GPU work completion",
             Self::PresentSubmit => "Presentation submission",
             Self::Presentation => "Monitor presentation",
+            Self::CpuParse => "CPU codec parsing",
+            Self::GpuInput => "GPU bitstream upload",
+            Self::DecodeSubmit => "GPU decode/copy submission",
+            Self::SurfaceAcquire => "Swapchain acquisition",
+            Self::GpuRender => "GPU render duration",
+            Self::SoftwareDecode => "Software decode work",
+            Self::SoftwareUpload => "Decoded plane upload submission",
         }
     }
 }
@@ -98,6 +119,9 @@ pub struct Sample {
 }
 impl Sample {
     pub fn cell(&self, capture: u64) -> String {
+        if self.outcome == Outcome::Unavailable {
+            return format!("Unavailable: {}", self.reason);
+        }
         let start = (self.start_us.saturating_sub(capture as i64)) as f64 / 1000.;
         let prefix = if self.estimated { "≈" } else { "" };
         let duration = self
@@ -193,13 +217,16 @@ impl Average {
             return;
         }
         self.count += 1;
-        if synchronized {
+        if sample.outcome == Outcome::Complete && synchronized {
             self.start_count += 1;
             self.mean_start_us += ((sample.start_us.saturating_sub(capture as i64)) as f64
                 - self.mean_start_us)
                 / self.start_count as f64;
         }
-        if let Some(d) = sample.duration_us {
+        if let Some(d) = sample
+            .duration_us
+            .filter(|_| sample.outcome == Outcome::Complete)
+        {
             self.duration_count += 1;
             self.mean_duration_us +=
                 (d as f64 - self.mean_duration_us) / self.duration_count as f64;
@@ -232,6 +259,11 @@ pub struct StreamStats {
     pub bitrate_kbps: f64,
     pub fps: f64,
     pub decoded_fps: Option<f64>,
+    pub presented_fps: Option<f64>,
+    pub gpu_memory_bytes: Option<u64>,
+    pub gpu_in_flight: Option<u32>,
+    pub frame_age_us: Option<u64>,
+    pub engine: Option<String>,
     pub frames: u64,
     pub dropped: u64,
     pub rtt_us: u64,
@@ -666,6 +698,11 @@ impl StatsView {
         if let Some(s) = snapshot.history.last() {
             lines.push(format!("{:.0} kbps · {:.1} FPS · RTT {:.2}ms · RTT variation {:.2}ms · drops {} · connection packet loss {} · congestion events {}",s.bitrate_kbps,s.fps,s.rtt_us as f64/1000.,s.jitter_us as f64/1000.,s.dropped,s.lost_packets,s.congestion_events));
             lines.push(format!("Decode FPS {} · capture queue {} · sender queue {} · decoder queue {} · audio: unavailable",fps(s.decoded_fps),queue(s.capture_queue),queue(s.send_queue),queue(s.decode_queue)));
+            if let Some(engine) = &s.engine {
+                lines.push(format!("{engine} · presentation submit {} FPS · GPU in flight {} · accounted video memory {:.1} MiB (excludes driver/swapchain) · frame age {}",
+                    fps(s.presented_fps), queue(s.gpu_in_flight), s.gpu_memory_bytes.unwrap_or(0) as f64 / 1048576.,
+                    s.frame_age_us.map(|age| format!("≈{:.2}ms to compositor submission", age as f64 / 1000.)).unwrap_or_else(|| "unavailable".into())));
+            }
             // Compact history chart; never retain frame buffers in statistics.
             let chart = |values: Vec<f64>| {
                 let max = values.iter().copied().fold(1f64, f64::max);
@@ -957,5 +994,61 @@ mod tests {
         assert!(s.frames.len() <= FRAME_LIMIT);
         assert!(s.history.len() <= HISTORY_LIMIT);
         assert_eq!(s.averages[Stage::Encode as usize].count, 100);
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    #[test]
+    fn failures_and_unavailable_do_not_pollute_success_timings() {
+        let mut average = Average::default();
+        for outcome in [
+            Outcome::Failed,
+            Outcome::Dropped,
+            Outcome::Cancelled,
+            Outcome::TimedOut,
+            Outcome::Unavailable,
+        ] {
+            average.add(
+                &Sample {
+                    start_us: 9_000_000,
+                    duration_us: Some(8_000_000),
+                    outcome,
+                    reason: "not completed".into(),
+                    estimated: false,
+                },
+                0,
+                true,
+            );
+        }
+        assert_eq!(average.start_count, 0);
+        assert_eq!(average.duration_count, 0);
+        average.add(
+            &Sample {
+                start_us: 120,
+                duration_us: Some(30),
+                outcome: Outcome::Complete,
+                reason: String::new(),
+                estimated: false,
+            },
+            100,
+            true,
+        );
+        assert_eq!(average.mean_start_us, 20.);
+        assert_eq!(average.mean_duration_us, 30.);
+        assert_eq!(average.failures, 4);
+        assert_eq!(average.incomplete, 5);
+    }
+    #[test]
+    fn unavailable_scanout_has_no_fabricated_start_time() {
+        let sample = Sample {
+            start_us: 50_760,
+            duration_us: None,
+            outcome: Outcome::Unavailable,
+            reason: "No monitor feedback".into(),
+            estimated: true,
+        };
+        assert_eq!(sample.cell(0), "Unavailable: No monitor feedback");
     }
 }

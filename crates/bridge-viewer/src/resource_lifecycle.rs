@@ -1,9 +1,49 @@
 //! A native producer must not be destroyed until its consumers release resources.
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
+
+/// A display candidate is replaceable; codec references must be owned elsewhere.
+/// Replaces the old candidate without waiting for the display thread. No pixel copy.
+pub struct LatestSender<T>(Arc<Mutex<LatestState<T>>>);
+pub struct LatestReceiver<T>(Arc<Mutex<LatestState<T>>>);
+struct LatestState<T> {
+    value: Option<T>,
+    receiver_alive: bool,
+}
+pub fn latest_channel<T>() -> (LatestSender<T>, LatestReceiver<T>) {
+    let state = Arc::new(Mutex::new(LatestState {
+        value: None,
+        receiver_alive: true,
+    }));
+    (LatestSender(state.clone()), LatestReceiver(state))
+}
+impl<T> LatestSender<T> {
+    pub fn replace(&self, value: T) -> Result<Option<T>, T> {
+        let Ok(mut state) = self.0.lock() else {
+            return Err(value);
+        };
+        if !state.receiver_alive {
+            return Err(value);
+        }
+        Ok(state.value.replace(value))
+    }
+}
+impl<T> LatestReceiver<T> {
+    pub fn take(&self) -> Option<T> {
+        self.0.lock().ok()?.value.take()
+    }
+}
+impl<T> Drop for LatestReceiver<T> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.receiver_alive = false;
+            state.value = None;
+        }
+    }
+}
 
 /// Clones retain their generation; advancing invalidates old network producers.
 #[derive(Clone, Default)]
@@ -75,6 +115,19 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn display_candidate_is_latest_and_bounded() {
+        let (tx, rx) = latest_channel();
+        assert_eq!(tx.replace(1), Ok(None));
+        for value in 2..1000 {
+            assert_eq!(tx.replace(value), Ok(Some(value - 1)));
+        }
+        assert_eq!(rx.take(), Some(999));
+        assert_eq!(rx.take(), None);
+        drop(rx);
+        assert_eq!(tx.replace(1000), Err(1000));
+    }
 
     struct Native(Arc<Mutex<Vec<&'static str>>>);
     impl Drop for Native {
