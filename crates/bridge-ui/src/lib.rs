@@ -3,41 +3,15 @@ use bridge_core::telemetry::{Stage, TimingView};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, TitleBar,
     button::{Button, ButtonVariants},
-    table::{
-        Column, DataTable, Table, TableBody, TableCell, TableDelegate, TableHead, TableHeader,
-        TableRow, TableState,
-    },
+    table::{Column, DataTable, TableDelegate, TableState},
 };
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Global, IntoElement, Render,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, rems, size,
+    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub const TIMING_HELP: &str = "Start = time since capture (cumulative; do not add columns). Duration = time spent in that stage. S/D in frame cells use the same definitions. Estimated timings include clock uncertainty. GPU completion is not monitor presentation.";
-
-/// Bounded compact preview; the inspector provides retained, resizable columns.
-pub fn timing_preview(rows: Vec<Vec<String>>) -> impl IntoElement {
-    let mut rows = rows.into_iter();
-    let header = rows.next().unwrap_or_default();
-    Table::new()
-        .small()
-        .child(
-            TableHeader::new().child(
-                TableRow::new().children(
-                    header
-                        .into_iter()
-                        .map(|label| TableHead::new().min_w(rems(12.)).child(label)),
-                ),
-            ),
-        )
-        .child(TableBody::new().children(rows.map(|row| {
-            TableRow::new().children(
-                row.into_iter()
-                    .map(|value| TableCell::new().min_w(rems(12.)).child(value)),
-            )
-        })))
-}
 
 #[derive(Clone, Copy)]
 pub enum InspectionAction {
@@ -45,6 +19,7 @@ pub enum InspectionAction {
     Averages,
     Freeze,
     Burst,
+    Close,
 }
 
 /// Snapshot values only: no network reads, GPU ownership, or domain mutation in rendering.
@@ -79,6 +54,10 @@ pub struct InspectionSource {
     action: Arc<dyn Fn(InspectionAction) + Send + Sync>,
 }
 impl InspectionSource {
+    /// Release the domain diagnostics subscription, including window-open rollback.
+    pub fn close(&self) {
+        (self.action)(InspectionAction::Close);
+    }
     pub fn new(
         read: impl Fn() -> Option<InspectionData> + Send + Sync + 'static,
         action: impl Fn(InspectionAction) + Send + Sync + 'static,
@@ -90,8 +69,12 @@ impl InspectionSource {
     }
 }
 
+struct InspectionWindow {
+    handle: AnyWindowHandle,
+    source: InspectionSource,
+}
 #[derive(Default)]
-struct InspectionWindows(HashMap<String, AnyWindowHandle>);
+struct InspectionWindows(HashMap<String, InspectionWindow>);
 impl Global for InspectionWindows {}
 
 /// Reuse an inspector for the same domain screen; failed window handles are replaced.
@@ -100,14 +83,30 @@ pub fn open_inspector(key: String, source: InspectionSource, cx: &mut App) -> an
         cx.set_global(InspectionWindows::default());
         cx.on_window_closed(|cx, closed_id| {
             if cx.has_global::<InspectionWindows>() {
-                cx.global_mut::<InspectionWindows>()
-                    .0
-                    .retain(|_, handle| handle.window_id() != closed_id);
+                let sources = {
+                    let windows = &mut cx.global_mut::<InspectionWindows>().0;
+                    let keys = windows
+                        .iter()
+                        .filter(|(_, entry)| entry.handle.window_id() == closed_id)
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    keys.into_iter()
+                        .filter_map(|key| windows.remove(&key))
+                        .map(|entry| entry.source)
+                        .collect::<Vec<_>>()
+                };
+                for source in sources {
+                    source.close();
+                }
             }
         })
         .detach();
     }
-    if let Some(handle) = cx.global::<InspectionWindows>().0.get(&key).copied()
+    if let Some(handle) = cx
+        .global::<InspectionWindows>()
+        .0
+        .get(&key)
+        .map(|entry| entry.handle)
         && handle
             .update(cx, |_, window, _| window.activate_window())
             .is_ok()
@@ -115,6 +114,7 @@ pub fn open_inspector(key: String, source: InspectionSource, cx: &mut App) -> an
         return Ok(());
     }
     let bounds = Bounds::centered(None, size(px(1100.), px(680.)), cx);
+    let close_source = source.clone();
     let (handle, _) = gpui_kit::open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -140,7 +140,13 @@ pub fn open_inspector(key: String, source: InspectionSource, cx: &mut App) -> an
             view
         },
     )?;
-    cx.global_mut::<InspectionWindows>().0.insert(key, handle);
+    cx.global_mut::<InspectionWindows>().0.insert(
+        key,
+        InspectionWindow {
+            handle,
+            source: close_source,
+        },
+    );
     Ok(())
 }
 
@@ -407,13 +413,25 @@ mod tests {
     #[gpui_kit::test]
     fn inspectors_reuse_windows_and_release_closed_handles(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
-        let source = InspectionSource::new(|| None, |_| {});
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let closes = Arc::new(AtomicUsize::new(0));
+        let observed = closes.clone();
+        let source = InspectionSource::new(
+            || None,
+            move |action| {
+                if matches!(action, InspectionAction::Close) {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        );
         cx.update(|cx| {
             open_inspector("screen:1".into(), source.clone(), cx).unwrap();
-            let first = cx.global::<InspectionWindows>().0["screen:1"];
+            let first = cx.global::<InspectionWindows>().0["screen:1"].handle;
             open_inspector("screen:1".into(), source, cx).unwrap();
             assert_eq!(
-                cx.global::<InspectionWindows>().0["screen:1"].window_id(),
+                cx.global::<InspectionWindows>().0["screen:1"]
+                    .handle
+                    .window_id(),
                 first.window_id()
             );
             assert_eq!(cx.global::<InspectionWindows>().0.len(), 1);
@@ -422,6 +440,11 @@ mod tests {
                 .unwrap();
         });
         cx.read(|cx| assert!(cx.global::<InspectionWindows>().0.is_empty()));
+        assert_eq!(
+            closes.load(Ordering::Relaxed),
+            1,
+            "closing releases diagnostics exactly once"
+        );
     }
     #[gpui_kit::test]
     fn inspector_controls_keep_state_and_close_source_safely(cx: &mut gpui_kit::TestAppContext) {
@@ -470,7 +493,7 @@ mod tests {
                 InspectionAction::Freeze => {
                     write_frozen.fetch_xor(true, Ordering::Relaxed);
                 }
-                InspectionAction::Burst => {}
+                InspectionAction::Burst | InspectionAction::Close => {}
             },
         );
         cx.update(gpui_kit::init);

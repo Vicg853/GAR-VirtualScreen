@@ -445,6 +445,26 @@ mod app {
 
     impl ViewerView {
         fn inspect_stats(&mut self, id: ScreenId, cx: &mut Context<Self>) {
+            if let Ok(mut state) = self.state.lock() {
+                let Some(index) = state.screens.iter().position(|s| s.config.screen_id == id)
+                else {
+                    return;
+                };
+                if !state.screens[index].stats_view.open {
+                    if let Some(Err(error)) =
+                        Some(self.commands.try_send(Command::Diagnostics(id, true)))
+                    {
+                        state.message = format!("Could not enable statistics: {error}");
+                        state.diagnostics.record("stats", &state.message);
+                        cx.notify();
+                        return;
+                    }
+                    state.screens[index].stats_view.reset();
+                    state.screens[index].stats_view.open = true;
+                }
+            } else {
+                return;
+            }
             let shared = self.state.clone();
             let read = shared.clone();
             let commands = self.commands.clone();
@@ -482,6 +502,10 @@ mod app {
                             }
                             let telemetry = screen.telemetry.clone();
                             match action {
+                                bridge_ui::InspectionAction::Close => {
+                                    screen.stats_view.open = false;
+                                    screen.stats_view.reset();
+                                }
                                 bridge_ui::InspectionAction::Frames => {
                                     screen.stats_view.mode = TimingView::Frames
                                 }
@@ -509,6 +533,14 @@ mod app {
                         } else {
                             return;
                         }
+                        if matches!(action, bridge_ui::InspectionAction::Close) {
+                            if let Some(Err(error)) =
+                                Some(commands.try_send(Command::Diagnostics(id, false)))
+                            {
+                                state.message = format!("Could not disable statistics: {error}");
+                                state.diagnostics.record("stats", &state.message);
+                            }
+                        }
                         if matches!(action, bridge_ui::InspectionAction::Burst) {
                             let _ = Some(commands.try_send(Command::Burst(id)));
                         }
@@ -517,9 +549,10 @@ mod app {
             );
             if let Err(error) = bridge_ui::open_inspector(
                 format!("viewer:{}:{id}", self.input_owner.unwrap_or(0)),
-                source,
+                source.clone(),
                 cx,
             ) {
+                source.close();
                 message(
                     &self.state,
                     format!("Cannot open statistics inspector: {error:#}"),
@@ -602,18 +635,10 @@ mod app {
                 .iter()
                 .find(|screen| Some(screen.config.screen_id) == state.navigation.selected)
                 .cloned();
-            let (decoded, skipped, decoder, frame_error) = active_screen
+            let frame_error = active_screen
                 .as_ref()
                 .and_then(|screen| screen.frame.lock().ok())
-                .map(|frame| {
-                    (
-                        frame.frames,
-                        frame.skipped,
-                        frame.decoder.clone(),
-                        frame.error.clone(),
-                    )
-                })
-                .unwrap_or_default();
+                .and_then(|frame| frame.error.clone());
             let hosts = state
                 .hosts
                 .iter()
@@ -924,170 +949,13 @@ mod app {
                 .unwrap_or_else(|| state.diagnostics.clone());
             let stats_panel = if let Some(screen) = &active_screen {
                 let id = screen.config.screen_id;
-                let mut panel = div()
-                    .id("viewer-stats-panel")
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        Button::new("viewer-stats-toggle")
-                            .label(if screen.stats_view.open {
-                                "Stats ▴ · instrumented stream"
-                            } else {
-                                "Stats ▾"
-                            })
-                            .outline()
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Ok(mut state) = this.state.lock() {
-                                    if let Some(s) =
-                                        state.screens.iter_mut().find(|s| s.config.screen_id == id)
-                                    {
-                                        let enabled = !s.stats_view.open;
-                                        s.stats_view.open = enabled;
-                                        s.stats_view.frozen = None;
-                                        let _ = this
-                                            .commands
-                                            .try_send(Command::Diagnostics(id, enabled));
-                                    }
-                                }
-                                cx.notify();
-                            })),
-                    );
-                if screen.stats_view.open {
-                    panel = panel
-                        .child(
-                            Button::new("viewer-inspect-stats")
-                                .label("Open statistics inspector")
-                                .primary()
-                                .small()
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(bridge_ui::TIMING_HELP),
-                        )
-                        .child("Temporary diagnostics · opening/closing restarts this stream")
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("viewer-timing-frames")
-                                        .label("Frame rows")
-                                        .outline()
-                                        .small()
-                                        .selected(screen.stats_view.mode == TimingView::Frames)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.config.screen_id == id)
-                                                {
-                                                    s.stats_view.mode = TimingView::Frames;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("viewer-timing-averages")
-                                        .label("Stage averages")
-                                        .outline()
-                                        .small()
-                                        .selected(screen.stats_view.mode == TimingView::Averages)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.config.screen_id == id)
-                                                {
-                                                    s.stats_view.mode = TimingView::Averages;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("viewer-timing-freeze")
-                                        .label(if screen.stats_view.frozen.is_some() {
-                                            "Resume"
-                                        } else {
-                                            "Freeze"
-                                        })
-                                        .outline()
-                                        .small()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.config.screen_id == id)
-                                                {
-                                                    s.stats_view.frozen =
-                                                        if s.stats_view.frozen.is_some() {
-                                                            None
-                                                        } else {
-                                                            Some(s.telemetry.snapshot())
-                                                        };
-                                                    s.stats_view.freeze_after = None;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("viewer-timing-burst")
-                                        .label("Capture next 20")
-                                        .outline()
-                                        .small()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.config.screen_id == id)
-                                                {
-                                                    s.stats_view.frozen = None;
-                                                    s.stats_view.freeze_after = Some(
-                                                        s.telemetry.snapshot().averages
-                                                            [Stage::Capture as usize]
-                                                            .count
-                                                            + 20,
-                                                    );
-                                                }
-                                                let _ = this.commands.try_send(Command::Burst(id));
-                                            }
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .children(
-                            screen
-                                .stats_view
-                                .lines(&screen.telemetry)
-                                .into_iter()
-                                .map(|line| div().text_sm().child(line)),
-                        )
-                        .child(
-                            div()
-                                .id("viewer-timing-table")
-                                .min_w_0()
-                                .h(gpui_kit::rems(14.))
-                                .overflow_scroll()
-                                .child(bridge_ui::timing_preview(
-                                    screen.stats_view.table(&screen.telemetry),
-                                )),
-                        );
-                }
-                panel
+                div().id("viewer-stats-panel").child(
+                    Button::new("viewer-inspect-stats")
+                        .label("Open statistics")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx))),
+                )
             } else {
                 div().id("viewer-stats-none")
             };
@@ -1146,18 +1014,6 @@ mod app {
                 .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
-                        let ids = state
-                            .screens
-                            .iter_mut()
-                            .filter(|s| s.stats_view.open)
-                            .map(|s| {
-                                s.stats_view.open = false;
-                                s.config.screen_id
-                            })
-                            .collect::<Vec<_>>();
-                        for id in ids {
-                            let _ = this.commands.try_send(Command::Diagnostics(id, false));
-                        }
                         state.navigation.view = ScreenView::Details;
                         state.show_codecs = false;
                         state.show_logs = false;
@@ -1197,50 +1053,159 @@ mod app {
                     .child(
                         active_screen
                             .as_ref()
-                            .map(|screen| format!("Stream details · {} · {:?} · generation {}", screen.config.name, screen.config.codec, screen.config.generation))
+                            .map(|screen| {
+                                format!(
+                                    "Stream details · {} · {:?} · generation {}",
+                                    screen.config.name,
+                                    screen.config.codec,
+                                    screen.config.generation
+                                )
+                            })
                             .unwrap_or_else(|| "No active screen stream".into()),
                     )
-                    .when(active_screen.as_ref().is_some_and(|s|s.terminal),|panel|panel.child(if active_screen.as_ref().and_then(|s|s.frame.lock().ok().map(|f|f.cleanup_complete)).unwrap_or(false){"Cleanup complete · retry is available"}else{"Closing video resources · waiting for worker exit…"}))
-                    .child(div().flex().flex_wrap().gap_2()
-                        .when(active_screen.as_ref().is_some_and(|s| !s.removing && (!s.terminal || s.frame.lock().map(|f|f.cleanup_complete).unwrap_or(false))), |row| row
-                            .child(Button::new("retry-stream").label(if active_screen.as_ref().is_some_and(|s| s.terminal) { "Retry stream" } else { "Restart stream" }).primary().small().on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(id) = this.state.lock().ok().and_then(|s| s.navigation.selected) { let _ = this.commands.try_send(Command::RetryScreen(id)); }
-                                    cx.notify();
-                                })))
-                            .child(Button::new("remove-stream").label("Detach viewer").danger().small().on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(id) = this.state.lock().ok().and_then(|s| s.navigation.selected) { let _ = this.commands.try_send(Command::RemoveScreen(id)); }
-                                    cx.notify();
-                                })))))
+                    .when(
+                        active_screen.as_ref().is_some_and(|s| s.terminal),
+                        |panel| {
+                            panel.child(
+                                if active_screen
+                                    .as_ref()
+                                    .and_then(|s| s.frame.lock().ok().map(|f| f.cleanup_complete))
+                                    .unwrap_or(false)
+                                {
+                                    "Cleanup complete · retry is available"
+                                } else {
+                                    "Closing video resources · waiting for worker exit…"
+                                },
+                            )
+                        },
+                    )
+                    .child(div().flex().flex_wrap().gap_2().when(
+                        active_screen.as_ref().is_some_and(|s| {
+                            !s.removing
+                                && (!s.terminal
+                                    || s.frame.lock().map(|f| f.cleanup_complete).unwrap_or(false))
+                        }),
+                        |row| {
+                            row.child(
+                                Button::new("retry-stream")
+                                    .label(if active_screen.as_ref().is_some_and(|s| s.terminal) {
+                                        "Retry stream"
+                                    } else {
+                                        "Restart stream"
+                                    })
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(id) = this
+                                            .state
+                                            .lock()
+                                            .ok()
+                                            .and_then(|s| s.navigation.selected)
+                                        {
+                                            let _ =
+                                                this.commands.try_send(Command::RetryScreen(id));
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("remove-stream")
+                                    .label("Detach viewer")
+                                    .danger()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(id) = this
+                                            .state
+                                            .lock()
+                                            .ok()
+                                            .and_then(|s| s.navigation.selected)
+                                        {
+                                            let _ =
+                                                this.commands.try_send(Command::RemoveScreen(id));
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    ))
                     .child("Source settings affect every viewer attached to this host screen.")
                     .child(logs_toggle)
                     .child(logs)
-                    .when(active_screen.as_ref().is_some_and(|s| !s.terminal && !s.removing), |panel| panel.child(
-                        Button::new("show-display").label("Show display window").outline().small().on_click(cx.listener(|this, _, _, cx| {
-                                let result = this.state.lock().ok()
-                                    .and_then(|state| state.screens.iter().find(|screen| Some(screen.config.screen_id) == state.navigation.selected).map(|screen| screen.video_window.clone()))
-                                    .map(|window| window.show());
-                                if let Some(Err(error)) = result {
-                                    message(&this.state, format!("Cannot show display: {error:#}"));
-                                }
-                                cx.notify();
-                            })),
-                    ))
-                    .when(active_screen.as_ref().is_some_and(|s| !s.removing), |panel| panel
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(if state.connected { "PRESETS · selected stream" } else { "PRESETS · next connection" }))
-                    .child(div().flex().flex_wrap().gap_2().children(presets))
-                    .child(
-                        Button::new("codec-menu").label(if state.show_codecs { "Video settings ▴" } else { "Video settings ▾" }).outline().small().on_click(cx.listener(|this, _, _, cx| {
-                                if let Ok(mut state) = this.state.lock() {
-                                    state.show_codecs = !state.show_codecs;
-                                }
-                                cx.notify();
-                            })),
+                    .when(
+                        active_screen
+                            .as_ref()
+                            .is_some_and(|s| !s.terminal && !s.removing),
+                        |panel| {
+                            panel.child(
+                                Button::new("show-display")
+                                    .label("Show display window")
+                                    .outline()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let result = this
+                                            .state
+                                            .lock()
+                                            .ok()
+                                            .and_then(|state| {
+                                                state
+                                                    .screens
+                                                    .iter()
+                                                    .find(|screen| {
+                                                        Some(screen.config.screen_id)
+                                                            == state.navigation.selected
+                                                    })
+                                                    .map(|screen| screen.video_window.clone())
+                                            })
+                                            .map(|window| window.show());
+                                        if let Some(Err(error)) = result {
+                                            message(
+                                                &this.state,
+                                                format!("Cannot show display: {error:#}"),
+                                            );
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        },
                     )
-                    .child(codec_panel)
-                    .child(stats_panel)
-)
-                    .child(format!("Received {} · host sent {} · host drops {} · decoded {} · skipped {} · {} · {:.1} MB · {} kbps{}", active_screen.as_ref().map(|screen| screen.received_frames).unwrap_or(state.received_frames), active_screen.as_ref().map(|screen| screen.host_frames_sent).unwrap_or_default(), active_screen.as_ref().map(|screen| screen.host_frames_dropped).unwrap_or_default(), decoded, skipped, if decoder.is_empty() { "decoder initializing" } else { decoder.as_str() }, active_screen.as_ref().map(|screen| screen.bytes).unwrap_or(state.bytes) as f64 / 1_000_000.0, active_screen.as_ref().map(|screen| screen.bitrate_kbps).unwrap_or_default(),
-                        frame_error.map(|e| format!(" · {e}")).unwrap_or_default()))
+                    .when(
+                        active_screen.as_ref().is_some_and(|s| !s.removing),
+                        |panel| {
+                            panel
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if state.connected {
+                                            "PRESETS · selected stream"
+                                        } else {
+                                            "PRESETS · next connection"
+                                        }),
+                                )
+                                .child(div().flex().flex_wrap().gap_2().children(presets))
+                                .child(
+                                    Button::new("codec-menu")
+                                        .label(if state.show_codecs {
+                                            "Video settings ▴"
+                                        } else {
+                                            "Video settings ▾"
+                                        })
+                                        .outline()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Ok(mut state) = this.state.lock() {
+                                                state.show_codecs = !state.show_codecs;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(codec_panel)
+                                .child(stats_panel)
+                        },
+                    )
+                    .when_some(frame_error, |panel, error| {
+                        panel.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                    })
             } else if page == ControlsPage::Connect {
                 div()
                     .id("viewer-next-connection-settings")
@@ -1303,7 +1268,7 @@ mod app {
 )
                     .child(div().flex().flex_wrap().gap_2().px_3().py_2()
                        .child(Button::new("workspace-back").label("← Screens").primary().small().on_click(cx.listener(|this,_,_,cx|{
-                          if let Ok(mut state)=this.state.lock(){state.show_codecs=false;state.show_logs=false;for screen in &mut state.screens{if screen.stats_view.open{screen.stats_view.open=false;let _=this.commands.try_send(Command::Diagnostics(screen.config.screen_id,false));}}}
+                          if let Ok(mut state)=this.state.lock(){state.show_codecs=false;state.show_logs=false;}
                           if let Ok(mut ws)=this.workspace.lock(){ws.selected=None;}cx.notify();})))
                        .child(Button::new("workspace-remove").label("Remove local screen").danger().small().on_click(cx.listener(|this,_,_,cx|{let id=this.workspace.lock().ok().and_then(|ws|ws.selected);if let Some(id)=id{remove_local_screen(&this.workspace,id);}cx.notify();}))))
                     .when(state.connected || state.connecting, |panel| panel.child(

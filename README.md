@@ -10,7 +10,7 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust, a C/C++ toolchain for OpenH264, the GPUI Wayland/X11 development libraries, and a Vulkan loader with a working GPU driver. The linker needs the development versions of `libxkbcommon` and `libxkbcommon-x11`. The decoder no longer builds `moq-vaapi` or its bindgen/Clang bindings.
+The Linux viewer needs Rust 1.95.0 or newer, a C/C++ toolchain for OpenH264, the GPUI Wayland/X11 development libraries, and a Vulkan loader with a working GPU driver. The linker needs the development versions of `libxkbcommon` and `libxkbcommon-x11`. The decoder no longer builds `moq-vaapi` or its bindgen/Clang bindings.
 
 ```sh
 # Fedora
@@ -46,7 +46,7 @@ The host and viewer use GPUI Kit controls with themed Buttons, editable Form/Inp
 
 Closing a native video window detaches that viewer from its host screen. The host screen and its other viewers remain independent. Removing a screen on the host closes its viewer window. A video lane failure closes its display and keeps its control row available for retry or removal. The primary screen can be removed too; an empty screen list remains connected and can add screens again. Closing the controls widget quits the app and tears down the whole session. Widgets can be dragged by the header, resized at the edges, and minimized. **Show display window** brings an existing live window to the front. Both widgets have expandable **Logs** sections; messages also go to the terminal and the displayed log file.
 
-The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
+The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The statistics inspector reports the skipped-frame count so an overloaded viewer is visible.
 
 ## Wire protocol v6
 
@@ -88,11 +88,22 @@ The vendored `gpu-video` adapter submits decoding asynchronously and polls timel
 
 The host's TLS certificate and private key are kept under the local `airbridge` configuration directory. The private key is mode `0600` on Unix. PIN authentication uses SPAKE2 and confirms the result against the QUIC TLS exporter before starting the media stream.
 
+## Rust toolchain
+
+`rust-toolchain.toml` pins Rust 1.95.0 and Cargo declares Rust 1.95 as the minimum. GPUI pre 0.3.8 uses `std::hint::cold_path`, stabilized in Rust 1.95; older stable compilers report E0658. With rustup, install the pinned toolchain before building:
+
+```sh
+rustup toolchain install 1.95.0 --profile minimal
+cargo run -p bridge-viewer --release
+```
+
+Run Cargo inside this repository so its toolchain file is applied. No nightly compiler or unstable-feature override is required.
+
 ## Temporary stream diagnostics
 
-In stream details, open **Stats** below Video settings. Opening requests a new instrumented stream generation; closing returns to the normal compiled path unless the other peer still has Stats open. Return to the list also closes the local subscription. Both apps must be rebuilt for protocol v6. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
+In stream details, click **Open statistics** below Video settings. Opening the inspector requests a new instrumented stream generation; closing it returns to the normal compiled path unless another peer still has its inspector open. Widget navigation leaves open inspectors and their subscriptions active. Both apps must be rebuilt for protocol v6. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
 
-**Open statistics inspector** opens a separate resizable Kit DataTable window. The identity column stays pinned while scrolling; columns can be resized. Frame rows and stage averages share Freeze/Resume and Capture next 20 with the screen widget. **GPU / display stages** filters the table for decoding, queues, uploads, swapchain acquisition, GPU work and presentation. **Start after capture (avg)** is a cumulative offset; **Stage duration (avg)** is time within the stage. Do not add the start offsets. Closing the inspector leaves the screen's Stats toggle in its current state; close Stats in the widget to release its diagnostics subscription. Removing/disconnecting a source clears the inspector's data and disables its stream actions.
+**Open statistics** in the screen controls opens a separate resizable Kit DataTable inspector and enables temporary instrumentation. Statistics and timing controls appear only in this window. The identity column stays pinned while scrolling; columns can be resized. **GPU / display stages** filters the table for decoding, queues, uploads, swapchain acquisition, GPU work and presentation. **Start after capture (avg)** is a cumulative offset; **Stage duration (avg)** is time within the stage. Do not add the start offsets. Closing the inspector releases this screen's diagnostics subscription; instrumentation remains active if another peer is still subscribed. Removing/disconnecting a source clears the inspector's data and disables its stream actions.
 
 Stats retain 60 one-second samples with compact bitrate/FPS/RTT history charts. RTT jitter is the change between successive RTT samples, not RTP interarrival jitter; QUIC loss/congestion counters are connection-wide. Audio fields are reserved and unavailable. **Frame rows** retain at most 20 sampled frames (about one per second); **Stage averages** update fixed-size incremental accumulators without using the frame history. Freeze/Resume holds a readable snapshot, and Capture next 20 requests consecutive capture callbacks, then freezes after the observed stages conclude. In overloaded diagnostics queues, observations may be discarded and the loss counter increases; video never waits for diagnostics delivery.
 

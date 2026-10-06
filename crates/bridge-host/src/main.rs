@@ -98,9 +98,6 @@ mod app {
         session_commands: Option<mpsc::Sender<HostUiCommand>>,
         presets: Vec<Preset>,
         selected: usize,
-        frames: u64,
-        dropped: u64,
-        bytes: u64,
         audio_notice: Option<String>,
         show_codecs: bool,
         show_logs: bool,
@@ -202,20 +199,6 @@ mod app {
             stats_view: StatsView::default(),
             viewer_stats: false,
         });
-        let ids = state
-            .screens
-            .iter_mut()
-            .filter(|s| s.stats_view.open)
-            .map(|s| {
-                s.stats_view.open = false;
-                s.screen_id
-            })
-            .collect::<Vec<_>>();
-        if let Some(commands) = &state.session_commands {
-            for id in ids {
-                let _ = commands.try_send(HostUiCommand::Diagnostics(id, false));
-            }
-        }
         state.navigation.open(screen_id);
         state.show_codecs = false;
         state.show_logs = false;
@@ -349,6 +332,27 @@ mod app {
     }
     impl HostView {
         fn inspect_stats(&mut self, id: ScreenId, cx: &mut Context<Self>) {
+            if let Ok(mut state) = self.state.lock() {
+                let Some(index) = state.screens.iter().position(|s| s.screen_id == id) else {
+                    return;
+                };
+                if !state.screens[index].stats_view.open {
+                    if let Some(Err(error)) = state
+                        .session_commands
+                        .as_ref()
+                        .map(|commands| commands.try_send(HostUiCommand::Diagnostics(id, true)))
+                    {
+                        state.message = format!("Could not enable statistics: {error}");
+                        state.diagnostics.record("stats", &state.message);
+                        cx.notify();
+                        return;
+                    }
+                    state.screens[index].stats_view.reset();
+                    state.screens[index].stats_view.open = true;
+                }
+            } else {
+                return;
+            }
             let shared = self.state.clone();
             let read = shared.clone();
 
@@ -387,6 +391,10 @@ mod app {
                             }
                             let telemetry = stats_telemetry(screen);
                             match action {
+                                bridge_ui::InspectionAction::Close => {
+                                    screen.stats_view.open = false;
+                                    screen.stats_view.reset();
+                                }
                                 bridge_ui::InspectionAction::Frames => {
                                     screen.stats_view.mode = TimingView::Frames
                                 }
@@ -414,6 +422,16 @@ mod app {
                         } else {
                             return;
                         }
+                        if matches!(action, bridge_ui::InspectionAction::Close) {
+                            if let Some(Err(error)) =
+                                state.session_commands.as_ref().map(|commands| {
+                                    commands.try_send(HostUiCommand::Diagnostics(id, false))
+                                })
+                            {
+                                state.message = format!("Could not disable statistics: {error}");
+                                state.diagnostics.record("stats", &state.message);
+                            }
+                        }
                         if matches!(action, bridge_ui::InspectionAction::Burst) {
                             let _ = state
                                 .session_commands
@@ -423,7 +441,9 @@ mod app {
                     }
                 },
             );
-            if let Err(error) = bridge_ui::open_inspector(format!("host:{id}"), source, cx) {
+            if let Err(error) = bridge_ui::open_inspector(format!("host:{id}"), source.clone(), cx)
+            {
+                source.close();
                 set_message(
                     &self.state,
                     format!("Cannot open statistics inspector: {error:#}"),
@@ -719,183 +739,13 @@ mod app {
             };
             let stats_panel = if let Some(screen) = &selected_screen {
                 let id = screen.screen_id;
-                let mut panel = div()
-                    .id("host-stats-panel")
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        Button::new("host-stats-toggle")
-                            .label(if screen.stats_view.open {
-                                "Stats ▴ · instrumented stream"
-                            } else {
-                                "Stats ▾"
-                            })
-                            .outline()
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Ok(mut state) = this.state.lock() {
-                                    if let Some(s) =
-                                        state.screens.iter_mut().find(|s| s.screen_id == id)
-                                    {
-                                        let enabled = !s.stats_view.open;
-                                        s.stats_view.open = enabled;
-                                        s.stats_view.frozen = None;
-                                        if let Some(commands) = &state.session_commands {
-                                            let _ = commands
-                                                .try_send(HostUiCommand::Diagnostics(id, enabled));
-                                        }
-                                    }
-                                }
-                                cx.notify();
-                            })),
-                    );
-                if screen.stats_view.open {
-                    panel = panel
-                        .child(
-                            Button::new("host-inspect-stats")
-                                .label("Open statistics inspector")
-                                .primary()
-                                .small()
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(bridge_ui::TIMING_HELP),
-                        )
-                        .child(format!(
-                            "Stats target: {}",
-                            screen
-                                .viewers
-                                .iter()
-                                .find(|p| Some(p.id) == screen.stats_peer)
-                                .map(|p| p.name.clone())
-                                .unwrap_or_else(|| "Shared source (select a viewer below)".into())
-                        ))
-                        .child("Temporary diagnostics · opening/closing restarts this stream")
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("host-timing-frames")
-                                        .label("Frame rows")
-                                        .outline()
-                                        .small()
-                                        .selected(screen.stats_view.mode == TimingView::Frames)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.screen_id == id)
-                                                {
-                                                    s.stats_view.mode = TimingView::Frames;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("host-timing-averages")
-                                        .label("Stage averages")
-                                        .outline()
-                                        .small()
-                                        .selected(screen.stats_view.mode == TimingView::Averages)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.screen_id == id)
-                                                {
-                                                    s.stats_view.mode = TimingView::Averages;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("host-timing-freeze")
-                                        .label(if screen.stats_view.frozen.is_some() {
-                                            "Resume"
-                                        } else {
-                                            "Freeze"
-                                        })
-                                        .outline()
-                                        .small()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.screen_id == id)
-                                                {
-                                                    s.stats_view.frozen =
-                                                        if s.stats_view.frozen.is_some() {
-                                                            None
-                                                        } else {
-                                                            Some(stats_telemetry(s).snapshot())
-                                                        };
-                                                    s.stats_view.freeze_after = None;
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("host-timing-burst")
-                                        .label("Capture next 20")
-                                        .outline()
-                                        .small()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Ok(mut state) = this.state.lock() {
-                                                if let Some(s) = state
-                                                    .screens
-                                                    .iter_mut()
-                                                    .find(|s| s.screen_id == id)
-                                                {
-                                                    s.stats_view.frozen = None;
-                                                    s.stats_view.freeze_after = Some(
-                                                        stats_telemetry(s).snapshot().averages
-                                                            [Stage::Capture as usize]
-                                                            .count
-                                                            + 20,
-                                                    );
-                                                }
-                                                if let Some(commands) = &state.session_commands {
-                                                    let _ =
-                                                        commands.try_send(HostUiCommand::Burst(id));
-                                                }
-                                            }
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .children(
-                            screen
-                                .stats_view
-                                .lines(&stats_telemetry(screen))
-                                .into_iter()
-                                .map(|line| div().text_sm().child(line)),
-                        )
-                        .child(
-                            div()
-                                .id("host-timing-table")
-                                .min_w_0()
-                                .h(gpui_kit::rems(14.))
-                                .overflow_scroll()
-                                .child(bridge_ui::timing_preview(
-                                    screen.stats_view.table(&stats_telemetry(screen)),
-                                )),
-                        );
-                }
-                panel
+                div().id("host-stats-panel").child(
+                    Button::new("host-inspect-stats")
+                        .label("Open statistics")
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx))),
+                )
             } else {
                 div().id("host-stats-none")
             };
@@ -960,20 +810,6 @@ mod app {
                 .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
-                        let ids = state
-                            .screens
-                            .iter_mut()
-                            .filter(|s| s.stats_view.open)
-                            .map(|s| {
-                                s.stats_view.open = false;
-                                s.screen_id
-                            })
-                            .collect::<Vec<_>>();
-                        if let Some(commands) = &state.session_commands {
-                            for id in ids {
-                                let _ = commands.try_send(HostUiCommand::Diagnostics(id, false));
-                            }
-                        }
                         state.navigation.back();
                         state.show_codecs = false;
                         state.show_logs = false;
@@ -1131,22 +967,6 @@ mod app {
                             .bg(cx.theme().secondary)
                             .child(format!("Status: {}", state.message)),
                     )
-                    .child(format!(
-                        "Sent {} frames · {} capture drops · {:.1} MB",
-                        selected_screen
-                            .as_ref()
-                            .map(|screen| screen.frames)
-                            .unwrap_or(state.frames),
-                        selected_screen
-                            .as_ref()
-                            .map(|screen| screen.dropped)
-                            .unwrap_or(state.dropped),
-                        selected_screen
-                            .as_ref()
-                            .map(|screen| screen.bytes)
-                            .unwrap_or(state.bytes) as f64
-                            / 1_000_000.0
-                    ))
             } else {
                 div().id("host-screen-details-hidden")
             };
@@ -1248,9 +1068,6 @@ mod app {
             session_commands: None,
             presets,
             selected: 1,
-            frames: 0,
-            dropped: 0,
-            bytes: 0,
             audio_notice: None,
             show_codecs: false,
             show_logs: false,
@@ -1356,6 +1173,61 @@ mod app {
     mod tests {
         use super::*;
 
+        #[gpui_kit::test]
+        fn statistics_live_only_in_inspector_and_close_releases_subscription(
+            cx: &mut gpui_kit::TestAppContext,
+        ) {
+            use gpui_kit::test::TestWindowExt;
+            let (commands, mut requests) = mpsc::channel(16);
+            let mut initial = initial_state(built_in_presets(), "123456".into());
+            initial.navigation.open(1);
+            initial.session_commands = Some(commands);
+            let state = Arc::new(Mutex::new(initial));
+            cx.update(gpui_kit::init);
+            let (controls, _) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                    cx.new(|_| HostView {
+                        state: state.clone(),
+                    })
+                })
+                .unwrap()
+            });
+            controls
+                .update(cx, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.click("host-inspect-stats", cx);
+                    window.click("host-inspect-stats", cx);
+                    assert!(window.try_find("host-timing-table").is_none());
+                    assert!(window.try_find("host-timing-frames").is_none());
+                    window.click("host-screen-view-toggle-details", cx);
+                })
+                .unwrap();
+            assert!(state.lock().unwrap().screens[0].stats_view.open);
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(HostUiCommand::Diagnostics(1, true))
+            ));
+            assert!(
+                requests.try_recv().is_err(),
+                "refocusing does not restart diagnostics again"
+            );
+            cx.update(|cx| {
+                let inspector = cx
+                    .windows()
+                    .into_iter()
+                    .find(|handle| handle.window_id() != controls.window_id())
+                    .unwrap();
+                inspector
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+            });
+            assert!(!state.lock().unwrap().screens[0].stats_view.open);
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(HostUiCommand::Diagnostics(1, false))
+            ));
+            assert!(requests.try_recv().is_err());
+        }
         #[gpui_kit::test]
         fn kit_buttons_switch_list_details_and_screen_ownership(cx: &mut gpui_kit::TestAppContext) {
             use gpui_kit::test::TestWindowExt;
