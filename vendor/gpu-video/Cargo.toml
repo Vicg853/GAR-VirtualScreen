@@ -85,6 +85,9 @@ default-features = false
 features = ["std", "vulkan", "wgsl"]
 optional = true
 
+[dev-dependencies.openh264]
+version = "0.9.8"
+
 [dev-dependencies.clap]
 version = "4.5.20"
 features = ["derive"]

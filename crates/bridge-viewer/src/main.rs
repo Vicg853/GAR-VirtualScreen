@@ -1844,7 +1844,6 @@ mod app {
                 s.config.screen_id == id && s.config.generation == generation && !s.removing
             })?;
             if screen.terminal {
-                screen.diagnostics.record("lifecycle", &detail);
                 if screen.status != "Video lane closed" || detail == "Video lane closed" {
                     return None;
                 }
@@ -2260,11 +2259,11 @@ mod app {
             ),
         );
         let (lane_events, mut lane_notices) = mpsc::channel(64);
-        let mut lane_task = tokio::spawn(receive_lanes(
+        let mut lane_task = Some(tokio::spawn(receive_lanes(
             connection.clone(),
             shared.clone(),
             lane_events,
-        ));
+        )));
         let stats_state = shared.clone();
         let diagnostic_send = tokio::spawn(bridge_core::telemetry_transport::send_batches(
             connection.clone(),
@@ -2361,7 +2360,9 @@ mod app {
                             Some(Command::Connect(_, _, _)) => message(&shared, "Already connected"),
                         }
                     }
-                    lane = &mut lane_task => {
+                    lane = async { lane_task.as_mut().expect("Media task owned until completion").await } => {
+                        // The output has been consumed: cleanup must not poll it again.
+                        lane_task.take();
                         match lane {
                             Ok(()) => bail!("The media connection closed"),
                             Err(error) => bail!("Media lane manager stopped: {error}"),
@@ -2471,8 +2472,7 @@ mod app {
         let _ = diagnostic_send.await;
         control_task.abort();
         let _ = control_task.await;
-        lane_task.abort();
-        let _ = lane_task.await;
+        stop_lane_manager(lane_task).await;
         connection.close(0u32.into(), b"viewer disconnected");
         clear_client_session(&shared);
         if session_result.is_ok() {
@@ -2480,6 +2480,13 @@ mod app {
             message(&shared, cause.unwrap_or_else(|| "Disconnected".into()));
         }
         session_result
+    }
+
+    async fn stop_lane_manager(task: Option<tokio::task::JoinHandle<()>>) {
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     fn update_client_screen_status(
@@ -2734,6 +2741,39 @@ mod app {
             assert_eq!(state.screens[0].status, "Capture failed");
         }
         #[tokio::test]
+        async fn completed_media_task_is_not_polled_again_during_cleanup() {
+            let mut task = Some(tokio::spawn(async {}));
+            tokio::select! {
+                result = async { task.as_mut().unwrap().await } => {
+                    assert!(result.is_ok());
+                    task.take();
+                }
+            }
+            stop_lane_manager(task).await;
+        }
+
+        #[tokio::test]
+        async fn panicked_media_task_is_not_polled_again_during_cleanup() {
+            let mut task = Some(tokio::spawn(async {
+                panic!("fixture media task failure");
+            }));
+            assert!(task.as_mut().unwrap().await.unwrap_err().is_panic());
+            task.take();
+            stop_lane_manager(task).await;
+        }
+
+        #[tokio::test]
+        async fn active_media_task_is_cancelled_and_joined_during_cleanup() {
+            let (ready, began) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = ready.send(());
+                std::future::pending::<()>().await;
+            });
+            began.await.unwrap();
+            stop_lane_manager(Some(task)).await;
+        }
+
+        #[tokio::test]
         async fn media_panic_is_scoped_and_unregisters_the_lane() {
             let key = (2, 7, MediaLane::Video);
             let active = Arc::new(Mutex::new(HashSet::from([key])));
@@ -2775,7 +2815,11 @@ mod app {
             shared.lock().unwrap().screens.push(screen(1, 3));
             end_client_lane(&shared, 1, 3, "Video lane closed".into());
             end_client_lane(&shared, 1, 3, "Capture failed: permission denied".into());
+            let diagnostics = shared.lock().unwrap().screens[0].diagnostics.clone();
+            let count = diagnostics.recent().len();
+            end_client_lane(&shared, 1, 3, "Capture failed: permission denied".into());
             end_client_lane(&shared, 1, 3, "Video lane closed".into());
+            assert_eq!(diagnostics.recent().len(), count);
             assert_eq!(
                 shared.lock().unwrap().screens[0].status,
                 "Capture failed: permission denied"

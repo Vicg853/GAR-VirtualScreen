@@ -59,9 +59,9 @@ Date: 2026-10-05. Scope: the Vulkan presentation implementation and direct softw
 
 ## Checks performed
 
-- `cargo test --workspace`: 52 tests passed (core 22, host 5, display operations 4, viewer 21).
-- Supplemental actual-source native check: 22 tests and one compile-fail doctest passed. Tests use actual OpenH264 with NOOP graphics, validate WGSL, bounded metadata/output, PTS parity, decoder reset cycles, barriers, and child clean/crash/hang lifecycle. No window is opened.
-- Vendored no-reordering sorter test: passed for 1,000 completed pictures, even with SPS reorder capacity of 16.
+- `cargo test --workspace`: 55 tests passed (core 22, host 5, display operations 4, viewer 24).
+- Supplemental actual-source native check: 23 tests and one compile-fail doctest passed. Tests use actual OpenH264 with NOOP graphics, validate WGSL, bounded metadata/output, PTS parity, decoder reset cycles, barriers, and child clean/crash/hang lifecycle. No window is opened.
+- Vendored decoder tests: four passed, including no-reordering release for 1,000 completed pictures and real H.264 decode/reference-release admission at the four-picture limit.
 - macOS workspace release build and host `.app` packaging succeeded; `codesign --verify --deep --strict` passed. The bundle is not launched.
 - Linux `cargo check --target x86_64-unknown-linux-gnu`: blocked at native dependencies because `x86_64-linux-gnu-gcc` is absent. A Rust target alone does not supply the C toolchain/sysroot.
 - No VM, container, UI launch, or visual checking was used.
@@ -71,3 +71,14 @@ Date: 2026-10-05. Scope: the Vulkan presentation implementation and direct softw
 The complete plan is **not** certified complete. NVDEC/VAAPI engines remain unimplemented. Actual Linux linking, Vulkan validation layers/driver stress, Wayland/X11 presentation, sustained resource measurements, color/crop appearance, multi-screen behavior under load and an affected-viewer latency capture remain unverified. Unsupported hardware currently uses explicit software fallback; older NVIDIA cards are not promised a GPU-resident hardware engine.
 
 Rebuild both peers for protocol v6. Run once with auto selection, optionally compare `AIRBRIDGE_DECODER=software` and supported forced Vulkan, and collect instrumented frame rows/stage averages to confirm where remaining frame age occurs. No claim that the original two-second symptom is fixed is justified before that run.
+
+
+## Viewer admission and shutdown correction
+
+The affected runtime reported `GPU decode admission capacity exceeded`, followed by `JoinHandle polled after completion`. Source investigation found:
+
+- Capacity was checked before every native decoder instruction. A picture using the fourth slot was followed by reference-release instructions, which incorrectly triggered the capacity failure. Admission now preflights only Decode/IDR instructions for the complete batch; metadata and reference release consume no output slots. The four-picture bound is unchanged.
+- The session consumed its media manager JoinHandle in `select!`, then awaited that completed handle again during cleanup. The handle is now owned as an Option, taken after its result is consumed, and only an unconsumed task is aborted/awaited during cleanup.
+- Native child errors now send the original engine reason before cleanup. Successful cleanup sends Stopped and exits normally even when the stream failed; actual cleanup failures/crashes still take the abnormal supervisor path. Parent packet admission stops on closed worker status. Duplicate terminal lane notices do not add duplicate lifecycle logs or overwrite a specific failure with a generic closure.
+
+Regression coverage includes real OpenH264-generated picture instructions ending with reference release, full-capacity metadata admission, atomic picture limits, completed/panicked/active media task cleanup, clean native-worker failure acknowledgement, and failure preservation after media FIN. Linux physical-GPU confirmation remains required; tests open no windows.

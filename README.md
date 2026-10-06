@@ -10,17 +10,15 @@ The macOS host needs Rust, Xcode, and the Xcode Metal Toolchain. The first launc
 cargo run -p bridge-host --release
 ```
 
-The Linux viewer needs Rust and the development libraries required by GPUI for Wayland and X11. The linker needs `libxkbcommon.so` and `libxkbcommon-x11.so` (the development packages, not just the runtime libraries). VA-API bindings are generated with bindgen, which needs both `libclang` and Clang's builtin resource headers (including `stddef.h`). Install matching Clang packages on the **Linux viewer machine**:
+The Linux viewer needs Rust, a C/C++ toolchain for OpenH264, the GPUI Wayland/X11 development libraries, and a Vulkan loader with a working GPU driver. The linker needs the development versions of `libxkbcommon` and `libxkbcommon-x11`. The decoder no longer builds `moq-vaapi` or its bindgen/Clang bindings.
 
 ```sh
 # Fedora
-sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel clang clang-devel clang-resource-filesystem
+sudo dnf install gcc gcc-c++ libxkbcommon-devel libxkbcommon-x11-devel vulkan-loader-devel
 
 # Ubuntu / Debian
-sudo apt install libxkbcommon-dev libxkbcommon-x11-dev clang libclang-dev
+sudo apt install build-essential libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev
 ```
-
-If `LIBCLANG_PATH` is set to a custom LLVM installation, unset it or point it at the same LLVM version that provides the Clang resource headers. Check that Clang can locate its builtin headers with `clang -print-resource-dir` and that the printed directory contains `include/stddef.h`.
 
 Then run:
 
@@ -30,7 +28,7 @@ cargo run -p bridge-viewer --release
 
 Start the Mac host, then start the viewer. On the host, add/select a screen and open its details to see its PIN. On the viewer, add a local screen, select the discovered host screen inside its details, enter that screen's PIN, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
 
-The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 5. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
+The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 6. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
 
 The host's video-only path uses CoreGraphics display streams, so it does not construct a ScreenCaptureKit stream. ScreenCaptureKit initialized a CoreAudio clock even with audio capture disabled and stalled for about 150 seconds on one Mac. The CoreGraphics display-stream API is marked obsolete by the macOS 15+ SDK and may be removed in a future macOS release; the host reports a visible error if this API is unavailable.
 
@@ -50,7 +48,7 @@ Closing a native video window removes that screen on the host. Removing a screen
 
 The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The widget reports the skipped-frame count so an overloaded viewer is visible.
 
-## Wire protocol v5
+## Wire protocol v6
 
 Each viewer-local screen opens an independent QUIC session to exactly one existing host screen. Before PIN proof, a bounded version/target selector chooses the screen. SPAKE2 identities bind the selected screen and protocol version, and proof confirmation binds the TLS exporter. The host replies with its runtime host identity, subscriber identity, and complete screen configuration. Screen creation/removal belongs to the host widget. Request IDs, settings revisions and capture generations scope later messages.
 
@@ -70,14 +68,19 @@ Each Linux screen uses a supervised native child mode of the viewer executable. 
 
 The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer requests a shared source change for that host screen, affecting its active subscribers. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect immediately on the selected screen after its media pipeline restarts. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
 
-The current session sends video packets with sequence numbers and timestamps; the protocol retains an audio packet type for later use. The host currently sends H.264. On Linux, the viewer probes hardware decoders in this order: NVIDIA NVDEC, VA-API (commonly Intel and AMD), then V4L2 (embedded SoCs). If none can open the stream, it uses OpenH264 software decoding. Hardware decoding and display rendering are separate choices: Vulkan DMA-BUF import can keep supported VA-API frames on the GPU, while unsupported imports and NVDEC CUDA frames currently use the decoder's CPU readback path before GPU presentation.
+The host currently sends progressive 8-bit 4:2:0 H.264 without B-frame reordering. Each video lane declares this contract, and the viewer carries the source PTS through its private worker IPC in both normal and instrumented modes. Inline SPS/PPS supply crop and SDR color metadata.
+
+At screen startup, the native worker selects a compiled `StreamEngine<H264, API, INSTRUMENTED>` once. It first attempts native Vulkan Video decoding on the presentation device. If initialization fails, it reports the reason and selects direct OpenH264 software decoding with Vulkan presentation. Set `AIRBRIDGE_DECODER=software` to force software, or `AIRBRIDGE_DECODER=vulkan` to require native Vulkan Video and report an error instead of falling back. No decoded-image CPU readback is used by the hardware engine. Software uploads borrowed decoder Y/U/V planes directly into reusable textures once; a fragment shader converts them into the swapchain.
+
+The vendored `gpu-video` adapter submits decoding asynchronously and polls timeline completion. Its compressed input ring holds at most four submissions, independent output images are retained by leases, and the latest completed candidate replaces older unpresented output. Rendering permits at most two submissions in flight. Native video allocations are capped at 256 MiB per screen; software plane storage is capped at 128 MiB and eight leased/cached pictures. Swapchains, driver-private memory and other application allocations are outside these accounting values. The eight-screen application limit bounds the sum of per-screen pools; there is no dynamically shared memory budget across child processes.
 
 ## Current limits
 
 - The virtual display uses macOS's private `CGVirtualDisplay` API. It can change between macOS releases and does not suit Mac App Store distribution.
 - Up to eight host screens and eight viewers per host screen. Each viewer-local entry connects to one host screen.
-- Linux H.264 decode uses NVDEC, VA-API, or V4L2 when available, with OpenH264 software fallback. AV1 is not yet negotiated by the host/viewer stream, even though NVDEC support exists in the backend dependency.
-- Linux VA-API DMA-BUF frames can be imported into Vulkan for GPU rendering when the decoder and presentation GPU/driver support sharing the exported surface. NVIDIA NVDEC is hardware accelerated, but its CUDA output currently requires a CPU readback before wgpu presentation.
+- Native Vulkan H.264 decoding requires suitable profile/format support and independent native/graphics queue handles. Unsupported devices use software decoding. This does not guarantee Vulkan Video support on a GTX 1060 or every Intel/AMD driver.
+- NVDEC/CUDA, VAAPI/DMA-BUF and V4L2 hardware engines are not part of this implementation. Their former generic readback paths have been removed. AV1 and non-Vulkan presentation are future work.
+- SDR BT.709/BT.601 matrix/range and cropped progressive 4:2:0 are handled; HDR/BT.2020 and interlaced or higher-bit-depth streams are rejected.
 - Each screen/lane currently uses an ordered QUIC stream. Packet loss can delay later frames within that lane, while other lanes continue independently. QUIC datagrams or frame-level retransmission policy are future latency improvements.
 - The common codec ranking still describes future negotiation preference; this session currently streams H.264 only.
 - The VSync setting is stored with presets; explicit display presentation control is not wired to it yet.
@@ -87,7 +90,7 @@ The host's TLS certificate and private key are kept under the local `airbridge` 
 
 ## Temporary stream diagnostics
 
-In stream details, open **Stats** below Video settings. Opening requests a new instrumented stream generation; closing returns to the normal compiled path unless the other peer still has Stats open. Return to the list also closes the local subscription. Both apps must be rebuilt for protocol v5. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
+In stream details, open **Stats** below Video settings. Opening requests a new instrumented stream generation; closing returns to the normal compiled path unless the other peer still has Stats open. Return to the list also closes the local subscription. Both apps must be rebuilt for protocol v6. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
 
 Stats retain 60 one-second samples with compact bitrate/FPS/RTT history charts. RTT jitter is the change between successive RTT samples, not RTP interarrival jitter; QUIC loss/congestion counters are connection-wide. Audio fields are reserved and unavailable. **Frame rows** retain at most 20 sampled frames (about one per second); **Stage averages** update fixed-size incremental accumulators without using the frame history. Freeze/Resume holds a readable snapshot, and Capture next 20 requests consecutive capture callbacks, then freezes after the observed stages conclude. In overloaded diagnostics queues, observations may be discarded and the loss counter increases; video never waits for diagnostics delivery.
 
@@ -102,4 +105,10 @@ Screen Recording preflight gates capture and display preparation. Use the explic
 
 The native callback queue and callback context remain owned until stop is confirmed and the callback queue drains. Unconfirmed cleanup retains the entire producer/display and blocks new capture/display work until host restart. A stuck in-process macOS operation is not forcibly freed; the screen records the retained-resource failure. The Linux supervisor has a stronger isolation boundary because its native resources live in a child process.
 
-The audited implementation plan and lifecycle/UI map are in [screen-ownership-and-lifecycle-plan.md](docs/screen-ownership-and-lifecycle-plan.md). Both apps must be rebuilt for protocol v5.
+The audited implementation plan and lifecycle/UI map are in [screen-ownership-and-lifecycle-plan.md](docs/screen-ownership-and-lifecycle-plan.md). Both apps must be rebuilt for protocol v6.
+
+## GPU engine implementation and nonvisual checks
+
+See [gpu-stream-engine-plan.md](docs/gpu-stream-engine-plan.md) and [gpu-stream-engine-implementation.md](docs/gpu-stream-engine-implementation.md) for the phase audit, resource contracts and remaining hardware validation. [The supplemental test tool](tools/native-video-check/README.md) compiles the actual native worker, engine and lifecycle source on macOS without opening windows. Its OpenH264 fixtures use a NOOP graphics backend; this checks CPU decoding, ownership, reset behavior and shader validity, not Vulkan execution or Linux presentation.
+
+GPU timing separates surface acquisition, CPU preparation, GPU render timestamp duration and completion callback observation. Unknown monitor presentation is unavailable. Stage averages include successful samples only; failures and unavailable observations retain their own counts. The observed frame age ends at compositor submission, not scanout. Actual GPU driver tests and an instrumented run on the affected Linux viewer are required to locate and confirm removal of the reported two-second delay.

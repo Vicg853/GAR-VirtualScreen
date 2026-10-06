@@ -505,6 +505,9 @@ fn supervise<const DEBUG: bool>(
     let mut config = (1280, 720);
     let mut generation = 0;
     while !stop.load(Ordering::Acquire) {
+        if target.lock().map(|s| s.closed).unwrap_or(true) {
+            break;
+        }
         if let Some(p) = process.as_mut() {
             match p.child.try_wait() {
                 Ok(Some(status)) => {
@@ -803,6 +806,20 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
         }
         Ok(())
     })();
+    // Report the original engine error before cleanup; a closed packet channel
+    // is a consequence, not the useful failure reason.
+    let stream_error = result.as_ref().err().map(|error| {
+        frame
+            .lock()
+            .ok()
+            .and_then(|s| s.error.clone())
+            .unwrap_or_else(|| format!("{error:#}"))
+    });
+    if let Some(message) = stream_error {
+        if let Ok(mut socket) = output.lock() {
+            let _ = worker::write(&mut *socket, &Message::Error(message), &[]);
+        }
+    }
     done.store(true, Ordering::Release);
     let _ = events.join();
     if let Some(window) = window {
@@ -810,15 +827,12 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
         drop(window);
     }
     crate::native_video::VideoWindow::shutdown_backend();
-    if let Err(error) = &result {
-        if let Ok(mut socket) = output.lock() {
-            let _ = worker::write(&mut *socket, &Message::Error(format!("{error:#}")), &[]);
-        }
-    }
     if let Ok(mut socket) = output.lock() {
         worker::write(&mut *socket, &Message::Stopped, &[])?;
     }
-    result
+    // Stopped acknowledges successful native cleanup. Stream failure was
+    // already sent separately; do not turn it into an abnormal process exit.
+    Ok(())
 }
 
 fn child_submit<const DEBUG: bool>(
@@ -898,6 +912,14 @@ mod tests {
                     thread::sleep(Duration::from_millis(50));
                 },
                 Message::Stop => {
+                    if mode == "stream-error" {
+                        worker::write(
+                            &mut socket,
+                            &Message::Error("fixture decoder failure".into()),
+                            &[],
+                        )
+                        .unwrap();
+                    }
                     worker::write(&mut socket, &Message::Stopped, &[]).unwrap();
                     break;
                 }
@@ -926,6 +948,12 @@ mod tests {
     #[test]
     fn clean_worker_acknowledges_and_is_reaped() {
         let mut p = fixture_process("normal").unwrap();
+        assert!(p.finish().is_ok());
+        assert!(p.child.try_wait().unwrap().is_some());
+    }
+    #[test]
+    fn decoder_failure_can_acknowledge_successful_native_cleanup() {
+        let mut p = fixture_process("stream-error").unwrap();
         assert!(p.finish().is_ok());
         assert!(p.child.try_wait().unwrap().is_some());
     }

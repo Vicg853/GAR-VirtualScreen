@@ -305,12 +305,11 @@ impl<'a> VulkanDecoder<'a> {
         &mut self,
         instructions: &[DecoderInstruction],
     ) -> Result<(), VulkanDecoderError> {
+        // Only picture instructions consume output slots. In particular, a
+        // trailing Drop must still release references after the fourth decode.
+        // Preflight the complete batch so rejection cannot partially submit it.
+        validate_admission(self.pending_outputs.len(), instructions)?;
         for instruction in instructions {
-            if self.pending_outputs.len() >= 4 {
-                return Err(VulkanDecoderError::InvalidInputData(
-                    "GPU decode admission capacity exceeded".into(),
-                ));
-            }
             if let Some(mut submission) = self.decode_impl::<MEASURE>(instruction)? {
                 let (texture, ready) = submission
                     .decoder
@@ -1250,5 +1249,86 @@ impl Drop for VulkanDecoder<'_> {
         // Native resource safety on normal close, device error and Rust unwinding.
         // Worker supervision is the outer timeout for an unresponsive driver.
         let _ = self.tracker.wait_for_all(u64::MAX);
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn validate_admission(
+    pending: usize,
+    instructions: &[DecoderInstruction],
+) -> Result<(), VulkanDecoderError> {
+    let pictures = instructions
+        .iter()
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                DecoderInstruction::Decode { .. } | DecoderInstruction::Idr { .. }
+            )
+        })
+        .count();
+    if !admission_fits(pending, pictures) {
+        return Err(VulkanDecoderError::InvalidInputData(
+            "GPU decode admission capacity exceeded".into(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(feature = "wgpu")]
+fn admission_fits(pending: usize, pictures: usize) -> bool {
+    pending
+        .checked_add(pictures)
+        .is_some_and(|total| total <= 4)
+}
+#[cfg(all(test, feature = "wgpu"))]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn reference_release_is_allowed_at_full_picture_capacity() {
+        let instructions = [DecoderInstruction::Drop {
+            reference_ids: vec![],
+        }];
+        assert!(validate_admission(4, &instructions).is_ok());
+    }
+    #[test]
+    fn real_h264_picture_and_trailing_reference_drop_fit_last_slot() {
+        use crate::parser::{
+            decoder_instructions::compile_to_decoder_instructions, h264::H264Parser,
+            reference_manager::ReferenceContext,
+        };
+        use openh264::{encoder::Encoder, formats::YUVBuffer};
+        let mut encoder = Encoder::new().unwrap();
+        let yuv = YUVBuffer::new(64, 64);
+        let mut parser = H264Parser::default();
+        let mut references = ReferenceContext::new(Default::default());
+        let mut observed_release = false;
+        for pts in 0..30 {
+            let bytes = encoder.encode(&yuv).unwrap().to_vec();
+            if bytes.is_empty() {
+                continue;
+            }
+            let mut units = parser.parse(&bytes, Some(pts)).unwrap();
+            units.extend(parser.flush().unwrap());
+            let instructions = compile_to_decoder_instructions(&mut references, units).unwrap();
+            assert!(validate_admission(3, &instructions).is_ok());
+            if let Some(index) = instructions
+                .iter()
+                .position(|i| matches!(i, DecoderInstruction::Decode { .. }))
+            {
+                observed_release |= instructions[index + 1..]
+                    .iter()
+                    .any(|i| matches!(i, DecoderInstruction::Drop { .. }));
+            }
+        }
+        assert!(
+            observed_release,
+            "Fixture must reproduce decode followed by reference release"
+        );
+    }
+    #[test]
+    fn picture_batch_is_admitted_atomically_at_the_limit() {
+        assert!(admission_fits(3, 1));
+        assert!(!admission_fits(3, 2));
+        assert!(!admission_fits(4, 1));
+        assert!(!admission_fits(usize::MAX, 1));
     }
 }
