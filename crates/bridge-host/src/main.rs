@@ -26,9 +26,13 @@ mod app {
         security::server_endpoint,
         telemetry::{Outcome, Stage, StatsView, StreamStats, Telemetry, TimingView, now_us},
     };
-    use gpui::{
-        App, Application, Bounds, Context, MouseButton, ResizeEdge, Window, WindowBounds,
-        WindowDecorations, WindowOptions, bounds, div, point, prelude::*, px, rgb, size,
+    use gpui_kit::component::{
+        ActiveTheme, Selectable, Sizable, TitleBar,
+        button::{Button, ButtonVariants},
+    };
+    use gpui_kit::{
+        App, Bounds, Context, MouseButton, ResizeEdge, Window, WindowBounds, WindowDecorations,
+        WindowOptions, bounds, div, point, prelude::*, px, size,
     };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -226,7 +230,7 @@ mod app {
         state: Arc<Mutex<State>>,
     }
 
-    fn resize_from_border(event: &gpui::MouseDownEvent, window: &mut Window) {
+    fn resize_from_border(event: &gpui_kit::MouseDownEvent, window: &mut Window) {
         let point = event.position;
         let size = window.window_bounds().get_bounds().size;
         let border = px(7.0);
@@ -257,14 +261,10 @@ mod app {
         action: fn(&mut State),
         cx: &mut Context<HostView>,
     ) -> impl IntoElement {
-        div()
-            .id(id)
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(rgb(0x35517a))
-            .cursor_pointer()
-            .child(label)
+        Button::new(id)
+            .label(label)
+            .primary()
+            .small()
             .on_click(cx.listener(move |_, _, _, cx| {
                 if let Ok(mut state) = shared.lock() {
                     if state.screens.iter().any(|screen| {
@@ -297,10 +297,11 @@ mod app {
             }))
     }
 
-    impl Render for HostView {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    impl HostView {
+        fn refresh(&mut self, cx: &mut Context<Self>) {
             if let Ok(mut state) = self.state.lock() {
                 for s in &mut state.screens {
+                    normalize_stats_target(s);
                     if s.stats_view.open {
                         let telemetry = s
                             .viewers
@@ -312,6 +313,127 @@ mod app {
                     }
                 }
             }
+            cx.notify();
+        }
+    }
+
+    fn normalize_stats_target(screen: &mut HostScreen) {
+        if screen
+            .stats_peer
+            .is_some_and(|id| !screen.viewers.iter().any(|peer| peer.id == id))
+        {
+            screen.stats_peer = None;
+            screen.stats_view.reset();
+        }
+    }
+
+    fn stats_telemetry(screen: &HostScreen) -> Arc<Telemetry> {
+        screen
+            .viewers
+            .iter()
+            .find(|peer| Some(peer.id) == screen.stats_peer)
+            .map(|peer| peer.telemetry.clone())
+            .unwrap_or_else(|| screen.telemetry.clone())
+    }
+    fn screen_name_for_inspection(screen: &HostScreen) -> String {
+        format!(
+            "{} · {}",
+            screen.name,
+            screen
+                .viewers
+                .iter()
+                .find(|p| Some(p.id) == screen.stats_peer)
+                .map(|p| p.name.as_str())
+                .unwrap_or("shared source")
+        )
+    }
+    impl HostView {
+        fn inspect_stats(&mut self, id: ScreenId, cx: &mut Context<Self>) {
+            let shared = self.state.clone();
+            let read = shared.clone();
+
+            let source = bridge_ui::InspectionSource::new(
+                move || {
+                    let mut state = read.lock().ok()?;
+                    let screen = state.screens.iter_mut().find(|s| s.screen_id == id)?;
+                    normalize_stats_target(screen);
+                    if !screen.stats_view.open {
+                        return None;
+                    }
+                    let telemetry = stats_telemetry(screen);
+                    screen.stats_view.refresh(&telemetry);
+                    let title = format!(
+                        "Screen {id} · {} · generation {} · viewer {}",
+                        screen_name_for_inspection(screen),
+                        screen.generation,
+                        screen
+                            .stats_peer
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "shared source".into())
+                    );
+                    Some(bridge_ui::InspectionData::new(
+                        title,
+                        screen.stats_view.table(&telemetry),
+                        screen.stats_view.lines(&telemetry),
+                        screen.stats_view.mode,
+                        screen.stats_view.frozen.is_some(),
+                    ))
+                },
+                move |action| {
+                    if let Ok(mut state) = shared.lock() {
+                        if let Some(screen) = state.screens.iter_mut().find(|s| s.screen_id == id) {
+                            if !screen.stats_view.open {
+                                return;
+                            }
+                            let telemetry = stats_telemetry(screen);
+                            match action {
+                                bridge_ui::InspectionAction::Frames => {
+                                    screen.stats_view.mode = TimingView::Frames
+                                }
+                                bridge_ui::InspectionAction::Averages => {
+                                    screen.stats_view.mode = TimingView::Averages
+                                }
+                                bridge_ui::InspectionAction::Freeze => {
+                                    screen.stats_view.frozen = if screen.stats_view.frozen.is_some()
+                                    {
+                                        None
+                                    } else {
+                                        Some(telemetry.snapshot())
+                                    };
+                                    screen.stats_view.freeze_after = None;
+                                }
+                                bridge_ui::InspectionAction::Burst => {
+                                    screen.stats_view.frozen = None;
+                                    screen.stats_view.freeze_after = Some(
+                                        telemetry.snapshot().averages[Stage::Capture as usize]
+                                            .count
+                                            + 20,
+                                    );
+                                }
+                            }
+                        } else {
+                            return;
+                        }
+                        if matches!(action, bridge_ui::InspectionAction::Burst) {
+                            let _ = state
+                                .session_commands
+                                .as_ref()
+                                .map(|commands| commands.try_send(HostUiCommand::Burst(id)));
+                        }
+                    }
+                },
+            );
+            if let Err(error) = bridge_ui::open_inspector(format!("host:{id}"), source, cx) {
+                set_message(
+                    &self.state,
+                    format!("Cannot open statistics inspector: {error:#}"),
+                );
+            }
+        }
+    }
+
+    impl Render for HostView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let state = self.state.lock().unwrap().clone();
             let mut selected_screen = state
                 .screens
@@ -334,21 +456,18 @@ mod app {
                     let shared = self.state.clone();
                     let screen_id = screen.screen_id;
                     let selected = Some(screen_id) == state.navigation.selected;
-                    div()
-                        .id(("host-screen", screen_id as usize))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(if selected { 0x365986 } else { 0x28354b }))
-                        .border_1()
-                        .border_color(rgb(if selected { 0x6fd3ff } else { 0x344158 }))
-                        .cursor_pointer()
-                        .child(format!(
+                    Button::new(("host-screen", screen_id as usize))
+                        .w_full()
+                        .min_w_0()
+                        .label(format!(
                             "{}{} · {}",
                             if selected { "● " } else { "" },
                             screen.name,
                             screen.status
                         ))
+                        .outline()
+                        .small()
+                        .selected(selected)
                         .on_click(cx.listener(move |_, _, _, cx| {
                             if let Ok(mut state) = shared.lock() {
                                 state.navigation.open(screen_id);
@@ -370,14 +489,10 @@ mod app {
                 .collect::<Vec<_>>();
             let add_screen = {
                 let shared = self.state.clone();
-                div()
-                    .id("host-add-screen")
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(0x35517a))
-                    .cursor_pointer()
-                    .child("+ Add screen")
+                Button::new("host-add-screen")
+                    .label("+ Add screen")
+                    .primary()
+                    .small()
                     .on_click(cx.listener(move |_, _, _, cx| {
                         if let Ok(mut state) = shared.lock() {
                             if let Some(screen_id) = add_host_screen(&mut state) {
@@ -401,50 +516,39 @@ mod app {
                     } else {
                         preset.name.clone()
                     };
-                    div()
-                        .id(("preset", index))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(if index == state.selected {
-                            0x31658e
-                        } else {
-                            0x263248
-                        }))
-                        .border_1()
-                        .border_color(rgb(if index == state.selected {
-                            0x6fd3ff
-                        } else {
-                            0x344158
-                        }))
-                        .cursor_pointer()
-                        .child(label)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if let Ok(mut state) = shared.lock() {
-                                if state.screens.iter().any(|screen| {
-                                    Some(screen.screen_id) == state.navigation.selected
-                                        && screen.removing
-                                }) {
-                                    return;
-                                }
-                                state.selected = index;
-                                state.settings = state.presets[index].settings.clone();
-                                let update = sync_selected_settings(&mut state);
-                                state.message = "Preset selected · applying to this screen".into();
-                                state.diagnostics.record(
-                                    "settings",
-                                    format!("Selected {} preset", state.presets[index].name),
-                                );
-                                if let (Some((screen_id, settings)), Some(commands)) =
-                                    (update, state.session_commands.as_ref())
-                                {
-                                    let _ = commands.try_send(HostUiCommand::ChangeSettings(
-                                        screen_id, settings,
-                                    ));
-                                }
+                    Button::new(gpui_kit::SharedString::from(format!(
+                        "preset:{}",
+                        preset.name
+                    )))
+                    .label(label)
+                    .outline()
+                    .small()
+                    .selected(index == state.selected)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Ok(mut state) = shared.lock() {
+                            if state.screens.iter().any(|screen| {
+                                Some(screen.screen_id) == state.navigation.selected
+                                    && screen.removing
+                            }) {
+                                return;
                             }
-                            cx.notify();
-                        }))
+                            state.selected = index;
+                            state.settings = state.presets[index].settings.clone();
+                            let update = sync_selected_settings(&mut state);
+                            state.message = "Preset selected · applying to this screen".into();
+                            state.diagnostics.record(
+                                "settings",
+                                format!("Selected {} preset", state.presets[index].name),
+                            );
+                            if let (Some((screen_id, settings)), Some(commands)) =
+                                (update, state.session_commands.as_ref())
+                            {
+                                let _ = commands
+                                    .try_send(HostUiCommand::ChangeSettings(screen_id, settings));
+                            }
+                        }
+                        cx.notify();
+                    }))
                 })
                 .collect::<Vec<_>>();
             let codec_panel = if state.show_codecs {
@@ -455,7 +559,7 @@ mod app {
                     .gap_2()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x263248))
+                    .bg(cx.theme().muted)
                     .child("Codec settings")
                     .child("H.264 · VideoToolbox hardware preferred, software available")
                     .child("AV1 appears when a working encoder is available.")
@@ -621,18 +725,14 @@ mod app {
                     .flex_col()
                     .gap_2()
                     .child(
-                        div()
-                            .id("host-stats-toggle")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x28354b))
-                            .cursor_pointer()
-                            .child(if screen.stats_view.open {
+                        Button::new("host-stats-toggle")
+                            .label(if screen.stats_view.open {
                                 "Stats ▴ · instrumented stream"
                             } else {
                                 "Stats ▾"
                             })
+                            .outline()
+                            .small()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Ok(mut state) = this.state.lock() {
                                     if let Some(s) =
@@ -652,6 +752,21 @@ mod app {
                     );
                 if screen.stats_view.open {
                     panel = panel
+                        .child(
+                            Button::new("host-inspect-stats")
+                                .label("Open statistics inspector")
+                                .primary()
+                                .small()
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(bridge_ui::TIMING_HELP),
+                        )
                         .child(format!(
                             "Stats target: {}",
                             screen
@@ -668,17 +783,11 @@ mod app {
                                 .flex_wrap()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .id("host-timing-frames")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(if screen.stats_view.mode == TimingView::Frames {
-                                            0x35517a
-                                        } else {
-                                            0x28354b
-                                        }))
-                                        .cursor_pointer()
-                                        .child("Frame rows")
+                                    Button::new("host-timing-frames")
+                                        .label("Frame rows")
+                                        .outline()
+                                        .small()
+                                        .selected(screen.stats_view.mode == TimingView::Frames)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -693,19 +802,11 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("host-timing-averages")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(
-                                            if screen.stats_view.mode == TimingView::Averages {
-                                                0x35517a
-                                            } else {
-                                                0x28354b
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .child("Stage averages")
+                                    Button::new("host-timing-averages")
+                                        .label("Stage averages")
+                                        .outline()
+                                        .small()
+                                        .selected(screen.stats_view.mode == TimingView::Averages)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -720,17 +821,14 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("host-timing-freeze")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x28354b))
-                                        .cursor_pointer()
-                                        .child(if screen.stats_view.frozen.is_some() {
+                                    Button::new("host-timing-freeze")
+                                        .label(if screen.stats_view.frozen.is_some() {
                                             "Resume"
                                         } else {
                                             "Freeze"
                                         })
+                                        .outline()
+                                        .small()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -742,7 +840,7 @@ mod app {
                                                         if s.stats_view.frozen.is_some() {
                                                             None
                                                         } else {
-                                                            Some(s.telemetry.snapshot())
+                                                            Some(stats_telemetry(s).snapshot())
                                                         };
                                                     s.stats_view.freeze_after = None;
                                                 }
@@ -751,13 +849,10 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("host-timing-burst")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x28354b))
-                                        .cursor_pointer()
-                                        .child("Capture next 20")
+                                    Button::new("host-timing-burst")
+                                        .label("Capture next 20")
+                                        .outline()
+                                        .small()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -767,7 +862,7 @@ mod app {
                                                 {
                                                     s.stats_view.frozen = None;
                                                     s.stats_view.freeze_after = Some(
-                                                        s.telemetry.snapshot().averages
+                                                        stats_telemetry(s).snapshot().averages
                                                             [Stage::Capture as usize]
                                                             .count
                                                             + 20,
@@ -785,40 +880,19 @@ mod app {
                         .children(
                             screen
                                 .stats_view
-                                .lines(&screen.telemetry)
+                                .lines(&stats_telemetry(screen))
                                 .into_iter()
                                 .map(|line| div().text_sm().child(line)),
                         )
                         .child(
                             div()
                                 .id("host-timing-table")
-                                .h(px(220.))
+                                .min_w_0()
+                                .h(gpui_kit::rems(14.))
                                 .overflow_scroll()
-                                .text_sm()
-                                .children(
-                                    screen
-                                        .stats_view
-                                        .table(&screen.telemetry)
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(index, row)| {
-                                            div()
-                                                .flex()
-                                                .gap_1()
-                                                .bg(rgb(if index == 0 {
-                                                    0x28354b
-                                                } else {
-                                                    0x0d1420
-                                                }))
-                                                .children(row.into_iter().map(|cell| {
-                                                    div()
-                                                        .w(px(175.))
-                                                        .flex_shrink_0()
-                                                        .p_1()
-                                                        .child(cell)
-                                                }))
-                                        }),
-                                ),
+                                .child(bridge_ui::timing_preview(
+                                    screen.stats_view.table(&stats_telemetry(screen)),
+                                )),
                         );
                 }
                 panel
@@ -832,7 +906,7 @@ mod app {
                     .overflow_y_scroll()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x0d1420))
+                    .bg(cx.theme().muted)
                     .text_sm()
                     .child(format!(
                         "File: {}",
@@ -856,46 +930,34 @@ mod app {
             } else {
                 div().id("host-logs-empty")
             };
-            let logs_toggle = div()
-                .id("logs-menu")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x28354b))
-                .cursor_pointer()
-                .child(if state.show_logs {
+            let logs_toggle = Button::new("logs-menu")
+                .label(if state.show_logs {
                     "Logs ▴"
                 } else {
                     "Logs ▾"
                 })
+                .outline()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         state.show_logs = !state.show_logs;
                     }
                     cx.notify();
                 }));
-            let list_toggle = div()
-                .id("host-screen-view-toggle-list")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x35517a))
-                .cursor_pointer()
-                .child("Selected screen details →")
+            let list_toggle = Button::new("host-screen-view-toggle-list")
+                .label("Selected screen details →")
+                .primary()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         state.navigation.view = ScreenView::Details;
                     }
                     cx.notify();
                 }));
-            let details_toggle = div()
-                .id("host-screen-view-toggle-details")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x35517a))
-                .cursor_pointer()
-                .child("← Screen list")
+            let details_toggle = Button::new("host-screen-view-toggle-details")
+                .label("← Screen list")
+                .primary()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         let ids = state
@@ -927,7 +989,12 @@ mod app {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(div().text_sm().text_color(rgb(0xa8b8cf)).child("SCREENS"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("SCREENS"),
+                        )
                         .child(div().flex().flex_col().gap_1().children(screen_cards))
                         .child(add_screen)
                         .when(selected_screen.is_some(), |this| this.child(list_toggle))
@@ -942,8 +1009,7 @@ mod app {
                     .gap_3()
                     .child(details_toggle)
                     .child(selected_screen.as_ref().map(|screen|format!("SCREEN PIN · {}",screen.pin)).unwrap_or_default())
-                    .child(div().id("capture-permission").p_2().rounded_md().bg(rgb(0x28354b)).cursor_pointer().child("Screen Recording access")
-                        .on_click(cx.listener(|this,_,_,cx|{let granted=mac::request_capture_access();set_message(&this.state,if granted{"Screen Recording is granted · retry this screen"}else{"Grant Screen Recording access to the launched app/executable, restart it and retry"});cx.notify();})))
+                    .child(Button::new("capture-permission").label("Screen Recording access").outline().small().on_click(cx.listener(|this,_,_,cx|{let granted=mac::request_capture_access();set_message(&this.state,if granted{"Screen Recording is granted · retry this screen"}else{"Grant Screen Recording access to the launched app/executable, restart it and retry"});cx.notify();})))
                     .child(
                         div()
                             .flex()
@@ -956,15 +1022,7 @@ mod app {
                                         .is_some_and(|screen| !screen.removing),
                                 |this| {
                                     this.child(
-                                        div()
-                                            .id("host-restart-screen")
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(0x35517a))
-                                            .cursor_pointer()
-                                            .child("Restart stream")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        Button::new("host-restart-screen").label("Restart stream").primary().small().on_click(cx.listener(|this, _, _, cx| {
                                                 if let Ok(state) = this.state.lock() {
                                                     if let (Some(screen_id), Some(commands)) = (
                                                         state.navigation.selected,
@@ -989,15 +1047,7 @@ mod app {
                                     .is_some_and(|screen| !screen.removing),
                                 |panel| {
                                     panel.child(
-                                        div()
-                                            .id("host-remove-screen")
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(0x573846))
-                                            .cursor_pointer()
-                                            .child("Remove screen")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        Button::new("host-remove-screen").label("Remove screen").danger().small().on_click(cx.listener(|this, _, _, cx| {
                                                 let selected =
                                                     this.state.lock().ok().and_then(|state| {
                                                         state.navigation.selected.map(|id| {
@@ -1040,19 +1090,11 @@ mod app {
                             panel
                                 .child(div().flex().flex_wrap().gap_2().children(presets))
                                 .child(
-                                    div()
-                                        .id("codec-menu")
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .bg(rgb(0x35517a))
-                                        .cursor_pointer()
-                                        .child(if state.show_codecs {
+                                    Button::new("codec-menu").label(if state.show_codecs {
                                             "Settings ▴"
                                         } else {
                                             "Settings ▾"
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        }).primary().small().on_click(cx.listener(|this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 state.show_codecs = !state.show_codecs;
                                             }
@@ -1064,9 +1106,9 @@ mod app {
                                 .child("Connected viewers")
                                 .children(selected_screen.as_ref().map(|s|s.viewers.clone()).unwrap_or_default().into_iter().map(|peer|{
                                     let id=peer.id;let screen_id=selected_screen.as_ref().map(|s|s.screen_id).unwrap_or(0);let selected=selected_screen.as_ref().is_some_and(|s|s.stats_peer==Some(id));
-                                    div().id(("connected-viewer",id as usize)).p_2().rounded_md().bg(rgb(if selected{0x35517a}else{0x28354b})).flex().justify_between()
-                                      .child(div().id(("peer-stats",id as usize)).cursor_pointer().child(format!("{} · {} · select stats",peer.name,peer.status)).on_click(cx.listener(move|this,_,_,cx|{if let Ok(mut state)=this.state.lock(){if let Some(s)=state.screens.iter_mut().find(|s|s.screen_id==screen_id){s.stats_peer=Some(id);s.stats_view.reset();}}cx.notify();})))
-                                      .child(div().id(("disconnect-peer",id as usize)).px_2().cursor_pointer().child("Disconnect").on_click(cx.listener(move|this,_,_,cx|{if let Ok(state)=this.state.lock(){if let Some(commands)=&state.session_commands{let _=commands.try_send(HostUiCommand::DisconnectPeer(screen_id,id));}}cx.notify();})))
+                                    div().id(("connected-viewer",id as usize)).p_2().rounded_md().bg(if selected { cx.theme().accent } else { cx.theme().secondary }).flex().justify_between()
+                                      .child(Button::new(("peer-stats",id as usize)).label(format!("{} · {} · select stats",peer.name,peer.status)).outline().small().selected(selected).flex_1().min_w_0().on_click(cx.listener(move|this,_,_,cx|{if let Ok(mut state)=this.state.lock(){if let Some(s)=state.screens.iter_mut().find(|s|s.screen_id==screen_id){s.stats_peer=Some(id);s.stats_view.reset();}}cx.notify();})))
+                                      .child(Button::new(("disconnect-peer",id as usize)).label("Disconnect").outline().small().on_click(cx.listener(move|this,_,_,cx|{if let Ok(state)=this.state.lock(){if let Some(commands)=&state.session_commands{let _=commands.try_send(HostUiCommand::DisconnectPeer(screen_id,id));}}cx.notify();})))
                                 }))
                         },
                     )
@@ -1074,11 +1116,7 @@ mod app {
                         div()
                             .rounded_md()
                             .p_2()
-                            .bg(rgb(if state.audio_notice.is_some() {
-                                0x4a3924
-                            } else {
-                                0x203149
-                            }))
+                            .bg(cx.theme().secondary)
                             .child(
                                 state
                                     .audio_notice
@@ -1090,7 +1128,7 @@ mod app {
                         div()
                             .rounded_md()
                             .p_2()
-                            .bg(rgb(0x203149))
+                            .bg(cx.theme().secondary)
                             .child(format!("Status: {}", state.message)),
                     )
                     .child(format!(
@@ -1118,51 +1156,19 @@ mod app {
                 .on_mouse_down(MouseButton::Left, |event, window, _| {
                     resize_from_border(event, window)
                 })
-                .bg(rgb(0x141c2b))
+                .bg(cx.theme().background)
                 .border_1()
-                .border_color(rgb(0x36465f))
-                .text_color(rgb(0xf2f5fb))
+                .border_color(cx.theme().border)
+                .text_color(cx.theme().foreground)
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .h(px(42.0))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .bg(rgb(0x1d2940))
-                        .child(
-                            div()
-                                .flex_1()
-                                .child("AIRBRIDGE  ·  HOST")
-                                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.start_window_move()
-                                }),
-                        )
-                        .child(
-                            div()
-                                .id("minimize")
-                                .px_2()
-                                .cursor_pointer()
-                                .child("−")
-                                .on_click(cx.listener(|_, _, window, _| window.minimize_window())),
-                        )
-                        .child(
-                            div()
-                                .id("close")
-                                .px_2()
-                                .cursor_pointer()
-                                .child("×")
-                                .on_click(cx.listener(|_, _, _, cx| cx.quit())),
-                        ),
-                )
+                .child(TitleBar::new().child("AirBridge · Host"))
                 .child(
                     div()
                         .px_3()
                         .py_2()
                         .text_sm()
-                        .bg(rgb(0x203149))
+                        .bg(cx.theme().secondary)
                         .child(state.message.clone()),
                 )
                 .child(
@@ -1272,62 +1278,72 @@ mod app {
             }
         });
         let app_shutdown = shutdown.clone();
-        Application::new().run(move |cx: &mut App| {
-            cx.on_app_quit(move |_| {
-                let _ = app_shutdown.send(true);
-                async {}
-            })
-            .detach();
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let widget_size = size(px(390.0), px(470.0));
-            let bounds = cx
-                .primary_display()
-                .map(|display| {
-                    let area = display.bounds();
-                    bounds(
-                        point(
-                            area.origin.x + area.size.width - widget_size.width - px(20.0),
-                            area.origin.y + px(70.0),
-                        ),
-                        widget_size,
-                    )
+        gpui_kit::application()
+            .with_assets(gpui_kit::assets::Assets)
+            .run(move |cx: &mut App| {
+                gpui_kit::init(cx);
+                cx.on_app_quit(move |_| {
+                    let _ = app_shutdown.send(true);
+                    async {}
                 })
-                .unwrap_or_else(|| Bounds::centered(None, widget_size, cx));
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: None,
-                    window_decorations: Some(WindowDecorations::Client),
-                    window_min_size: Some(size(px(330.0), px(280.0))),
-                    ..Default::default()
-                },
-                |_, cx| {
-                    let view = cx.new(|_| HostView {
-                        state: state.clone(),
-                    });
-                    let view_weak = view.downgrade();
-                    cx.spawn(async move |cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(250))
-                                .await;
-                            if view_weak.update(cx, |_, cx| cx.notify()).is_err() {
-                                break;
-                            }
-                        }
+                .detach();
+                cx.on_window_closed(|cx, _| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+                let widget_size = size(px(390.0), px(470.0));
+                let bounds = cx
+                    .primary_display()
+                    .map(|display| {
+                        let area = display.bounds();
+                        bounds(
+                            point(
+                                area.origin.x + area.size.width - widget_size.width - px(20.0),
+                                area.origin.y + px(70.0),
+                            ),
+                            widget_size,
+                        )
                     })
-                    .detach();
-                    view
-                },
-            )
-            .expect("Cannot open AirBridge window");
-            cx.activate(true);
-        });
+                    .unwrap_or_else(|| Bounds::centered(None, widget_size, cx));
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_decorations: Some(WindowDecorations::Client),
+                        window_min_size: Some(size(px(330.0), px(280.0))),
+                        ..TitleBar::window_options()
+                    },
+                    cx,
+                    |window, cx| {
+                        let view = cx.new(|_| HostView {
+                            state: state.clone(),
+                        });
+                        let controls_id = window.window_handle().window_id();
+                        cx.on_window_closed(move |cx, closed_id| {
+                            if closed_id == controls_id {
+                                cx.quit();
+                            }
+                        })
+                        .detach();
+                        let view_weak = view.downgrade();
+                        cx.spawn(async move |cx| {
+                            loop {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(250))
+                                    .await;
+                                if view_weak.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .detach();
+                        view
+                    },
+                )
+                .expect("Cannot open AirBridge window");
+                cx.activate(true);
+            });
         let _ = shutdown.send(true);
         let _ = server_thread.join();
     }
@@ -1339,10 +1355,62 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[gpui_kit::test]
+        fn kit_buttons_switch_list_details_and_screen_ownership(cx: &mut gpui_kit::TestAppContext) {
+            use gpui_kit::test::TestWindowExt;
+            let state = Arc::new(Mutex::new(initial_state(
+                built_in_presets(),
+                "123456".into(),
+            )));
+            cx.update(gpui_kit::init);
+            let (handle, _) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                    cx.new(|_| HostView {
+                        state: state.clone(),
+                    })
+                })
+                .unwrap()
+            });
+            handle
+                .update(cx, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert_eq!(
+                        window.find(("host-screen", 1_usize)).role(),
+                        Some(gpui_kit::Role::Button)
+                    );
+                    assert_eq!(state.lock().unwrap().navigation.selected, Some(1));
+                    window.click(("host-screen", 1_usize), cx);
+                    assert!(window.try_find("host-add-screen").is_none());
+                    window.click("codec-menu", cx);
+                })
+                .unwrap();
+            assert!(state.lock().unwrap().show_codecs);
+            handle
+                .update(cx, |_, window, cx| {
+                    window.click("host-screen-view-toggle-details", cx);
+                    assert!(window.try_find("codec-menu").is_none());
+                    window.click("host-add-screen", cx);
+                })
+                .unwrap();
+            assert_eq!(state.lock().unwrap().screens.len(), 2);
+            assert_eq!(state.lock().unwrap().navigation.selected, Some(2));
+            assert!(!state.lock().unwrap().show_codecs);
+            handle
+                .update(cx, |_, window, cx| window.click("host-remove-screen", cx))
+                .unwrap();
+            assert_eq!(state.lock().unwrap().screens.len(), 1);
+            assert_eq!(state.lock().unwrap().navigation.view, ScreenView::List);
+        }
         #[test]
         fn screen_pins_and_selection_are_independent() {
             let mut s = initial_state(built_in_presets(), "123456".into());
             assert_eq!(s.screens[0].pin, "123456");
+            s.screens[0].stats_peer = Some(999);
+            s.screens[0].stats_view.freeze_after = Some(20);
+            normalize_stats_target(&mut s.screens[0]);
+            assert!(s.screens[0].stats_peer.is_none());
+            assert!(s.screens[0].stats_view.freeze_after.is_none());
             let id = add_host_screen(&mut s).unwrap();
             assert_eq!(s.navigation.selected, Some(id));
             assert_eq!(s.screens.len(), 2);

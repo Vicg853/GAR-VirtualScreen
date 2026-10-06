@@ -6,13 +6,13 @@ license.workspace = true
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
+bridge-ui = { path = "../bridge-ui" }
 anyhow.workspace = true
 tokio.workspace = true
-gpui.workspace = true
+gpui-kit.workspace = true
 quinn.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["wayland", "x11"] }
 gpu-video = { path = "../../vendor/gpu-video" }
 bytemuck = { version = "1", features = ["derive"] }
 openh264 = "0.9.8"
@@ -22,5 +22,6 @@ pollster = "0.4"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "x11"] }
 
 [dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
 naga = { version = "30", features = ["wgsl-in"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "noop", "wgsl"] }

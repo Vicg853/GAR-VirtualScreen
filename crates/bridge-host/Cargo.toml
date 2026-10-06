@@ -7,9 +7,10 @@ build = "build.rs"
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
+bridge-ui = { path = "../bridge-ui" }
 anyhow.workspace = true
 tokio.workspace = true
-gpui.workspace = true
+gpui-kit.workspace = true
 quinn.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -18,3 +19,6 @@ apple-cf = "0.11.0"
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

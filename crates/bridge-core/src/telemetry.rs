@@ -784,8 +784,8 @@ impl StatsView {
             TimingView::Averages => {
                 let mut rows = vec![vec![
                     "Stage".into(),
-                    "Average start".into(),
-                    "Average duration".into(),
+                    "Start after capture (avg)".into(),
+                    "Stage duration (avg)".into(),
                     "Samples".into(),
                     "Failures / incomplete".into(),
                     "Last result".into(),

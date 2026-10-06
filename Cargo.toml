@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bridge-core", "crates/bridge-host", "crates/bridge-viewer"]
+members = ["crates/bridge-core", "crates/bridge-host", "crates/bridge-viewer", "crates/bridge-ui"]
 exclude = ["vendor/gpu-video"]
 resolver = "2"
 
@@ -19,4 +19,4 @@ sha2 = "0.10"
 spake2 = "0.4"
 hmac = "0.12"
 mdns-sd = "0.21.4"
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+gpui-kit = "=0.7.1"

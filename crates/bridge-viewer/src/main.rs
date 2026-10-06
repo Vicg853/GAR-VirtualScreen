@@ -33,10 +33,16 @@ mod app {
             TraceToken, now_us,
         },
     };
-    use gpui::{
-        App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, ResizeEdge,
-        Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, bounds, div, point,
-        prelude::*, px, rgb, size,
+    use gpui_kit::component::{
+        ActiveTheme, Selectable, Sizable, TitleBar,
+        button::{Button, ButtonVariants},
+        form::{Field, Form},
+        input::{Input, InputEvent, InputState},
+    };
+    use gpui_kit::{
+        AnyWindowHandle, App, Bounds, Context, Entity, MouseButton, ResizeEdge, Subscription,
+        Window, WindowBounds, WindowDecorations, WindowOptions, bounds, div, point, prelude::*, px,
+        size,
     };
     use std::{
         collections::{HashMap, HashSet, VecDeque},
@@ -147,12 +153,10 @@ mod app {
         selected_host: usize,
         target_screen: u32,
         target_input: String,
-        edit_target: bool,
         host_identity: String,
         viewer_identity: u64,
         pin: String,
         manual_address: String,
-        edit_address: bool,
         settings: VideoSettings,
         override_host: bool,
         screens: Vec<ClientScreen>,
@@ -366,11 +370,13 @@ mod app {
         catalog: Arc<Mutex<State>>,
         state: Arc<Mutex<State>>,
         commands: mpsc::Sender<Command>,
-        focus: FocusHandle,
-        rendered: bool,
+        inputs: [Entity<InputState>; 3],
+        input_owner: Option<u64>,
+        input_values: [String; 3],
+        _input_subscriptions: Vec<Subscription>,
     }
 
-    fn resize_from_border(event: &gpui::MouseDownEvent, window: &mut Window) {
+    fn resize_from_border(event: &gpui_kit::MouseDownEvent, window: &mut Window) {
         let point = event.position;
         let size = window.window_bounds().get_bounds().size;
         let border = px(7.0);
@@ -402,14 +408,10 @@ mod app {
         action: fn(&mut State),
         cx: &mut Context<ViewerView>,
     ) -> impl IntoElement {
-        div()
-            .id(id)
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(rgb(0x35517a))
-            .cursor_pointer()
-            .child(label)
+        Button::new(id)
+            .label(label)
+            .primary()
+            .small()
             .on_click(cx.listener(move |_, _, _, cx| {
                 if let Ok(mut state) = shared.lock() {
                     if state.screens.iter().any(|s| {
@@ -441,103 +443,133 @@ mod app {
             }))
     }
 
-    impl Render for ViewerView {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            if let Ok(mut ws) = self.workspace.lock() {
-                ws.retiring.retain(|e| {
-                    let finished = e
-                        .thread
-                        .lock()
-                        .map(|t| t.as_ref().is_none_or(|t| t.is_finished()))
-                        .unwrap_or(true);
-                    if finished {
-                        if let Some(t) = e.thread.lock().ok().and_then(|mut t| t.take()) {
-                            let _ = t.join();
+    impl ViewerView {
+        fn inspect_stats(&mut self, id: ScreenId, cx: &mut Context<Self>) {
+            let shared = self.state.clone();
+            let read = shared.clone();
+            let commands = self.commands.clone();
+            let source = bridge_ui::InspectionSource::new(
+                move || {
+                    let mut state = read.lock().ok()?;
+                    let screen = state
+                        .screens
+                        .iter_mut()
+                        .find(|s| s.config.screen_id == id)?;
+                    if !screen.stats_view.open {
+                        return None;
+                    }
+                    let telemetry = screen.telemetry.clone();
+                    screen.stats_view.refresh(&telemetry);
+                    let title = format!(
+                        "Screen {id} · {} · generation {}",
+                        screen.config.name, screen.config.generation
+                    );
+                    Some(bridge_ui::InspectionData::new(
+                        title,
+                        screen.stats_view.table(&telemetry),
+                        screen.stats_view.lines(&telemetry),
+                        screen.stats_view.mode,
+                        screen.stats_view.frozen.is_some(),
+                    ))
+                },
+                move |action| {
+                    if let Ok(mut state) = shared.lock() {
+                        if let Some(screen) =
+                            state.screens.iter_mut().find(|s| s.config.screen_id == id)
+                        {
+                            if !screen.stats_view.open {
+                                return;
+                            }
+                            let telemetry = screen.telemetry.clone();
+                            match action {
+                                bridge_ui::InspectionAction::Frames => {
+                                    screen.stats_view.mode = TimingView::Frames
+                                }
+                                bridge_ui::InspectionAction::Averages => {
+                                    screen.stats_view.mode = TimingView::Averages
+                                }
+                                bridge_ui::InspectionAction::Freeze => {
+                                    screen.stats_view.frozen = if screen.stats_view.frozen.is_some()
+                                    {
+                                        None
+                                    } else {
+                                        Some(telemetry.snapshot())
+                                    };
+                                    screen.stats_view.freeze_after = None;
+                                }
+                                bridge_ui::InspectionAction::Burst => {
+                                    screen.stats_view.frozen = None;
+                                    screen.stats_view.freeze_after = Some(
+                                        telemetry.snapshot().averages[Stage::Capture as usize]
+                                            .count
+                                            + 20,
+                                    );
+                                }
+                            }
+                        } else {
+                            return;
+                        }
+                        if matches!(action, bridge_ui::InspectionAction::Burst) {
+                            let _ = Some(commands.try_send(Command::Burst(id)));
                         }
                     }
-                    !finished
-                });
+                },
+            );
+            if let Err(error) = bridge_ui::open_inspector(
+                format!("viewer:{}:{id}", self.input_owner.unwrap_or(0)),
+                source,
+                cx,
+            ) {
+                message(
+                    &self.state,
+                    format!("Cannot open statistics inspector: {error:#}"),
+                );
             }
+        }
+    }
+
+    impl Render for ViewerView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let last_selected = self.workspace.lock().ok().and_then(|ws| ws.last_selected);
             let (entries, selected) = self
                 .workspace
                 .lock()
                 .map(|ws| (ws.entries.clone(), ws.selected))
                 .unwrap_or_default();
-            if let Some(entry) = entries.iter().find(|e| Some(e.id) == selected) {
-                self.state = entry.state.clone();
-                self.commands = entry.commands.clone();
-            } else {
+            if selected.is_none() {
                 let rows = entries
                     .iter()
                     .map(|entry| {
                         let id = entry.id;
                         let state = entry.state.lock().unwrap();
                         let summary = format!("Screen {id} · {}", state.message);
-                        div()
-                            .id(("local-screen", id as usize))
-                            .p_3()
-                            .rounded_md()
-                            .bg(rgb(if last_selected == Some(id) {
-                                0x35517a
-                            } else {
-                                0x28354b
-                            }))
-                            .cursor_pointer()
-                            .child(summary)
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                        Button::new(("local-screen", id as usize))
+                            .w_full()
+                            .min_w_0()
+                            .label(summary.clone())
+                            .tooltip(summary)
+                            .outline()
+                            .small()
+                            .selected(last_selected == Some(id))
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Ok(mut ws) = this.workspace.lock() {
                                     ws.selected = Some(id);
                                 }
-                                cx.notify();
+                                this.refresh(window, cx);
                             }))
                     })
                     .collect::<Vec<_>>();
                 return div()
                     .size_full()
                     .min_h_0()
-                    .bg(rgb(0x141c2b))
-                    .text_color(rgb(0xf2f5fb))
+                    .bg(cx.theme().background)
+                    .text_color(cx.theme().foreground)
                     .flex()
                     .flex_col()
                     .on_mouse_down(MouseButton::Left, |event, window, _| {
                         resize_from_border(event, window)
                     })
-                    .child(
-                        div()
-                            .h(px(42.))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .bg(rgb(0x1d2940))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child("AIRBRIDGE · VIEWER SCREENS")
-                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        window.start_window_move()
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("list-minimize")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .child("−")
-                                    .on_click(
-                                        cx.listener(|_, _, window, _| window.minimize_window()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("list-close")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .child("×")
-                                    .on_click(cx.listener(|_, _, _, cx| cx.quit())),
-                            ),
-                    )
+                    .child(TitleBar::new().child("AirBridge · Screens"))
                     .child(
                         div()
                             .id("local-list-scroll")
@@ -550,39 +582,17 @@ mod app {
                             .gap_2()
                             .children(rows)
                             .child(
-                                div()
-                                    .id("add-local-screen")
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x35517a))
-                                    .cursor_pointer()
-                                    .child("+ Add screen")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                Button::new("add-local-screen")
+                                    .label("+ Add screen")
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         add_local_screen(&this.workspace, &this.catalog);
-                                        cx.notify();
+                                        this.refresh(window, cx);
                                     })),
                             ),
                     )
                     .into_any_element();
-            }
-            if !self.rendered {
-                self.rendered = true;
-                if let Ok(state) = self.state.lock() {
-                    state.diagnostics.record(
-                        "ui",
-                        format!(
-                            "Controls window rendering at {:?}",
-                            window.window_bounds().get_bounds()
-                        ),
-                    );
-                }
-            }
-            if let Ok(mut state) = self.state.lock() {
-                for s in &mut state.screens {
-                    if s.stats_view.open {
-                        s.stats_view.refresh(&s.telemetry);
-                    }
-                }
             }
             let state = self.state.lock().unwrap().clone();
             let page = state.page();
@@ -609,24 +619,20 @@ mod app {
                 .iter()
                 .enumerate()
                 .map(|(index, host)| {
-                    let shared = self.state.clone();
                     let selected = index == state.selected_host;
                     let host_name = host.name.clone();
-                    div()
-                        .id(("host", index))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(if selected { 0x365986 } else { 0x28354b }))
-                        .border_1()
-                        .border_color(rgb(if selected { 0x6fd3ff } else { 0x344158 }))
-                        .cursor_pointer()
-                        .child(format!("{}{}", if selected { "● " } else { "" }, host.name))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if let Ok(mut state) = shared.lock() {
+                    Button::new(gpui_kit::SharedString::from(format!("host:{}", host.name)))
+                        .w_full()
+                        .min_w_0()
+                        .label(format!("{}{}", if selected { "● " } else { "" }, host.name))
+                        .outline()
+                        .small()
+                        .selected(selected)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Ok(mut state) = this.state.lock() {
                                 state.select_host(&host_name);
                             }
-                            cx.notify();
+                            this.refresh(window, cx);
                         }))
                 })
                 .collect::<Vec<_>>();
@@ -637,21 +643,18 @@ mod app {
                     let shared = self.state.clone();
                     let screen_id = screen.config.screen_id;
                     let selected = Some(screen_id) == state.navigation.selected;
-                    div()
-                        .id(("viewer-screen", screen_id as usize))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(if selected { 0x365986 } else { 0x28354b }))
-                        .border_1()
-                        .border_color(rgb(if selected { 0x6fd3ff } else { 0x344158 }))
-                        .cursor_pointer()
-                        .child(format!(
+                    Button::new(("viewer-screen", screen_id as usize))
+                        .w_full()
+                        .min_w_0()
+                        .label(format!(
                             "{}{} · {}",
                             if selected { "● " } else { "" },
                             screen.config.name,
                             screen.status
                         ))
+                        .outline()
+                        .small()
+                        .selected(selected)
                         .on_click(cx.listener(move |_, _, _, cx| {
                             if let Ok(mut state) = shared.lock() {
                                 state.navigation.open(screen_id);
@@ -684,65 +687,54 @@ mod app {
                 .map(|(index, preset)| {
                     let shared = self.state.clone();
                     let commands = commands.clone();
-                    div()
-                        .id(("preset", index))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(if index == state.selected_preset {
-                            0x365986
+                    Button::new(gpui_kit::SharedString::from(format!(
+                        "preset:{}",
+                        preset.name
+                    )))
+                    .label(format!(
+                        "{}{}",
+                        if index == state.selected_preset {
+                            "● "
                         } else {
-                            0x28354b
-                        }))
-                        .border_1()
-                        .border_color(rgb(if index == state.selected_preset {
-                            0x6fd3ff
-                        } else {
-                            0x344158
-                        }))
-                        .cursor_pointer()
-                        .child(format!(
-                            "{}{}",
-                            if index == state.selected_preset {
-                                "● "
-                            } else {
-                                ""
-                            },
-                            preset.name
-                        ))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if let Ok(mut state) = shared.lock() {
-                                if state.screens.iter().any(|s| {
-                                    Some(s.config.screen_id) == state.navigation.selected
-                                        && s.removing
-                                }) {
-                                    return;
-                                }
-                                state.selected_preset = index;
-                                state.settings = state.presets[index].settings.clone();
-                                state.override_host = true;
-                                let apply = persist_selected_settings(&mut state);
-                                state.message =
-                                    if state.connected && state.navigation.selected.is_some() {
-                                        format!(
-                                            "{} preset · applying to this screen",
-                                            state.presets[index].name
-                                        )
-                                    } else {
-                                        format!(
-                                            "{} preset selected for the next connection",
-                                            state.presets[index].name
-                                        )
-                                    };
-                                state.diagnostics.record("settings", &state.message);
-                                if let Some((screen_id, revision, settings)) = apply {
-                                    let _ = commands.try_send(Command::ChangeScreenSettings(
-                                        screen_id, revision, settings,
-                                    ));
-                                }
+                            ""
+                        },
+                        preset.name
+                    ))
+                    .outline()
+                    .small()
+                    .selected(index == state.selected_preset)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Ok(mut state) = shared.lock() {
+                            if state.screens.iter().any(|s| {
+                                Some(s.config.screen_id) == state.navigation.selected && s.removing
+                            }) {
+                                return;
                             }
-                            cx.notify();
-                        }))
+                            state.selected_preset = index;
+                            state.settings = state.presets[index].settings.clone();
+                            state.override_host = true;
+                            let apply = persist_selected_settings(&mut state);
+                            state.message =
+                                if state.connected && state.navigation.selected.is_some() {
+                                    format!(
+                                        "{} preset · applying to this screen",
+                                        state.presets[index].name
+                                    )
+                                } else {
+                                    format!(
+                                        "{} preset selected for the next connection",
+                                        state.presets[index].name
+                                    )
+                                };
+                            state.diagnostics.record("settings", &state.message);
+                            if let Some((screen_id, revision, settings)) = apply {
+                                let _ = commands.try_send(Command::ChangeScreenSettings(
+                                    screen_id, revision, settings,
+                                ));
+                            }
+                        }
+                        cx.notify();
+                    }))
                 })
                 .collect::<Vec<_>>();
             let connect_state = self.state.clone();
@@ -757,7 +749,7 @@ mod app {
                     .gap_2()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x28354b))
+                    .bg(cx.theme().secondary)
                     .child("Decoder: Vulkan Video when supported, software fallback")
                     .child("Codec: H.264")
                     .child(format!(
@@ -938,18 +930,14 @@ mod app {
                     .flex_col()
                     .gap_2()
                     .child(
-                        div()
-                            .id("viewer-stats-toggle")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x28354b))
-                            .cursor_pointer()
-                            .child(if screen.stats_view.open {
+                        Button::new("viewer-stats-toggle")
+                            .label(if screen.stats_view.open {
                                 "Stats ▴ · instrumented stream"
                             } else {
                                 "Stats ▾"
                             })
+                            .outline()
+                            .small()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Ok(mut state) = this.state.lock() {
                                     if let Some(s) =
@@ -968,6 +956,21 @@ mod app {
                     );
                 if screen.stats_view.open {
                     panel = panel
+                        .child(
+                            Button::new("viewer-inspect-stats")
+                                .label("Open statistics inspector")
+                                .primary()
+                                .small()
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.inspect_stats(id, cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(bridge_ui::TIMING_HELP),
+                        )
                         .child("Temporary diagnostics · opening/closing restarts this stream")
                         .child(
                             div()
@@ -975,17 +978,11 @@ mod app {
                                 .flex_wrap()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .id("viewer-timing-frames")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(if screen.stats_view.mode == TimingView::Frames {
-                                            0x35517a
-                                        } else {
-                                            0x28354b
-                                        }))
-                                        .cursor_pointer()
-                                        .child("Frame rows")
+                                    Button::new("viewer-timing-frames")
+                                        .label("Frame rows")
+                                        .outline()
+                                        .small()
+                                        .selected(screen.stats_view.mode == TimingView::Frames)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -1000,19 +997,11 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("viewer-timing-averages")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(
-                                            if screen.stats_view.mode == TimingView::Averages {
-                                                0x35517a
-                                            } else {
-                                                0x28354b
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .child("Stage averages")
+                                    Button::new("viewer-timing-averages")
+                                        .label("Stage averages")
+                                        .outline()
+                                        .small()
+                                        .selected(screen.stats_view.mode == TimingView::Averages)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -1027,17 +1016,14 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("viewer-timing-freeze")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x28354b))
-                                        .cursor_pointer()
-                                        .child(if screen.stats_view.frozen.is_some() {
+                                    Button::new("viewer-timing-freeze")
+                                        .label(if screen.stats_view.frozen.is_some() {
                                             "Resume"
                                         } else {
                                             "Freeze"
                                         })
+                                        .outline()
+                                        .small()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -1058,13 +1044,10 @@ mod app {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("viewer-timing-burst")
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x28354b))
-                                        .cursor_pointer()
-                                        .child("Capture next 20")
+                                    Button::new("viewer-timing-burst")
+                                        .label("Capture next 20")
+                                        .outline()
+                                        .small()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Ok(mut state) = this.state.lock() {
                                                 if let Some(s) = state
@@ -1096,33 +1079,12 @@ mod app {
                         .child(
                             div()
                                 .id("viewer-timing-table")
-                                .h(px(220.))
+                                .min_w_0()
+                                .h(gpui_kit::rems(14.))
                                 .overflow_scroll()
-                                .text_sm()
-                                .children(
-                                    screen
-                                        .stats_view
-                                        .table(&screen.telemetry)
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(index, row)| {
-                                            div()
-                                                .flex()
-                                                .gap_1()
-                                                .bg(rgb(if index == 0 {
-                                                    0x28354b
-                                                } else {
-                                                    0x0d1420
-                                                }))
-                                                .children(row.into_iter().map(|cell| {
-                                                    div()
-                                                        .w(px(175.))
-                                                        .flex_shrink_0()
-                                                        .p_1()
-                                                        .child(cell)
-                                                }))
-                                        }),
-                                ),
+                                .child(bridge_ui::timing_preview(
+                                    screen.stats_view.table(&screen.telemetry),
+                                )),
                         );
                 }
                 panel
@@ -1136,7 +1098,7 @@ mod app {
                     .overflow_y_scroll()
                     .p_2()
                     .rounded_md()
-                    .bg(rgb(0x0d1420))
+                    .bg(cx.theme().muted)
                     .text_sm()
                     .child(format!(
                         "File: {}",
@@ -1154,46 +1116,34 @@ mod app {
             } else {
                 div().id("viewer-logs-empty")
             };
-            let logs_toggle = div()
-                .id("logs-menu")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x28354b))
-                .cursor_pointer()
-                .child(if state.show_logs {
+            let logs_toggle = Button::new("logs-menu")
+                .label(if state.show_logs {
                     "Logs ▴"
                 } else {
                     "Logs ▾"
                 })
+                .outline()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         state.show_logs = !state.show_logs;
                     }
                     cx.notify();
                 }));
-            let list_toggle = div()
-                .id("viewer-screen-view-toggle-list")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x35517a))
-                .cursor_pointer()
-                .child("Selected stream details →")
+            let list_toggle = Button::new("viewer-screen-view-toggle-list")
+                .label("Selected stream details →")
+                .primary()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         state.navigation.view = ScreenView::Details;
                     }
                     cx.notify();
                 }));
-            let details_toggle = div()
-                .id("viewer-screen-view-toggle-details")
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(0x35517a))
-                .cursor_pointer()
-                .child("← Screens")
+            let details_toggle = Button::new("viewer-screen-view-toggle-details")
+                .label("← Screens")
+                .primary()
+                .small()
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Ok(mut state) = this.state.lock() {
                         let ids = state
@@ -1231,7 +1181,7 @@ mod app {
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0xa8b8cf))
+                                .text_color(cx.theme().muted_foreground)
                                 .child("SCREEN STREAMS"),
                         )
                         .child(div().flex().flex_col().gap_1().children(screen_cards))
@@ -1253,14 +1203,11 @@ mod app {
                     .when(active_screen.as_ref().is_some_and(|s|s.terminal),|panel|panel.child(if active_screen.as_ref().and_then(|s|s.frame.lock().ok().map(|f|f.cleanup_complete)).unwrap_or(false){"Cleanup complete · retry is available"}else{"Closing video resources · waiting for worker exit…"}))
                     .child(div().flex().flex_wrap().gap_2()
                         .when(active_screen.as_ref().is_some_and(|s| !s.removing && (!s.terminal || s.frame.lock().map(|f|f.cleanup_complete).unwrap_or(false))), |row| row
-                            .child(div().id("retry-stream").px_3().py_2().rounded_md().bg(rgb(0x35517a)).cursor_pointer()
-                                .child(if active_screen.as_ref().is_some_and(|s| s.terminal) { "Retry stream" } else { "Restart stream" })
-                                .on_click(cx.listener(|this, _, _, cx| {
+                            .child(Button::new("retry-stream").label(if active_screen.as_ref().is_some_and(|s| s.terminal) { "Retry stream" } else { "Restart stream" }).primary().small().on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(id) = this.state.lock().ok().and_then(|s| s.navigation.selected) { let _ = this.commands.try_send(Command::RetryScreen(id)); }
                                     cx.notify();
                                 })))
-                            .child(div().id("remove-stream").px_3().py_2().rounded_md().bg(rgb(0x573846)).cursor_pointer().child("Detach viewer")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                            .child(Button::new("remove-stream").label("Detach viewer").danger().small().on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(id) = this.state.lock().ok().and_then(|s| s.navigation.selected) { let _ = this.commands.try_send(Command::RemoveScreen(id)); }
                                     cx.notify();
                                 })))))
@@ -1268,15 +1215,7 @@ mod app {
                     .child(logs_toggle)
                     .child(logs)
                     .when(active_screen.as_ref().is_some_and(|s| !s.terminal && !s.removing), |panel| panel.child(
-                        div()
-                            .id("show-display")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x28354b))
-                            .cursor_pointer()
-                            .child("Show display window")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        Button::new("show-display").label("Show display window").outline().small().on_click(cx.listener(|this, _, _, cx| {
                                 let result = this.state.lock().ok()
                                     .and_then(|state| state.screens.iter().find(|screen| Some(screen.config.screen_id) == state.navigation.selected).map(|screen| screen.video_window.clone()))
                                     .map(|window| window.show());
@@ -1287,18 +1226,10 @@ mod app {
                             })),
                     ))
                     .when(active_screen.as_ref().is_some_and(|s| !s.removing), |panel| panel
-                    .child(div().text_sm().text_color(rgb(0xa8b8cf)).child(if state.connected { "PRESETS · selected stream" } else { "PRESETS · next connection" }))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(if state.connected { "PRESETS · selected stream" } else { "PRESETS · next connection" }))
                     .child(div().flex().flex_wrap().gap_2().children(presets))
                     .child(
-                        div()
-                            .id("codec-menu")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x28354b))
-                            .cursor_pointer()
-                            .child(if state.show_codecs { "Video settings ▴" } else { "Video settings ▾" })
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        Button::new("codec-menu").label(if state.show_codecs { "Video settings ▴" } else { "Video settings ▾" }).outline().small().on_click(cx.listener(|this, _, _, cx| {
                                 if let Ok(mut state) = this.state.lock() {
                                     state.show_codecs = !state.show_codecs;
                                 }
@@ -1319,18 +1250,14 @@ mod app {
                     .child("PRESETS · next connection")
                     .child(div().flex().flex_wrap().gap_2().children(presets))
                     .child(
-                        div()
-                            .id("connection-video-settings")
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(0x28354b))
-                            .cursor_pointer()
-                            .child(if state.show_codecs {
+                        Button::new("connection-video-settings")
+                            .label(if state.show_codecs {
                                 "Video settings ▴"
                             } else {
                                 "Video settings ▾"
                             })
+                            .outline()
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Ok(mut state) = this.state.lock() {
                                     state.show_codecs = !state.show_codecs;
@@ -1345,38 +1272,25 @@ mod app {
             } else {
                 div().id("viewer-screen-details-hidden")
             };
-            div().size_full().min_h_0().track_focus(&self.focus).on_key_down(cx.listener(Self::on_key))
+            div().size_full().min_w_0().min_h_0()
                 .on_mouse_down(MouseButton::Left, |event, window, _| resize_from_border(event, window))
-                .bg(rgb(0x141c2b)).border_1().border_color(rgb(0x36465f))
-                .text_color(rgb(0xf2f5fb)).flex().flex_col()
-                .child(div().h(px(42.0)).px_3().flex().items_center().justify_between().bg(rgb(0x1d2940))
-                    .child(div().flex_1().child("AIRBRIDGE  ·  VIEWER")
-                        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move()))
-                    .child(div().id("minimize").px_2().cursor_pointer().child("−")
-                        .on_click(cx.listener(|_, _, window, _| window.minimize_window())))
-                    .child(div().id("close").px_2().cursor_pointer().child("×")
-                        .on_click(cx.listener(|_, _, _, cx| cx.quit()))))
-                .child(div().px_3().py_2().bg(rgb(0x203149)).text_sm().child(state.message.clone()))
+                .bg(cx.theme().background).border_1().border_color(cx.theme().border)
+                .text_color(cx.theme().foreground).flex().flex_col()
+                .child(TitleBar::new().child("AirBridge · Viewer"))
+                .child(div().px_3().py_2().bg(cx.theme().secondary).text_sm().child(state.message.clone()))
                 .child(div().id("viewer-settings-scroll").flex_1().min_h_0().overflow_y_scroll().p_3().flex().flex_col().gap_3()
                     .when(page == ControlsPage::Connect, |panel| panel
-                    .child(div().text_sm().text_color(rgb(0xa8b8cf)).child("DISCOVERED HOSTS"))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("DISCOVERED HOSTS"))
                     .child(div().flex().flex_col().gap_1().children(hosts))
-                    .child(format!("Host screen {} · one host for this local screen",state.target_screen))
-                    .child(div().id("target-screen-cycle").p_2().rounded_md().bg(rgb(0x28354b)).cursor_pointer().child("Type manual host screen ID")
-                      .on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.edit_target=true;s.edit_address=false;s.target_input.clear();}cx.notify();})))
-                    .child(format!("PIN: {}  ·  {}", if state.pin.is_empty() { "_" } else { &state.pin }, if state.edit_address { "manual address input active" } else { "type six digits" }))
-                    .child(format!("Manual address: {}", if state.manual_address.is_empty() { "not set" } else { &state.manual_address }))
-                    .child(div().id("edit-address").px_3().py_2().rounded_md().bg(rgb(if state.edit_address { 0x365986 } else { 0x28354b }))
-                        .cursor_pointer().child(if state.edit_address { "Typing address · click for PIN" } else { "Typing PIN · click for address" })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Ok(mut state) = this.state.lock() { state.edit_address = !state.edit_address;state.edit_target=false; }
-                            cx.notify();
-                        })))
+                    .child(Form::new().small()
+                        .child(Field::new().label("Host screen ID").required(true).child(Input::new(&self.inputs[2]).small()))
+                        .child(Field::new().label("Six-digit screen PIN").required(true).child(Input::new(&self.inputs[1]).small().mask_toggle()))
+                        .child(Field::new().label("Manual host address").description("Leave blank to use the selected discovered host").child(Input::new(&self.inputs[0]).small())))
                     .child(div().flex().flex_wrap().gap_2()
-                        .child(div().id("connect").px_4().py_2().rounded_md().bg(rgb(0x3777b6)).cursor_pointer().child("Connect")
-                            .on_click(cx.listener(move |_, _, _, cx| {
+                        .child(Button::new("connect").label("Connect").primary().small().on_click(cx.listener(move |_, _, _, cx| {
                                 let state = connect_state.lock().unwrap().clone();
                                 if state.connected || state.connecting { return; }
+                                if state.target_screen == 0 { message(&connect_state, "Enter a valid host screen ID"); cx.notify(); return; }
                                 if bridge_core::security::validate_pin(&state.pin).is_err() { message(&connect_state, "Enter the six-digit host PIN"); cx.notify(); return; }
                                 let address = if !state.manual_address.is_empty() {
                                     state.manual_address.parse::<SocketAddr>().ok().or_else(|| state.manual_address.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, bridge_core::protocol::PORT)))
@@ -1387,16 +1301,14 @@ mod app {
                             })))
 )
 )
-                    .child(div().flex().gap_2().px_3().py_2()
-                       .child(div().id("workspace-back").p_2().rounded_md().bg(rgb(0x35517a)).cursor_pointer().child("← Screens").on_click(cx.listener(|this,_,_,cx|{
+                    .child(div().flex().flex_wrap().gap_2().px_3().py_2()
+                       .child(Button::new("workspace-back").label("← Screens").primary().small().on_click(cx.listener(|this,_,_,cx|{
                           if let Ok(mut state)=this.state.lock(){state.show_codecs=false;state.show_logs=false;for screen in &mut state.screens{if screen.stats_view.open{screen.stats_view.open=false;let _=this.commands.try_send(Command::Diagnostics(screen.config.screen_id,false));}}}
                           if let Ok(mut ws)=this.workspace.lock(){ws.selected=None;}cx.notify();})))
-                       .child(div().id("workspace-remove").p_2().rounded_md().bg(rgb(0x573846)).cursor_pointer().child("Remove local screen").on_click(cx.listener(|this,_,_,cx|{let id=this.workspace.lock().ok().and_then(|ws|ws.selected);if let Some(id)=id{remove_local_screen(&this.workspace,id);}cx.notify();}))))
+                       .child(Button::new("workspace-remove").label("Remove local screen").danger().small().on_click(cx.listener(|this,_,_,cx|{let id=this.workspace.lock().ok().and_then(|ws|ws.selected);if let Some(id)=id{remove_local_screen(&this.workspace,id);}cx.notify();}))))
                     .when(state.connected || state.connecting, |panel| panel.child(
-                        div().id("disconnect").px_4().py_2().rounded_md().bg(rgb(0x573846)).cursor_pointer()
-                            .child(if state.connecting { "Cancel connection" } else { "Disconnect this screen" })
-                            .on_click(cx.listener(|this, _, _, _| { let _ = this.commands.try_send(Command::Disconnect); }))))
-                    .when(!state.connected,|panel|panel.child(div().id("offline-logs-toggle").p_2().cursor_pointer().child(if state.show_logs {"Hide logs"}else{"Show logs"}).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.show_logs=!s.show_logs;}cx.notify();}))))
+                        Button::new("disconnect").label(if state.connecting { "Cancel connection" } else { "Disconnect this screen" }).danger().small().on_click(cx.listener(|this, _, _, _| { let _ = this.commands.try_send(Command::Disconnect); }))))
+                    .when(!state.connected,|panel|panel.child(Button::new("offline-logs-toggle").label(if state.show_logs {"Hide logs"}else{"Show logs"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.show_logs= !s.show_logs;}cx.notify();}))))
                     .when(!state.connected && state.show_logs,|panel|panel.child(div().id("offline-logs").h(px(150.)).overflow_y_scroll().p_2().children(state.diagnostics.recent().into_iter().map(|line|div().text_sm().child(line)))))
                     .child(screen_list_panel)
                     .child(stream_details_panel))
@@ -1405,48 +1317,121 @@ mod app {
     }
 
     impl ViewerView {
-        fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        fn new(
+            workspace: Arc<Mutex<Workspace>>,
+            state: Arc<Mutex<State>>,
+            commands: mpsc::Sender<Command>,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            let inputs = [
+                cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.10 or IP:port")),
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("123456")
+                        .masked(true)
+                        .validate(|value, _| {
+                            value.len() <= 6 && value.bytes().all(|b| b.is_ascii_digit())
+                        })
+                }),
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("1")
+                        .validate(|value, _| {
+                            value.len() <= 10 && value.bytes().all(|b| b.is_ascii_digit())
+                        })
+                }),
+            ];
+            let subscriptions = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    cx.subscribe_in(input, window, move |this, input, event, _, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            let value = input.read(cx).value().to_string();
+                            this.input_values[index] = value.clone();
+                            if let Ok(mut state) = this.state.lock() {
+                                match index {
+                                    0 => state.manual_address = value,
+                                    1 => state.pin = value,
+                                    _ => {
+                                        state.target_screen = value.parse::<u32>().unwrap_or(0);
+                                        state.target_input = value;
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        }
+                    })
+                })
+                .collect();
+            let mut this = Self {
+                workspace,
+                catalog: state.clone(),
+                state,
+                commands,
+                inputs,
+                input_owner: None,
+                input_values: Default::default(),
+                _input_subscriptions: subscriptions,
+            };
+            this.refresh(window, cx);
+            this
+        }
+
+        fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if let Ok(mut ws) = self.workspace.lock() {
+                ws.retiring.retain(|e| {
+                    let finished = e
+                        .thread
+                        .lock()
+                        .map(|t| t.as_ref().is_none_or(|t| t.is_finished()))
+                        .unwrap_or(true);
+                    if finished {
+                        if let Some(t) = e.thread.lock().ok().and_then(|mut t| t.take()) {
+                            let _ = t.join();
+                        }
+                    }
+                    !finished
+                });
+            }
+
+            let entry = self.workspace.lock().ok().and_then(|ws| {
+                ws.entries
+                    .iter()
+                    .find(|e| Some(e.id) == ws.selected)
+                    .cloned()
+            });
+            if let Some(entry) = entry {
+                let owner_changed = self.input_owner != Some(entry.id);
+                self.state = entry.state;
+                self.commands = entry.commands;
+                self.input_owner = Some(entry.id);
+                let values = self
+                    .state
+                    .lock()
+                    .map(|s| {
+                        [
+                            s.manual_address.clone(),
+                            s.pin.clone(),
+                            s.target_input.clone(),
+                        ]
+                    })
+                    .unwrap_or_default();
+                for (index, value) in values.into_iter().enumerate() {
+                    if owner_changed || self.input_values[index] != value {
+                        self.inputs[index]
+                            .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                        self.input_values[index] = value;
+                    }
+                }
+            } else {
+                self.input_owner = None;
+            }
             if let Ok(mut state) = self.state.lock() {
-                if state.connected || state.connecting {
-                    return;
-                }
-                if state.edit_target {
-                    if event.keystroke.key == "backspace" {
-                        state.target_input.pop();
-                    } else if let Some(character) = &event.keystroke.key_char {
-                        if character.len() == 1
-                            && character.bytes().all(|b| b.is_ascii_digit())
-                            && state.target_input.len() < 10
-                        {
-                            state.target_input.push_str(character);
-                        }
-                    }
-                    if let Ok(id) = state.target_input.parse::<u32>() {
-                        state.target_screen = id;
-                    }
-                    cx.notify();
-                    return;
-                }
-                let editing_address = state.edit_address;
-                let value = if editing_address {
-                    &mut state.manual_address
-                } else {
-                    &mut state.pin
-                };
-                if event.keystroke.key == "backspace" {
-                    value.pop();
-                } else if editing_address {
-                    if let Some(character) = &event.keystroke.key_char {
-                        if character.len() == 1 && value.len() < 64 {
-                            value.push_str(character);
-                        }
-                    }
-                } else if let Some(character) = &event.keystroke.key_char {
-                    if character.len() == 1
-                        && character.bytes().all(|b| b.is_ascii_digit())
-                        && value.len() < 6
-                    {
-                        value.push_str(character);
+                for screen in &mut state.screens {
+                    if screen.stats_view.open {
+                        screen.stats_view.refresh(&screen.telemetry);
                     }
                 }
             }
@@ -1459,7 +1444,7 @@ mod app {
         workspace: Arc<Mutex<Workspace>>,
         state: Arc<Mutex<State>>,
         commands: mpsc::Sender<Command>,
-    ) -> Result<WindowHandle<ViewerView>> {
+    ) -> Result<AnyWindowHandle> {
         let widget_size = size(px(400.0), px(540.0));
         let bounds = cx
             .primary_display()
@@ -1474,34 +1459,38 @@ mod app {
                 )
             })
             .unwrap_or_else(|| Bounds::centered(None, widget_size, cx));
-        let handle = cx.open_window(
+        let (handle, _) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
                 window_decorations: Some(WindowDecorations::Client),
                 window_min_size: Some(size(px(330.0), px(300.0))),
                 app_id: Some("airbridge-viewer".into()),
-                ..Default::default()
+                ..TitleBar::window_options()
             },
+            cx,
             |window, cx| {
                 window.set_window_title("AirBridge Controls");
-                let focus = cx.focus_handle();
-                window.focus(&focus);
-                let view = cx.new(|_| ViewerView {
-                    workspace,
-                    catalog: state.clone(),
-                    state,
-                    commands,
-                    focus,
-                    rendered: false,
-                });
+                let view = cx.new(|cx| ViewerView::new(workspace, state, commands, window, cx));
+                let controls_id = window.window_handle().window_id();
+                cx.on_window_closed(move |cx, closed_id| {
+                    if closed_id == controls_id {
+                        cx.quit();
+                    }
+                })
+                .detach();
+                let window_handle = window.window_handle();
                 let weak = view.downgrade();
                 cx.spawn(async move |cx| {
                     loop {
                         cx.background_executor()
                             .timer(Duration::from_millis(250))
                             .await;
-                        if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                        if window_handle
+                            .update(cx, |_, window, cx| {
+                                weak.update(cx, |this, cx| this.refresh(window, cx))
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -2517,12 +2506,10 @@ mod app {
             selected_host: 0,
             target_screen: 1,
             target_input: "1".into(),
-            edit_target: false,
             host_identity: String::new(),
             viewer_identity: 0,
             pin: String::new(),
             manual_address: String::new(),
-            edit_address: false,
             settings: presets[1].settings.clone(),
             override_host: false,
             screens: Vec::new(),
@@ -2587,27 +2574,31 @@ mod app {
         });
         let app_shutdown = shutdown.clone();
         let app_workspace = workspace.clone();
-        Application::new().run(move |cx: &mut App| {
-            cx.on_app_quit(move |_| {
-                let _ = app_shutdown.send(true);
-                async {}
-            })
-            .detach();
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let controls = open_controls(cx, app_workspace.clone(), state.clone(), send.clone())
-                .expect("Cannot open AirBridge controls");
-            let _ = controls;
-            state.lock().unwrap().diagnostics.record(
-                "viewer",
-                "Independent native video window and GPUI controls opened",
-            );
-            cx.activate(true);
-        });
+        gpui_kit::application()
+            .with_assets(gpui_kit::assets::Assets)
+            .run(move |cx: &mut App| {
+                gpui_kit::init(cx);
+                cx.on_app_quit(move |_| {
+                    let _ = app_shutdown.send(true);
+                    async {}
+                })
+                .detach();
+                cx.on_window_closed(|cx, _| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+                let controls =
+                    open_controls(cx, app_workspace.clone(), state.clone(), send.clone())
+                        .expect("Cannot open AirBridge controls");
+                let _ = controls;
+                state.lock().unwrap().diagnostics.record(
+                    "viewer",
+                    "Independent native video window and GPUI controls opened",
+                );
+                cx.activate(true);
+            });
         let _ = shutdown.send(true);
         let entries = workspace
             .lock()
@@ -2739,6 +2730,115 @@ mod app {
             assert!(state.screens[0].terminal);
             assert!(*state.screens[0].cancel.borrow());
             assert_eq!(state.screens[0].status, "Capture failed");
+        }
+
+        #[gpui_kit::test]
+        fn kit_inputs_edit_and_keep_each_screens_draft(cx: &mut gpui_kit::TestAppContext) {
+            use gpui_kit::test::TestWindowExt;
+            let first = Arc::new(Mutex::new(initial_state(built_in_presets())));
+            let second = Arc::new(Mutex::new(initial_state(built_in_presets())));
+            second.lock().unwrap().pin = "654321".into();
+            let (commands, _receiver) = mpsc::channel(16);
+            let entry = |id, state: Arc<Mutex<State>>| LocalScreen {
+                id,
+                state,
+                commands: commands.clone(),
+                shutdown: watch::channel(false).0,
+                thread: Arc::new(Mutex::new(None)),
+            };
+            let workspace = Arc::new(Mutex::new(Workspace {
+                entries: vec![entry(1, first.clone()), entry(2, second.clone())],
+                selected: Some(1),
+                ..Default::default()
+            }));
+            cx.update(gpui_kit::init);
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        ViewerView::new(workspace.clone(), first.clone(), commands, window, cx)
+                    })
+                })
+                .unwrap()
+            });
+            handle
+                .update(cx, |_, window, cx| {
+                    window.render_frame(cx);
+                    let input = view.read(cx).inputs[1].clone();
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    window.input("123456", cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(first.lock().unwrap().pin, "123456");
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("112233".into()));
+            handle
+                .update(cx, |_, window, cx| {
+                    window.press(
+                        if cfg!(target_os = "macos") {
+                            "cmd-a"
+                        } else {
+                            "ctrl-a"
+                        },
+                        cx,
+                    );
+                    window.press(
+                        if cfg!(target_os = "macos") {
+                            "cmd-v"
+                        } else {
+                            "ctrl-v"
+                        },
+                        cx,
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(first.lock().unwrap().pin, "112233");
+            handle
+                .update(cx, |_, window, cx| window.input("a", cx))
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                first.lock().unwrap().pin,
+                "112233",
+                "PIN validation rejects non-digits"
+            );
+            workspace.lock().unwrap().selected = Some(2);
+            handle
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| this.refresh(window, cx))
+                })
+                .unwrap();
+            cx.read(|cx| assert_eq!(view.read(cx).inputs[1].read(cx).value().as_ref(), "654321"));
+            workspace.lock().unwrap().selected = Some(1);
+            handle
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| this.refresh(window, cx))
+                })
+                .unwrap();
+            cx.read(|cx| assert_eq!(view.read(cx).inputs[1].read(cx).value().as_ref(), "112233"));
+            handle
+                .update(cx, |_, window, cx| {
+                    let input = view.read(cx).inputs[0].clone();
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    window.input("192.168.1.5", cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(first.lock().unwrap().manual_address, "192.168.1.5");
+            handle
+                .update(cx, |_, window, cx| {
+                    window.press("left", cx);
+                    view.update(cx, |this, cx| this.refresh(window, cx));
+                    window.input("0", cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                first.lock().unwrap().manual_address,
+                "192.168.1.05",
+                "periodic refresh must not reset the caret"
+            );
+            assert!(second.lock().unwrap().manual_address.is_empty());
         }
         #[tokio::test]
         async fn completed_media_task_is_not_polled_again_during_cleanup() {
