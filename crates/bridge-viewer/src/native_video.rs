@@ -33,6 +33,7 @@ const MAX_FRAME_PIXELS: u64 = 7680 * 4320;
 
 #[derive(Default)]
 pub struct VideoFrame {
+    pub window: bridge_core::sessions::WindowPlacement,
     pub width: u32,
     pub height: u32,
     pub frames: u64,
@@ -200,6 +201,9 @@ impl VideoWindow {
             .recv()
             .context("Native display cleanup acknowledgement cancelled")
     }
+    pub fn restore_window(&self, placement: bridge_core::sessions::WindowPlacement) -> Result<()> {
+        self.send_event(VideoEvent::Placement(self.id, placement))
+    }
     pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
         let epoch = self.epoch.advance();
         self.send_input(VideoInput::Reset {
@@ -295,6 +299,7 @@ enum VideoEvent {
     },
     Wake,
     Show(u64),
+    Placement(u64, bridge_core::sessions::WindowPlacement),
     Close(u64, Option<mpsc::Sender<()>>),
     Shutdown,
 }
@@ -417,6 +422,16 @@ impl VideoApp {
             }
         };
         self.window = Some(window.clone());
+        if let Ok(mut target) = self.target.lock() {
+            let size = window.inner_size();
+            let position = window.outer_position().ok();
+            target.window = bridge_core::sessions::WindowPlacement {
+                width: size.width,
+                height: size.height,
+                x: position.map(|p| p.x),
+                y: position.map(|p| p.y),
+            };
+        }
 
         let (renderer, adapter_name, engine_start) = match initialize_wgpu_renderer(
             &window,
@@ -732,6 +747,46 @@ impl ApplicationHandler<VideoEvent> for DisplayManager {
                     }
                 }
             }
+            VideoEvent::Placement(id, placement) => {
+                if let Some(app) = self.apps.get(&id) {
+                    if let Some(window) = &app.window {
+                        if placement.width > 0 && placement.height > 0 {
+                            let _ = window.request_inner_size(PhysicalSize::new(
+                                placement.width,
+                                placement.height,
+                            ));
+                        }
+                        if let (Some(x), Some(y)) = (placement.x, placement.y) {
+                            if window.outer_position().is_err() {
+                                app.diagnostics.record("window","Desktop does not support restoring explicit window positions; size was restored");
+                            } else {
+                                let size = window.inner_size();
+                                let visible = window.available_monitors().any(|monitor| {
+                                    let origin = monitor.position();
+                                    let extent = monitor.size();
+                                    i64::from(x) < i64::from(origin.x) + i64::from(extent.width)
+                                        && i64::from(y)
+                                            < i64::from(origin.y) + i64::from(extent.height)
+                                        && i64::from(x) + i64::from(size.width)
+                                            > i64::from(origin.x)
+                                        && i64::from(y) + i64::from(size.height)
+                                            > i64::from(origin.y)
+                                });
+                                let position = if visible {
+                                    winit::dpi::PhysicalPosition::new(x, y)
+                                } else {
+                                    app.diagnostics.record("window","Saved window position is outside connected monitors; using the current monitor");
+                                    window
+                                        .current_monitor()
+                                        .map(|monitor| monitor.position())
+                                        .unwrap_or(winit::dpi::PhysicalPosition::new(0, 0))
+                                };
+                                window.set_outer_position(position);
+                            }
+                        }
+                    }
+                }
+            }
             VideoEvent::Show(id) => {
                 if let Some(window) = self.apps.get(&id).and_then(|app| app.window.as_ref()) {
                     window.set_visible(true);
@@ -792,7 +847,20 @@ impl ApplicationHandler<VideoEvent> for DisplayManager {
             return;
         };
         match event {
+            WindowEvent::Moved(position) => {
+                if let Ok(mut target) = app.target.lock() {
+                    target.window.x = Some(position.x);
+                    target.window.y = Some(position.y);
+                }
+            }
             WindowEvent::Resized(size) => {
+                if size.width > 0 && size.height > 0 {
+                    if let Ok(mut target) = app.target.lock() {
+                        target.window.width = size.width;
+                        target.window.height = size.height;
+                    }
+                }
+
                 if let Some(renderer) = &mut app.renderer {
                     renderer.resize(size);
                 }

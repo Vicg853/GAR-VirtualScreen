@@ -14,7 +14,7 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 pub const MAX_VIEWERS_PER_SCREEN: usize = 8;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
@@ -63,6 +63,12 @@ pub struct ChangeScreenSettingsRequest {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello(ClientHello),
+    SessionHello {
+        hello: ClientHello,
+        viewer_id: String,
+        preferences: crate::sessions::ViewerPreferences,
+    },
+    SessionPreferences(crate::sessions::ViewerPreferences),
     AddScreen(AddScreenRequest),
     ChangeScreenSettings(ChangeScreenSettingsRequest),
     RemoveScreen {
@@ -89,6 +95,12 @@ pub enum ClientMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum HostMessage {
+    PersistentSessionAccepted {
+        contract: crate::sessions::SessionContract,
+        screens: Vec<ScreenConfig>,
+        viewer_id: u64,
+    },
+    SessionUpdated(crate::sessions::SessionContract),
     SessionAccepted {
         host_id: String,
         viewer_id: u64,

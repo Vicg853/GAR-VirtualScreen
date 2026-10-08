@@ -16,7 +16,7 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     // macOS can take longer than QUIC's idle timeout to initialize capture.
     // Keep the authenticated connection alive while there are no media frames.
     config.keep_alive_interval(Some(Duration::from_secs(5)));
-    config.max_concurrent_uni_streams(8u32.into());
+    config.max_concurrent_uni_streams(24u32.into());
     config.max_concurrent_bidi_streams(4u32.into());
     config.stream_receive_window((8u32 * 1024 * 1024).into());
     config.receive_window((16u32 * 1024 * 1024).into());
@@ -140,10 +140,10 @@ fn proof(key: &[u8], binding: &[u8], role: &[u8]) -> Result<[u8; 32]> {
 }
 
 pub async fn authenticate_host(connection: &Connection, pin: &str) -> Result<()> {
+    validate_pin(pin)?;
     authenticate_host_scoped(connection, pin, b"legacy").await
 }
 async fn authenticate_host_scoped(connection: &Connection, pin: &str, scope: &[u8]) -> Result<()> {
-    validate_pin(pin)?;
     let (mut send, mut recv) = connection.accept_bi().await?;
     let (state, outbound) = Spake2::<Ed25519Group>::start_b(
         &Password::new(pin.as_bytes()),
@@ -178,6 +178,7 @@ async fn authenticate_host_scoped(connection: &Connection, pin: &str, scope: &[u
 }
 
 pub async fn authenticate_viewer(connection: &Connection, pin: &str) -> Result<()> {
+    validate_pin(pin)?;
     authenticate_viewer_scoped(connection, pin, b"legacy").await
 }
 async fn authenticate_viewer_scoped(
@@ -185,7 +186,6 @@ async fn authenticate_viewer_scoped(
     pin: &str,
     scope: &[u8],
 ) -> Result<()> {
-    validate_pin(pin)?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let (state, outbound) = Spake2::<Ed25519Group>::start_a(
         &Password::new(pin.as_bytes()),
@@ -232,6 +232,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 struct AuthTarget {
     version: u16,
     screen_id: u32,
+    #[serde(default)]
+    account: Option<SessionLogin>,
 }
 fn screen_scope(id: u32) -> Vec<u8> {
     format!("airbridge/v{}/screen/{id}", crate::protocol::VERSION).into_bytes()
@@ -243,6 +245,9 @@ pub async fn authenticate_host_screen(
 ) -> Result<u32> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let target: AuthTarget = crate::protocol::receive_json(&mut recv).await?;
+    if target.account.is_some() {
+        bail!("Session authentication requires a session-aware host");
+    }
     let pin = if target.version == crate::protocol::VERSION {
         pin_for(target.screen_id)
     } else {
@@ -258,9 +263,11 @@ pub async fn authenticate_host_screen(
     crate::protocol::send_json(&mut send, &rejection).await?;
     send.finish()?;
     let pin = pin.ok_or_else(|| anyhow!("Screen unavailable or protocol version mismatch"))?;
+    validate_pin(&pin)?;
     authenticate_host_scoped(connection, &pin, &screen_scope(target.screen_id)).await?;
     Ok(target.screen_id)
 }
+
 pub async fn authenticate_viewer_screen(
     connection: &Connection,
     pin: &str,
@@ -273,6 +280,7 @@ pub async fn authenticate_viewer_screen(
         &AuthTarget {
             version: crate::protocol::VERSION,
             screen_id,
+            account: None,
         },
     )
     .await?;
@@ -283,4 +291,133 @@ pub async fn authenticate_viewer_screen(
         bail!("Host rejected screen selection: {reason:?}");
     }
     authenticate_viewer_scoped(connection, pin, &screen_scope(screen_id)).await
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionLogin {
+    pub username: String,
+    pub session_id: Option<String>,
+    pub host_id: Option<String>,
+    pub viewer_id: String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionSelection {
+    host_id: String,
+    session_id: String,
+    salt: [u8; 16],
+}
+pub enum AuthenticatedTarget {
+    Screen(u32),
+    Session {
+        session_id: String,
+        viewer_id: String,
+    },
+}
+fn session_scope(host: &str, session: &str, viewer: &str) -> Vec<u8> {
+    format!(
+        "airbridge/v{}/host/{host}/session/{session}/viewer/{viewer}",
+        crate::protocol::VERSION
+    )
+    .into_bytes()
+}
+pub async fn authenticate_host_target(
+    connection: &Connection,
+    pin_for: impl Fn(u32) -> Option<String>,
+    session_for: impl Fn(&SessionLogin) -> Option<crate::sessions::HostSession>,
+) -> Result<AuthenticatedTarget> {
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    let target: AuthTarget = crate::protocol::receive_json(&mut recv).await?;
+    if target.version != crate::protocol::VERSION {
+        bail!("Protocol version mismatch");
+    }
+    if let Some(login) = target.account {
+        if login.username.len() > 64 || !crate::sessions::valid_id(&login.viewer_id) {
+            bail!("Invalid session login");
+        }
+        let session = session_for(&login).filter(|s| {
+            s.contract.username == login.username
+                && login
+                    .host_id
+                    .as_ref()
+                    .is_none_or(|host| *host == s.contract.host_id)
+                && login
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session| *session == s.contract.session_id)
+        });
+        let selection = session.as_ref().map(|s| SessionSelection {
+            host_id: s.contract.host_id.clone(),
+            session_id: s.contract.session_id.clone(),
+            salt: s.salt,
+        });
+        crate::protocol::send_json(&mut send, &selection).await?;
+        send.finish()?;
+        let session = session.ok_or_else(|| anyhow!("Account or session unavailable"))?;
+        let scope = session_scope(
+            &session.contract.host_id,
+            &session.contract.session_id,
+            &login.viewer_id,
+        );
+        authenticate_host_scoped(connection, &session.key.0, &scope).await?;
+        Ok(AuthenticatedTarget::Session {
+            session_id: session.contract.session_id,
+            viewer_id: login.viewer_id,
+        })
+    } else {
+        let pin = pin_for(target.screen_id);
+        let rejection = pin
+            .is_none()
+            .then_some(crate::failure::FailureCode::ScreenUnavailable);
+        crate::protocol::send_json(&mut send, &rejection).await?;
+        send.finish()?;
+        let pin = pin.ok_or_else(|| anyhow!("Screen unavailable"))?;
+        validate_pin(&pin)?;
+        authenticate_host_scoped(connection, &pin, &screen_scope(target.screen_id)).await?;
+        Ok(AuthenticatedTarget::Screen(target.screen_id))
+    }
+}
+pub async fn authenticate_viewer_session(
+    connection: &Connection,
+    login: &SessionLogin,
+    password: &str,
+    remembered: Option<&crate::sessions::Secret>,
+) -> Result<(String, crate::sessions::Secret)> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    crate::protocol::send_json(
+        &mut send,
+        &AuthTarget {
+            version: crate::protocol::VERSION,
+            screen_id: 0,
+            account: Some(login.clone()),
+        },
+    )
+    .await?;
+    send.finish()?;
+    let selection: Option<SessionSelection> = crate::protocol::receive_json(&mut recv).await?;
+    let selection = selection.ok_or_else(|| anyhow!("Account or session unavailable"))?;
+    if !crate::sessions::valid_id(&selection.host_id)
+        || !crate::sessions::valid_id(&selection.session_id)
+        || login
+            .host_id
+            .as_ref()
+            .is_some_and(|h| *h != selection.host_id)
+        || login
+            .session_id
+            .as_ref()
+            .is_some_and(|s| *s != selection.session_id)
+    {
+        bail!("Session identity mismatch");
+    }
+    let key = if let Some(key) = remembered {
+        key.clone()
+    } else {
+        crate::sessions::validate_login(&login.username, password)?;
+        let password = crate::sessions::Secret(password.to_owned());
+        let salt = selection.salt;
+        tokio::task::spawn_blocking(move || crate::sessions::password_key(&password.0, &salt))
+            .await??
+    };
+    let scope = session_scope(&selection.host_id, &selection.session_id, &login.viewer_id);
+    authenticate_viewer_scoped(connection, &key.0, &scope).await?;
+    Ok((selection.session_id, key))
 }

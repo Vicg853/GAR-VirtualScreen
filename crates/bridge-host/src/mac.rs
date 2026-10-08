@@ -24,6 +24,8 @@ use videotoolbox::{
 };
 
 unsafe extern "C" {
+    fn airbridge_display_position(display_id: u32, x: *mut i32, y: *mut i32) -> bool;
+    fn airbridge_display_set_position(display_id: u32, x: i32, y: i32) -> i32;
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn airbridge_display_create(
@@ -600,4 +602,23 @@ mod ownership_tests {
         assert!(lease.context.is_null());
         lease.stop().unwrap(); // duplicate cleanup has no callback/free
     }
+}
+
+pub(crate) fn display_position(display_id: u32) -> Option<bridge_core::sessions::DisplayPosition> {
+    let (mut x, mut y) = (0, 0);
+    if unsafe { airbridge_display_position(display_id, &mut x, &mut y) } {
+        Some(bridge_core::sessions::DisplayPosition { x, y })
+    } else {
+        None
+    }
+}
+pub(crate) fn restore_display_position(
+    display_id: u32,
+    position: bridge_core::sessions::DisplayPosition,
+) -> Result<()> {
+    let code = unsafe { airbridge_display_set_position(display_id, position.x, position.y) };
+    if code != 0 {
+        bail!("CoreGraphics display arrangement error {code}");
+    }
+    Ok(())
 }

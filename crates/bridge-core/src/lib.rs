@@ -13,3 +13,6 @@ pub mod failure;
 pub mod worker;
 
 pub mod fanout;
+
+pub mod power;
+pub mod sessions;

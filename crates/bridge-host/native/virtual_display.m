@@ -186,3 +186,19 @@ bool airbridge_video_stream_stop(void *stream) {
     CFBridgingRelease(stream);
     return true;
 }
+
+// Session arrangement belongs to the source host, never to a viewer window.
+bool airbridge_display_position(uint32_t display_id, int32_t *x, int32_t *y) {
+    if (!CGDisplayIsOnline(display_id)) return false;
+    CGRect bounds = CGDisplayBounds(display_id);
+    *x = (int32_t)bounds.origin.x; *y = (int32_t)bounds.origin.y;
+    return true;
+}
+int32_t airbridge_display_set_position(uint32_t display_id, int32_t x, int32_t y) {
+    CGDisplayConfigRef config = NULL;
+    CGError error = CGBeginDisplayConfiguration(&config);
+    if (error != kCGErrorSuccess) return error;
+    error = CGConfigureDisplayOrigin(config, display_id, x, y);
+    if (error != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); return error; }
+    return CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+}

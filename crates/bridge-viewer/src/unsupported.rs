@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct VideoFrame {
+    pub window: bridge_core::sessions::WindowPlacement,
     pub width: u32,
     pub height: u32,
     pub frames: u64,
@@ -77,6 +78,12 @@ impl VideoWindow {
         Ok(())
     }
 
+    pub async fn restore_window(
+        &self,
+        _placement: bridge_core::sessions::WindowPlacement,
+    ) -> Result<()> {
+        Ok(())
+    }
     pub async fn reset(&mut self, _width: u32, _height: u32) -> Result<()> {
         bail!("{}", self.message)
     }

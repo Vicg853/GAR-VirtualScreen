@@ -4,7 +4,7 @@ mod service {
     use bridge_core::config::{Acceleration, Codec as BridgeCodec};
     use bridge_core::{
         failure::{Failure, FailureCode, FailureScope},
-        security::authenticate_host_screen,
+        security::{authenticate_host_target, AuthenticatedTarget},
     };
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
@@ -59,6 +59,7 @@ mod service {
         ),
     }
     enum NativeEvent {
+        Display(u32),
         Prepared(Result<()>),
         Ended(Result<()>),
         Progress(String),
@@ -80,15 +81,7 @@ mod service {
             }
         }
     }
-    fn pin_for(shared: &Arc<Mutex<State>>, id: u32) -> Option<String> {
-        shared
-            .lock()
-            .ok()?
-            .screens
-            .iter()
-            .find(|s| s.screen_id == id && !s.removing)
-            .map(|s| s.pin.clone())
-    }
+    fn pin_for(shared:&Arc<Mutex<State>>,id:u32)->Option<String>{let s=shared.lock().ok()?;if s.sessions.sessions.iter().any(|session|session.contract.screens.iter().any(|screen|screen.screen_id==id)){return None;}s.screens.iter().find(|s|s.screen_id==id&&!s.removing).map(|s|s.pin.clone())}
     fn config(shared: &Arc<Mutex<State>>, id: u32) -> Result<ScreenConfig> {
         let state = shared
             .lock()
@@ -193,6 +186,7 @@ mod service {
     fn native_worker(
         id: u32,
         settings: VideoSettings,
+        position:Option<bridge_core::sessions::DisplayPosition>,
         rx: native_mpsc::Receiver<NativeCommand>,
         events: mpsc::Sender<NativeEvent>,
     ) {
@@ -209,6 +203,8 @@ mod service {
                 owner.update(settings)?;
             } else {
                 *display = Some(mac::VirtualDisplay::new(settings)?);
+                if let Some((_,display_id))=display{let _=events.blocking_send(NativeEvent::Display(*display_id));if let Some(position)=position{if let Err(error)=mac::restore_display_position(*display_id,position){let _=events.blocking_send(NativeEvent::Progress(format!("Display arrangement restoration unavailable: {error}")));}}}
+
             }
             Ok(())
         };
@@ -275,9 +271,11 @@ mod service {
         // display drops only here, after capture has returned and callbacks stopped.
     }
     #[cfg(test)]
+    #[allow(unused_variables)]
     fn native_worker(
         id: u32,
         _settings: VideoSettings,
+        _position:Option<bridge_core::sessions::DisplayPosition>,
         rx: native_mpsc::Receiver<NativeCommand>,
         events: mpsc::Sender<NativeEvent>,
     ) {
@@ -460,7 +458,8 @@ mod service {
         let (native_tx, native_rx) = native_mpsc::sync_channel::<NativeCommand>(2);
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let settings = screen.settings.clone();
-        let native = std::thread::spawn(move || native_worker(id, settings, native_rx, event_tx));
+        let position=shared.lock().ok().and_then(|s|s.screens.iter().find(|s|s.screen_id==id).and_then(|s|s.display_position));
+        let native = std::thread::spawn(move || native_worker(id, settings, position, native_rx, event_tx));
         let (packet_tx, mut packet_rx) = mpsc::channel::<Arc<mac::EncodedPacket>>(4);
         let mut peers = HashMap::<u64, Peer>::new();
         let mut running = false;
@@ -617,6 +616,7 @@ mod service {
                     Some(ScreenCommand::Remove)|None=>{if let Ok(mut state)=shared.lock(){if let Some(s)=state.screens.iter_mut().find(|s|s.screen_id==id){s.removing=true;s.status="Stopping capture and removing display…".into();}}removed=true;stop.store(true,Ordering::Release);notify(&mut peers,HostMessage::ScreenRemoved{request_id:None,screen_id:id});peers.clear();if !running{break;}}
                 },
                 event=event_rx.recv()=>match event{
+                    Some(NativeEvent::Display(display_id))=>{if let Ok(mut s)=shared.lock(){if let Some(screen)=s.screens.iter_mut().find(|s|s.screen_id==id){screen.display_id=Some(display_id);}}}
                     Some(NativeEvent::Prepared(result))=>{match result{Ok(())=>{if !running{set_screen_message(&shared,id,"Prepared · waiting for viewers");}},Err(error)=>{let detail=format!("{error:#}");last_failure=Some(detail.clone());set_screen_message(&shared,id,&detail);if !peers.is_empty(){notify(&mut peers,failure(&screen,detail));}}}}
                     Some(NativeEvent::Progress(message))=>{set_screen_generation_message(&shared,id,screen.generation,&message);notify(&mut peers,HostMessage::StreamStatus{screen_id:id,generation:screen.generation,lane:MediaLane::Video,state:MediaState::WaitingForFirstFrame,message});}
                     Some(NativeEvent::Ended(result))=>{
@@ -674,83 +674,55 @@ mod service {
         actors: Arc<Mutex<HashMap<u32, ScreenHandle>>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
-        let screen_id = tokio::time::timeout(
-            Duration::from_secs(12),
-            authenticate_host_screen(&connection, |id| pin_for(&shared, id)),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Authentication timed out"))??;
-        let actor = actors
-            .lock()
-            .ok()
-            .and_then(|a| a.get(&screen_id).cloned())
-            .ok_or_else(|| anyhow::anyhow!("Screen removed during authentication"))?;
-        let (mut send, mut recv) =
-            tokio::time::timeout(Duration::from_secs(8), connection.accept_bi()).await??;
-        let hello: ClientMessage =
-            tokio::time::timeout(Duration::from_secs(8), receive_json(&mut recv)).await??;
-        let ClientMessage::Hello(hello) = hello else {
-            bail!("Expected greeting")
+        let authenticated=tokio::time::timeout(Duration::from_secs(20),authenticate_host_target(&connection,|id|pin_for(&shared,id),|login|{
+            shared.lock().ok()?.sessions.sessions.iter().find(|s|s.contract.username==login.username&&login.session_id.as_ref().is_none_or(|id|*id==s.contract.session_id)&&login.host_id.as_ref().is_none_or(|id|*id==s.contract.host_id)).cloned()
+        })).await.map_err(|_|anyhow::anyhow!("Authentication timed out"))??;
+        let(session_id,stable_viewer,screen_ids)=match authenticated {
+            AuthenticatedTarget::Screen(id)=>(None,None,vec![id]),
+            AuthenticatedTarget::Session{session_id,viewer_id}=>{
+                let ids=shared.lock().ok().and_then(|s|s.sessions.sessions.iter().find(|s|s.contract.session_id==session_id).map(|s|s.contract.screens.iter().map(|s|s.screen_id).collect())).ok_or_else(||anyhow::anyhow!("Session removed"))?;
+                (Some(session_id),Some(viewer_id),ids)
+            }
         };
-        if hello.version != VERSION {
-            bail!("Protocol mismatch")
-        }
-        let (controls, mut outgoing) = mpsc::channel(64);
-        let (reply, accepted) = oneshot::channel();
-        actor
-            .tx
-            .send(ScreenCommand::Join {
-                id,
-                connection: connection.clone(),
-                codecs: hello.codecs,
-                controls,
-                reply,
-            })
-            .await?;
-        let screen = accepted.await??;
-        if let Some(settings) = hello.initial_settings {
-            let _ = actor
-                .tx
-                .send(ScreenCommand::Settings {
-                    peer: Some(id),
-                    request: None,
-                    settings,
-                    revision: None,
-                })
-                .await;
-        }
-
-        let accepted_message = HostMessage::SessionAccepted {
-            host_id,
-            viewer_id: id,
-            screen,
+        let(mut send,mut recv)=tokio::time::timeout(Duration::from_secs(8),connection.accept_bi()).await??;
+        let greeting:ClientMessage=tokio::time::timeout(Duration::from_secs(8),receive_json(&mut recv)).await??;
+        let (hello,preferences)=match greeting {
+            ClientMessage::Hello(hello) if session_id.is_none()=>(hello,None),
+            ClientMessage::SessionHello{hello,viewer_id,preferences} if Some(&viewer_id)==stable_viewer.as_ref()=>{preferences.validate()?;(hello,Some(preferences))},
+            _=>bail!("Invalid authenticated session greeting"),
         };
-        if let Err(error) = send_control(&mut send, &accepted_message).await {
-            let _ = actor.tx.send(ScreenCommand::Leave(id)).await;
-            return Err(error);
+        if hello.version!=VERSION{bail!("Protocol mismatch");}
+        if let (Some(session_id),Some(viewer),Some(mut preferences))=(&session_id,&stable_viewer,preferences){
+            let mut state=shared.lock().map_err(|_|anyhow::anyhow!("Host state unavailable"))?;
+            let session=state.sessions.sessions.iter_mut().find(|s|s.contract.session_id==*session_id).ok_or_else(||anyhow::anyhow!("Session removed"))?;
+            preferences.screens.retain(|p|session.contract.screens.iter().any(|screen|screen.screen_id==p.screen_id));
+            session.viewers.retain(|v|v.viewer_id!=*viewer);if session.viewers.len()>=128 {bail!("Registered viewer limit reached");}
+            session.viewers.push(bridge_core::sessions::ViewerRegistration{viewer_id:viewer.clone(),preferences});
         }
+        let(controls,mut outgoing)=mpsc::channel(64);
+        let mut attached=HashMap::<u32,ScreenHandle>::new();let mut screens=Vec::new();
+        let candidates=screen_ids.iter().map(|id|get_actor(&actors,*id).map(|actor|(*id,actor)).ok_or_else(||anyhow::anyhow!("Screen removed during authentication"))).collect::<Result<Vec<_>>>()?;
+        for (screen_id,actor) in candidates {
+            let(reply,accepted)=oneshot::channel();
+            let result=async{actor.tx.send(ScreenCommand::Join{id,connection:connection.clone(),codecs:hello.codecs.clone(),controls:controls.clone(),reply}).await?;Ok::<_,anyhow::Error>(accepted.await??)}.await;
+            match result {Ok(screen)=>{attached.insert(screen_id,actor);screens.push(screen);},Err(error)=>{for actor in attached.values(){let _=actor.tx.send(ScreenCommand::Leave(id)).await;}return Err(error);}}
+        }
+        if session_id.is_none(){if let Some(settings)=hello.initial_settings{if let Some(actor)=attached.values().next(){let _=actor.tx.send(ScreenCommand::Settings{peer:Some(id),request:None,settings,revision:None}).await;}}}
+        let accepted_message=if let Some(session_id)=&session_id {
+            let contract=shared.lock().ok().and_then(|s|s.sessions.sessions.iter().find(|s|s.contract.session_id==*session_id).map(|s|s.contract.clone())).ok_or_else(||anyhow::anyhow!("Session removed"))?;
+            HostMessage::PersistentSessionAccepted{contract,screens,viewer_id:id}
+        }else{HostMessage::SessionAccepted{host_id,viewer_id:id,screen:screens.remove(0)}};
+        if let Err(error)=send_control(&mut send,&accepted_message).await{for actor in attached.values(){let _=actor.tx.send(ScreenCommand::Leave(id)).await;}return Err(error);}
         let diagnostics_shared = shared.clone();
         let diagnostics_send = tokio::spawn(bridge_core::telemetry_transport::send_batches(
             connection.clone(),
             move || {
-                diagnostics_shared
-                    .lock()
-                    .ok()
-                    .and_then(|s| {
-                        s.screens
-                            .iter()
-                            .find(|s| s.screen_id == screen_id)
-                            .and_then(|screen| {
-                                screen.viewers.iter().find(|p| p.id == id).map(|p| {
-                                    vec![(screen_id, screen.generation, p.telemetry.clone())]
-                                })
-                            })
-                    })
-                    .unwrap_or_default()
+                diagnostics_shared.lock().map(|s|s.screens.iter().filter_map(|screen|screen.viewers.iter().find(|p|p.id==id).map(|peer|(screen.screen_id,screen.generation,peer.telemetry.clone()))).collect()).unwrap_or_default()
             },
         ));
         let diagnostics_connection = connection.clone();
         let diagnostics_state = shared.clone();
+
         let diagnostics_receive = tokio::spawn(async move {
             while let Ok(mut stream) = diagnostics_connection.accept_uni().await {
                 let hello: Result<MediaStreamHello> =
@@ -763,14 +735,12 @@ mod service {
                     continue;
                 }
                 let state = diagnostics_state.clone();
+
                 let _ =
                     bridge_core::telemetry_transport::receive_batches(stream, move |batch| {
-                        if batch.screen_id != screen_id {
-                            return;
-                        }
                         if let Ok(s) = state.lock() {
                             if let Some(screen) = s.screens.iter().find(|s| {
-                                s.screen_id == screen_id && s.generation == batch.generation
+                                s.screen_id == batch.screen_id && s.generation == batch.generation
                             }) {
                                 if let Some(peer) = screen.viewers.iter().find(|p| p.id == id) {
                                     peer.telemetry.peer_lost(batch.lost_events);
@@ -788,18 +758,48 @@ mod service {
             }
         });
         let (mut incoming, reader) = control_reader::<_, ClientMessage>(recv);
+        let mut contract_timer=tokio::time::interval(Duration::from_secs(1));
+        let mut last_contract=String::new();
+        let mut detached=std::collections::HashSet::new();
         let result:Result<()>=async{loop{tokio::select!{
             _=shutdown.changed()=>break,
             _=connection.closed()=>break,
-            message=outgoing.recv()=>{let Some(message)=message else{break};let removed=matches!(message,HostMessage::ScreenRemoved{..});tokio::time::timeout(Duration::from_secs(3),send_control(&mut send,&message)).await??;if removed{break;}}
+            _=contract_timer.tick(),if session_id.is_some()=>{
+                let contract=shared.lock().ok().and_then(|s|s.sessions.sessions.iter().find(|s|Some(&s.contract.session_id)==session_id.as_ref()).map(|s|s.contract.clone()));
+                let Some(contract)=contract else {bail!("Session deleted");};
+                let snapshot=bridge_core::sessions::contract_snapshot(&contract)?;
+                if snapshot!=last_contract {
+                    send_control(&mut send,&HostMessage::SessionUpdated(contract.clone())).await?;
+                    let mut new_screens=Vec::new();
+                    for saved in &contract.screens {if !attached.contains_key(&saved.screen_id)&&!detached.contains(&saved.screen_id){
+                        if let Some(actor)=get_actor(&actors,saved.screen_id){let(reply,accepted)=oneshot::channel();actor.tx.send(ScreenCommand::Join{id,connection:connection.clone(),codecs:hello.codecs.clone(),controls:controls.clone(),reply}).await?;
+                            let screen=accepted.await??;attached.insert(saved.screen_id,actor);new_screens.push(screen);
+                        }
+                    }}
+                    for screen in new_screens{send_control(&mut send,&HostMessage::ScreenAdded{request_id:None,screen}).await?;}
+                    let removed=attached.keys().copied().filter(|id|!contract.screens.iter().any(|s|s.screen_id==*id)).collect::<Vec<_>>();
+                    for screen_id in removed{if let Some(actor)=attached.remove(&screen_id){let _=actor.tx.send(ScreenCommand::Leave(id)).await;}send_control(&mut send,&HostMessage::ScreenRemoved{request_id:None,screen_id}).await?;}
+                    last_contract=snapshot;
+                }
+            }
+            message=outgoing.recv()=>{let Some(message)=message else{break};let removed=match &message{HostMessage::ScreenRemoved{screen_id,..}=>Some(*screen_id),_=>None};send_control(&mut send,&message).await?;if let Some(screen_id)=removed{attached.remove(&screen_id);if session_id.is_none(){break;}}}
             message=incoming.recv()=>match message{
-                Some(Ok(ClientMessage::ChangeScreenSettings(change))) if change.screen_id==screen_id=>{actor.tx.send(ScreenCommand::Settings{peer:Some(id),request:Some(change.request_id),settings:change.settings,revision:Some(change.revision)}).await?;}
-                Some(Ok(ClientMessage::Diagnostics{screen_id:target,enabled})) if target==screen_id=>{actor.tx.send(ScreenCommand::Diagnostics{peer:Some(id),enabled}).await?;}
-                Some(Ok(ClientMessage::TraceBurst{screen_id:target})) if target==screen_id=>{actor.tx.send(ScreenCommand::Burst(Some(id))).await?;}
+                Some(Ok(ClientMessage::ChangeScreenSettings(change))) if attached.contains_key(&change.screen_id)=>{attached[&change.screen_id].tx.send(ScreenCommand::Settings{peer:Some(id),request:Some(change.request_id),settings:change.settings,revision:Some(change.revision)}).await?;}
+                Some(Ok(ClientMessage::Diagnostics{screen_id,enabled})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::Diagnostics{peer:Some(id),enabled}).await?;}
+                Some(Ok(ClientMessage::TraceBurst{screen_id})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::Burst(Some(id))).await?;}
                 Some(Ok(ClientMessage::ClockProbe{t1}))=>{let t2=now_us();send_control(&mut send,&HostMessage::ClockReply{t1,t2,t3:now_us()}).await?;}
-                Some(Ok(ClientMessage::VideoStopped{screen_id:target,generation})) if target==screen_id=>{actor.tx.send(ScreenCommand::VideoStopped{id,generation}).await?;}
+                Some(Ok(ClientMessage::VideoStopped{screen_id,generation})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::VideoStopped{id,generation}).await?;}
+                Some(Ok(ClientMessage::SessionPreferences(preferences))) if session_id.is_some()=>{
+                    preferences.validate()?;
+                    let mut s=shared.lock().map_err(|_|anyhow::anyhow!("Host state unavailable"))?;
+                    if let Some(session)=s.sessions.sessions.iter_mut().find(|s|Some(&s.contract.session_id)==session_id.as_ref()){
+                        if preferences.screens.iter().any(|screen|!session.contract.screens.iter().any(|s|s.screen_id==screen.screen_id)){bail!("Viewer preferences target another session");}
+                        if let Some(viewer)=session.viewers.iter_mut().find(|v|Some(&v.viewer_id)==stable_viewer.as_ref()){viewer.preferences=preferences;}
+                    }
+                }
+                Some(Ok(ClientMessage::RemoveScreen{request_id,screen_id})) if attached.contains_key(&screen_id)=>{detached.insert(screen_id);if let Some(actor)=attached.remove(&screen_id){let _=actor.tx.send(ScreenCommand::Leave(id)).await;}send_control(&mut send,&HostMessage::ScreenRemoved{request_id:Some(request_id),screen_id}).await?;}
                 Some(Ok(ClientMessage::Stop))|None=>break,
-                Some(Ok(_))=>{send_control(&mut send,&HostMessage::Error{request_id:None,screen_id:Some(screen_id),message:"This session attaches to one existing host screen; create/remove screens on the host".into()}).await?;}
+                Some(Ok(_))=>{send_control(&mut send,&HostMessage::Error{request_id:None,screen_id:None,message:"Request is outside this session's screens".into()}).await?;}
                 Some(Err(error))=>return Err(error),
             }
         }}Ok(())}.await;
@@ -809,7 +809,7 @@ mod service {
         let _ = diagnostics_receive.await;
         reader.abort();
         let _ = reader.await;
-        let _ = actor.tx.send(ScreenCommand::Leave(id)).await;
+        for actor in attached.values(){let _=actor.tx.send(ScreenCommand::Leave(id)).await;}
         result
     }
     pub(super) fn run(
@@ -821,13 +821,17 @@ mod service {
             .build()?;
         runtime.block_on(async move{
             let endpoint=server_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED),PORT))?;
-            let host_id={use std::io::Read;let mut bytes=[0;16];std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;bytes.iter().map(|b|format!("{b:02x}")).collect::<String>()};
+            let host_id=shared.lock().map_err(|_|anyhow::anyhow!("Host state unavailable"))?.sessions.host_id.clone();
+            let _host_advert=Advertiser::screen(&format!("AirBridge Host {}",&host_id[..8]),0,&host_id).map_err(|e|{set_message(&shared,format!("Host discovery unavailable: {e}"));e}).ok();
             let (ui_tx,mut ui)=mpsc::channel(64);if let Ok(mut s)=shared.lock(){s.session_commands=Some(ui_tx);}
             let actors=Arc::new(Mutex::new(HashMap::<u32,ScreenHandle>::new()));let mut tasks=JoinSet::new();let mut sessions=JoinSet::new();let mut adverts=HashMap::new();let mut next_peer=1u64;let mut admissions=HashMap::<IpAddr,(Instant,u32)>::new();
             let ids=shared.lock().map(|s|s.screens.iter().map(|s|s.screen_id).collect::<Vec<_>>()).unwrap_or_default();
             for id in ids{add_actor(id,&shared,&host_id,&actors,&mut tasks,&mut adverts);}
-            set_message(&shared,"Ready · each screen has its own PIN");
+            set_message(&shared,"Ready · session accounts and temporary screen PINs");
+            let power_state=shared.clone();let power=bridge_core::power::PowerController::new(move|notice|{if let Ok(mut s)=power_state.lock(){s.power_notice=notice;}});
+            let mut power_timer=tokio::time::interval(Duration::from_millis(500));
             loop{tokio::select!{
+                _=power_timer.tick()=>{if let Ok(mut s)=shared.lock(){if let Err(e)=persist_sessions(&mut s){s.message=format!("Session save failed: {e}");}}let active=shared.lock().map(|s|s.sessions.sessions.iter().any(|session|session.contract.keep_awake&&session.contract.screens.iter().any(|saved|s.screens.iter().any(|screen|screen.screen_id==saved.screen_id&&screen.status=="Streaming shared video"&&screen.viewers.iter().any(|peer|peer.status=="Streaming"))))).unwrap_or(false);power.set_active(active);}
                 _=shutdown.changed()=>break,
                 incoming=endpoint.accept()=>{let Some(incoming)=incoming else{break};admissions.retain(|_,(t,_)|t.elapsed()<Duration::from_secs(10));let ip=incoming.remote_address().ip();if !admissions.contains_key(&ip)&&admissions.len()>=128{incoming.refuse();continue;}let limit=admissions.entry(ip).or_insert((Instant::now(),0));if limit.1>=10{incoming.refuse();continue;}limit.1+=1;if sessions.len()>=64{incoming.refuse();continue;}let shared=shared.clone();let actors=actors.clone();let shutdown=shutdown.clone();let host_id=host_id.clone();let id=next_peer;next_peer+=1;sessions.spawn(async move{if let Ok(connection)=incoming.await{if let Err(error)=serve_peer(connection.clone(),id,host_id,shared.clone(),actors,shutdown).await{set_message(&shared,format!("Viewer {id}: {error:#}"));}connection.close(0u32.into(),b"viewer session ended");}});}
                 Some(_)=sessions.join_next()=>{},
@@ -908,6 +912,42 @@ None=>break,
             .unwrap()
         }
 
+        #[tokio::test]
+        async fn persistent_session_authenticates_once_and_detaches_one_screen(){
+            tokio::time::timeout(Duration::from_secs(15),async{
+                let mut state=initial_state(built_in_presets(),"123456".into());let second=add_host_screen(&mut state).unwrap();
+                let saved=state.screens.iter().map(|s|bridge_core::sessions::SavedScreen{position:None,screen_id:s.screen_id,name:s.name.clone(),settings:s.settings.clone()}).collect();
+                let session_id=state.sessions.create("alice".into(),"session-password",saved).unwrap();let host_id=state.sessions.host_id.clone();
+                let shared=Arc::new(Mutex::new(state));assert!(pin_for(&shared,1).is_none());
+                let actors=Arc::new(Mutex::new(HashMap::new()));let mut tasks=Vec::new();
+                for id in [1,second]{let(tx,rx)=mpsc::channel(64);let handle=ScreenHandle{tx};actors.lock().unwrap().insert(id,handle.clone());tasks.push(tokio::spawn(screen_actor(id,shared.clone(),rx,handle)));}
+                let(_h,_c,sender,viewer)=pair().await;let(shutdown,watch)=watch::channel(false);
+                let peer=tokio::spawn(serve_peer(sender,17,host_id.clone(),shared.clone(),actors.clone(),watch));
+                let stable_viewer=bridge_core::sessions::new_id().unwrap();let login=bridge_core::security::SessionLogin{username:"alice".into(),session_id:Some(session_id.clone()),host_id:Some(host_id),viewer_id:stable_viewer.clone()};
+                let(auth_id,key)=bridge_core::security::authenticate_viewer_session(&viewer,&login,"session-password",None).await.unwrap();assert_eq!(auth_id,session_id);assert_eq!(key.0,shared.lock().unwrap().sessions.sessions[0].key.0);
+                let(mut requests,mut replies)=viewer.open_bi().await.unwrap();
+                send_control(&mut requests,&ClientMessage::SessionHello{hello:bridge_core::protocol::ClientHello{version:VERSION,codecs:mac::available_codecs(),initial_settings:None},viewer_id:stable_viewer,preferences:Default::default()}).await.unwrap();
+                let accepted:HostMessage=receive_json(&mut replies).await.unwrap();let HostMessage::PersistentSessionAccepted{screens,contract,..}=accepted else{panic!("wrong acceptance")};assert_eq!(screens.len(),2);assert_eq!(contract.session_id,session_id);
+                send_control(&mut requests,&ClientMessage::RemoveScreen{request_id:44,screen_id:1}).await.unwrap();
+                loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if matches!(message,HostMessage::ScreenRemoved{request_id:Some(44),screen_id:1}){break;}}
+                send_control(&mut requests,&ClientMessage::ClockProbe{t1:987}).await.unwrap();loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if matches!(message,HostMessage::ClockReply{t1:987,..}){break;}}
+                assert!(shared.lock().unwrap().screens.iter().find(|s|s.screen_id==second).unwrap().viewers.iter().any(|v|v.id==17));
+                send_control(&mut requests,&ClientMessage::ChangeScreenSettings(bridge_core::protocol::ChangeScreenSettingsRequest{request_id:55,screen_id:999,revision:1,settings:built_in_presets()[1].settings.clone()})).await.unwrap();
+                loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if matches!(message,HostMessage::Error{..}){break;}}
+                send_control(&mut requests,&ClientMessage::Stop).await.unwrap();peer.await.unwrap().unwrap();shutdown.send_replace(true);
+                let handles=actors.lock().unwrap().values().cloned().collect::<Vec<_>>();for actor in handles{actor.tx.send(ScreenCommand::Remove).await.unwrap();}for task in tasks{task.await.unwrap();}
+            }).await.unwrap();
+        }
+        #[tokio::test]
+        async fn session_password_proof_rejects_wrong_secret_and_resumes_with_remembered_key(){
+            let mut store=bridge_core::sessions::HostStore::new().unwrap();let id=store.create("account".into(),"correct-password",vec![]).unwrap();let session=store.sessions[0].clone();
+            for valid in [false,true]{
+                let(_h,_c,host,viewer)=pair().await;let value=session.clone();let host_auth=tokio::spawn(async move{bridge_core::security::authenticate_host_target(&host,|_|None,move |_|Some(value.clone())).await});
+                let login=bridge_core::security::SessionLogin{username:"account".into(),session_id:Some(id.clone()),host_id:Some(store.host_id.clone()),viewer_id:bridge_core::sessions::new_id().unwrap()};
+                let result=bridge_core::security::authenticate_viewer_session(&viewer,&login,if valid{""}else{"wrong-password"},valid.then_some(&session.key)).await;
+                if valid{assert!(result.is_ok());assert!(matches!(host_auth.await.unwrap().unwrap(),AuthenticatedTarget::Session{..}));}else{assert!(result.is_err());viewer.close(1u32.into(),b"invalid proof");assert!(tokio::time::timeout(Duration::from_secs(2),host_auth).await.unwrap().unwrap().is_err());}
+            }
+        }
         #[tokio::test]
         async fn capture_failure_keeps_authenticated_control_responsive() {
             tokio::time::timeout(Duration::from_secs(10), async {

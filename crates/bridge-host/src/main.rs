@@ -29,6 +29,8 @@ mod app {
     use gpui_kit::component::{
         ActiveTheme, Selectable, Sizable, TitleBar,
         button::{Button, ButtonVariants},
+        form::{Field, Form},
+        input::{Input, InputState},
     };
     use gpui_kit::{
         App, Bounds, Context, MouseButton, ResizeEdge, Window, WindowBounds, WindowDecorations,
@@ -46,6 +48,8 @@ mod app {
 
     #[derive(Clone)]
     struct HostScreen {
+        display_id: Option<u32>,
+        display_position: Option<bridge_core::sessions::DisplayPosition>,
         pin: String,
         viewers: Vec<ViewerPeer>,
         stats_peer: Option<u64>,
@@ -102,6 +106,11 @@ mod app {
         show_codecs: bool,
         show_logs: bool,
         diagnostics: Arc<Diagnostics>,
+        sessions: bridge_core::sessions::HostStore,
+        selected_session: Option<String>,
+        storage_snapshot: String,
+        power_notice: String,
+        show_sessions: bool,
     }
 
     fn set_message(state: &Arc<Mutex<State>>, message: impl Into<String>) {
@@ -180,6 +189,8 @@ mod app {
             }
         };
         state.screens.push(HostScreen {
+            display_id: None,
+            display_position: None,
             pin,
             viewers: Vec::new(),
             stats_peer: None,
@@ -199,6 +210,23 @@ mod app {
             stats_view: StatsView::default(),
             viewer_stats: false,
         });
+        if let Some(session) = state
+            .sessions
+            .sessions
+            .iter_mut()
+            .find(|s| Some(&s.contract.session_id) == state.selected_session.as_ref())
+        {
+            session
+                .contract
+                .screens
+                .push(bridge_core::sessions::SavedScreen {
+                    position: None,
+                    screen_id,
+                    name: name.clone(),
+                    settings: state.settings.clone(),
+                });
+            session.contract.revision += 1;
+        }
         state.navigation.open(screen_id);
         state.show_codecs = false;
         state.show_logs = false;
@@ -211,6 +239,50 @@ mod app {
 
     struct HostView {
         state: Arc<Mutex<State>>,
+        account_inputs: [gpui_kit::Entity<InputState>; 2],
+    }
+    fn persist_sessions(state: &mut State) -> Result<()> {
+        state.sessions.next_screen_id = state.next_screen_id;
+        for screen in &mut state.screens {
+            if let Some(id) = screen.display_id {
+                if let Some(position) = mac::display_position(id) {
+                    screen.display_position = Some(position);
+                }
+            }
+        }
+        for session in &mut state.sessions.sessions {
+            let previous = bridge_core::sessions::contract_snapshot(&session.contract)?;
+            session.contract.screens.retain(|screen| {
+                state
+                    .screens
+                    .iter()
+                    .any(|s| s.screen_id == screen.screen_id && !s.removing)
+            });
+            for saved in &mut session.contract.screens {
+                if let Some(screen) = state
+                    .screens
+                    .iter()
+                    .find(|s| s.screen_id == saved.screen_id)
+                {
+                    saved.position = screen.display_position;
+                    saved.name = screen.name.clone();
+                    saved.settings = screen.settings.clone();
+                }
+            }
+            if previous != bridge_core::sessions::contract_snapshot(&session.contract)? {
+                session.contract.revision = session.contract.revision.saturating_add(1);
+            }
+        }
+        let snapshot = serde_snapshot(&state.sessions)?;
+        if snapshot != state.storage_snapshot {
+            #[cfg(not(test))]
+            state.sessions.save()?;
+            state.storage_snapshot = snapshot;
+        }
+        Ok(())
+    }
+    fn serde_snapshot(s: &bridge_core::sessions::HostStore) -> Result<String> {
+        Ok(bridge_core::sessions::snapshot(s)?)
     }
 
     fn resize_from_border(event: &gpui_kit::MouseDownEvent, window: &mut Window) {
@@ -283,6 +355,9 @@ mod app {
     impl HostView {
         fn refresh(&mut self, cx: &mut Context<Self>) {
             if let Ok(mut state) = self.state.lock() {
+                if let Err(error) = persist_sessions(&mut state) {
+                    state.message = format!("Session save failed: {error}");
+                }
                 for s in &mut state.screens {
                     normalize_stats_target(s);
                     if s.stats_view.open {
@@ -844,7 +919,7 @@ mod app {
                     .flex_col()
                     .gap_3()
                     .child(details_toggle)
-                    .child(selected_screen.as_ref().map(|screen|format!("SCREEN PIN · {}",screen.pin)).unwrap_or_default())
+                    .child(selected_screen.as_ref().map(|screen|{if let Some(session)=state.sessions.sessions.iter().find(|session|session.contract.screens.iter().any(|s|s.screen_id==screen.screen_id)){format!("SESSION ACCOUNT · {}",session.contract.username)}else{format!("SCREEN PIN · {}",screen.pin)}}).unwrap_or_default())
                     .child(Button::new("capture-permission").label("Screen Recording access").outline().small().on_click(cx.listener(|this,_,_,cx|{let granted=mac::request_capture_access();set_message(&this.state,if granted{"Screen Recording is granted · retry this screen"}else{"Grant Screen Recording access to the launched app/executable, restart it and retry"});cx.notify();})))
                     .child(
                         div()
@@ -1001,6 +1076,28 @@ mod app {
                         .flex()
                         .flex_col()
                         .gap_3()
+                        .child(Button::new("sessions-menu").label(if state.show_sessions{"Sessions ▴"}else{"Sessions ▾"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.show_sessions=!s.show_sessions;}cx.notify();})))
+                        .when(state.show_sessions,|panel|panel.child(div().flex().flex_col().gap_2().child("Saved sessions")
+                            .children(state.sessions.sessions.iter().map(|session|{
+                                let id=session.contract.session_id.clone();let selected=state.selected_session.as_ref()==Some(&id);
+                                Button::new(gpui_kit::SharedString::from(format!("session-select-{id}"))).label(format!("{} · {} screens",session.contract.username,session.contract.screens.len())).outline().small().selected(selected).on_click(cx.listener(move|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.selected_session=Some(id.clone());s.message="New screens will belong to this session".into();}cx.notify();}))
+                            }))
+                            .child(Form::new().small().child(Field::new().label("Account").child(Input::new(&self.account_inputs[0]).small())).child(Field::new().label("Session password").child(Input::new(&self.account_inputs[1]).small().mask_toggle())))
+                            .child(Button::new("session-create").label("Save current screens as session").primary().small().on_click(cx.listener(|this,_,window,cx|{
+                                let user=this.account_inputs[0].read(cx).value().to_string();let password=bridge_core::sessions::Secret(this.account_inputs[1].read(cx).value().to_string());
+                                this.account_inputs[1].update(cx,|input,cx|input.set_value("",window,cx));
+                                let shared=this.state.clone();std::thread::spawn(move||{
+                                    let snapshot=shared.lock().ok().map(|s|(s.sessions.clone(),s.screens.iter().filter(|screen|!screen.removing&&!s.sessions.sessions.iter().any(|session|session.contract.screens.iter().any(|saved|saved.screen_id==screen.screen_id))).map(|screen|bridge_core::sessions::SavedScreen{position:screen.display_position,screen_id:screen.screen_id,name:screen.name.clone(),settings:screen.settings.clone()}).collect::<Vec<_>>()));
+                                    if let Some((mut store,screens))=snapshot {let result=store.create(user,&password.0,screens);if let Ok(mut s)=shared.lock(){match result{Ok(id)=>{
+                                        let Some(session)=store.sessions.pop() else{return;};
+                                        if s.sessions.sessions.iter().any(|old|old.contract.username==session.contract.username || old.contract.screens.iter().any(|a|session.contract.screens.iter().any(|b|a.screen_id==b.screen_id))){s.message="Session creation conflicted with another change; retry".into();return;}
+                                        s.sessions.next_screen_id=s.sessions.next_screen_id.max(s.next_screen_id);
+                                        s.sessions.sessions.push(session);match s.sessions.save(){Ok(())=>{s.selected_session=Some(id);s.message="Session saved · login from the viewer using its account and password".into();},Err(e)=>{s.sessions.sessions.pop();s.message=format!("Session save failed: {e}");}}
+                                    },Err(e)=>s.message=format!("Session creation failed: {e}")}}}
+                                });cx.notify();
+                            })))
+                            .when(state.selected_session.is_some(),|panel|panel.child(Button::new("host-keep-awake").label(if state.sessions.sessions.iter().any(|s|Some(&s.contract.session_id)==state.selected_session.as_ref()&&s.contract.keep_awake){"Keep host awake: on"}else{"Keep host awake: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){let id=s.selected_session.clone();if let Some(session)=s.sessions.sessions.iter_mut().find(|session|Some(&session.contract.session_id)==id.as_ref()){session.contract.keep_awake=!session.contract.keep_awake;session.contract.revision+=1;}}cx.notify();}))))
+                            .child(state.power_notice.clone())))
                         .child(screen_list_panel)
                         .child(screen_details),
                 )
@@ -1041,6 +1138,8 @@ mod app {
             message: "Starting…".into(),
             settings: presets[1].settings.clone(),
             screens: vec![HostScreen {
+                display_id: None,
+                display_position: None,
                 pin: pin.clone(),
                 viewers: Vec::new(),
                 stats_peer: None,
@@ -1072,6 +1171,12 @@ mod app {
             show_codecs: false,
             show_logs: false,
             diagnostics: Arc::new(Diagnostics::new("host")),
+            sessions: bridge_core::sessions::HostStore::new()
+                .expect("System randomness unavailable"),
+            selected_session: None,
+            storage_snapshot: String::new(),
+            power_notice: String::new(),
+            show_sessions: false,
         }
     }
 
@@ -1081,7 +1186,70 @@ mod app {
             presets.extend(custom);
         }
         let pin = random_pin().expect("System randomness is unavailable");
-        let state = Arc::new(Mutex::new(initial_state(presets, pin)));
+        let mut initial = initial_state(presets, pin);
+        match bridge_core::sessions::HostStore::load() {
+            Ok(store) => {
+                let saved = store
+                    .sessions
+                    .iter()
+                    .flat_map(|s| s.contract.screens.clone())
+                    .collect::<Vec<_>>();
+                if !saved.is_empty() {
+                    initial.screens.clear();
+                    for screen in saved {
+                        if initial
+                            .screens
+                            .iter()
+                            .any(|s| s.screen_id == screen.screen_id)
+                        {
+                            continue;
+                        }
+                        let id = screen.screen_id;
+                        initial.screens.push(HostScreen {
+                            display_id: None,
+                            display_position: screen.position,
+                            pin: random_pin().expect("System randomness unavailable"),
+                            viewers: vec![],
+                            stats_peer: None,
+                            screen_id: id,
+                            name: screen.name,
+                            revision: 0,
+                            generation: 0,
+                            settings: screen.settings,
+                            codec: None,
+                            status: "Prepared · restored session".into(),
+                            removing: false,
+                            frames: 0,
+                            dropped: 0,
+                            bytes: 0,
+                            diagnostics: Arc::new(Diagnostics::new(&format!("host-screen-{id}"))),
+                            telemetry: Telemetry::new(),
+                            stats_view: StatsView::default(),
+                            viewer_stats: false,
+                        });
+                    }
+                    initial.next_screen_id = initial
+                        .screens
+                        .iter()
+                        .map(|s| s.screen_id)
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    initial.navigation.selected = initial.screens.first().map(|s| s.screen_id);
+                }
+                initial.next_screen_id = initial.next_screen_id.max(store.next_screen_id);
+                initial.selected_session = store
+                    .sessions
+                    .first()
+                    .map(|s| s.contract.session_id.clone());
+                initial.sessions = store;
+            }
+            Err(error) => {
+                eprintln!("Cannot load host sessions: {error}");
+                return;
+            }
+        }
+        let state = Arc::new(Mutex::new(initial));
         state
             .lock()
             .unwrap()
@@ -1133,8 +1301,16 @@ mod app {
                     },
                     cx,
                     |window, cx| {
-                        let view = cx.new(|_| HostView {
+                        let view = cx.new(|cx| HostView {
                             state: state.clone(),
+                            account_inputs: [
+                                cx.new(|cx| InputState::new(window, cx).placeholder("Username")),
+                                cx.new(|cx| {
+                                    InputState::new(window, cx)
+                                        .placeholder("Password (8+ bytes)")
+                                        .masked(true)
+                                }),
+                            ],
                         });
                         let controls_id = window.window_handle().window_id();
                         cx.on_window_closed(move |cx, closed_id| {
@@ -1185,8 +1361,12 @@ mod app {
             let state = Arc::new(Mutex::new(initial));
             cx.update(gpui_kit::init);
             let (controls, _) = cx.update(|cx| {
-                gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
-                    cx.new(|_| HostView {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| HostView {
+                        account_inputs: [
+                            cx.new(|cx| InputState::new(window, cx)),
+                            cx.new(|cx| InputState::new(window, cx).masked(true)),
+                        ],
                         state: state.clone(),
                     })
                 })
@@ -1237,8 +1417,12 @@ mod app {
             )));
             cx.update(gpui_kit::init);
             let (handle, _) = cx.update(|cx| {
-                gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
-                    cx.new(|_| HostView {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| HostView {
+                        account_inputs: [
+                            cx.new(|cx| InputState::new(window, cx)),
+                            cx.new(|cx| InputState::new(window, cx).masked(true)),
+                        ],
                         state: state.clone(),
                     })
                 })

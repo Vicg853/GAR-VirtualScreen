@@ -25,6 +25,7 @@ use std::{
 
 #[derive(Default)]
 pub struct VideoFrame {
+    pub window: bridge_core::sessions::WindowPlacement,
     pub width: u32,
     pub height: u32,
     pub frames: u64,
@@ -174,6 +175,18 @@ impl VideoWindow {
             })
             .map_err(|_| anyhow::anyhow!("Display command queue busy"))?;
         Ok(())
+    }
+    pub async fn restore_window(
+        &self,
+        placement: bridge_core::sessions::WindowPlacement,
+    ) -> Result<()> {
+        let epoch = self.epoch.current().context("Obsolete video window")?;
+        self.send(Input {
+            epoch,
+            message: Message::Placement(placement),
+            payload: vec![],
+        })
+        .await
     }
     pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
         let epoch = self.epoch.advance();
@@ -440,6 +453,7 @@ fn launch_using(
                 match message {
                     Message::Status(status) => {
                         if let Ok(mut s) = target.lock() {
+                            s.window = status.window;
                             s.width = status.width;
                             s.height = status.height;
                             s.frames = status.frames;
@@ -502,6 +516,7 @@ fn supervise<const DEBUG: bool>(
     diagnostics: Arc<Diagnostics>,
 ) {
     let mut process: Option<Process> = None;
+    let mut placement = bridge_core::sessions::WindowPlacement::default();
     let mut config = (1280, 720);
     let mut generation = 0;
     while !stop.load(Ordering::Acquire) {
@@ -579,6 +594,18 @@ fn supervise<const DEBUG: bool>(
                                 fail(&target, &diagnostics, error.to_string());
                                 break;
                             }
+                            if let Err(error) = worker::write(
+                                &mut p.socket,
+                                &Message::Placement(placement.clone()),
+                                &[],
+                            ) {
+                                fail(
+                                    &target,
+                                    &diagnostics,
+                                    format!("Window restore IPC failed: {error}"),
+                                );
+                                break;
+                            }
                             process = Some(p);
                         }
                         Err(error) => {
@@ -605,6 +632,21 @@ fn supervise<const DEBUG: bool>(
                             &target,
                             &diagnostics,
                             format!("Native media IPC failed: {error}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            Message::Placement(value) => {
+                placement = value.clone();
+                if let Some(p) = process.as_mut() {
+                    if let Err(error) =
+                        worker::write(&mut p.socket, &Message::Placement(value), &[])
+                    {
+                        fail(
+                            &target,
+                            &diagnostics,
+                            format!("Window placement IPC failed: {error}"),
                         );
                         break;
                     }
@@ -671,6 +713,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
             let status = tick_frame
                 .lock()
                 .map(|s| worker::Status {
+                    window: s.window.clone(),
                     width: s.width,
                     height: s.height,
                     frames: s.frames,
@@ -717,6 +760,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
             thread::sleep(Duration::from_millis(200));
         }
     });
+    let mut placement = bridge_core::sessions::WindowPlacement::default();
     let mut window: Option<crate::native_video::VideoWindow> = None;
     let mut config = (1280, 720, false);
     let mut submit: fn(
@@ -767,6 +811,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                             config.2,
                         )?;
                         runtime.block_on(created.reset(config.0, config.1))?;
+                        created.restore_window(placement.clone())?;
                         window = Some(created);
                     }
                     let window = window.as_ref().context("Native window unavailable")?;
@@ -793,6 +838,12 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                             },
                             &[],
                         )?;
+                    }
+                }
+                Message::Placement(value) => {
+                    placement = value;
+                    if let Some(window) = &window {
+                        window.restore_window(placement.clone())?;
                     }
                 }
                 Message::Show => {

@@ -34,7 +34,7 @@ mod app {
         },
     };
     use gpui_kit::component::{
-        ActiveTheme, Selectable, Sizable, TitleBar,
+        ActiveTheme, Disableable, Selectable, Sizable, TitleBar,
         button::{Button, ButtonVariants},
         form::{Field, Form},
         input::{Input, InputEvent, InputState},
@@ -156,6 +156,16 @@ mod app {
         host_identity: String,
         viewer_identity: u64,
         pin: String,
+        username: String,
+        stable_viewer: String,
+        remembered: Option<bridge_core::sessions::SavedViewerSession>,
+        authenticated_key: Option<bridge_core::sessions::Secret>,
+        contract: Option<bridge_core::sessions::SessionContract>,
+        preferences: bridge_core::sessions::ViewerPreferences,
+        remember: bool,
+        auto_connect: bool,
+        auto_suspended: bool,
+        power_notice: String,
         manual_address: String,
         settings: VideoSettings,
         override_host: bool,
@@ -188,6 +198,18 @@ mod app {
     }
 
     impl State {
+        fn auto_endpoint(&self) -> Option<SocketAddr> {
+            if !self.auto_connect || self.auto_suspended || !self.remember {
+                return None;
+            }
+            let saved = self.remembered.as_ref()?;
+            self.hosts
+                .iter()
+                .filter(|host| host.host_id == saved.contract.host_id)
+                .flat_map(|host| host.addresses.iter())
+                .copied()
+                .next()
+        }
         fn select_host(&mut self, name: &str) {
             if let Some(index) = self.hosts.iter().position(|host| host.name == name) {
                 self.selected_host = index;
@@ -304,6 +326,13 @@ mod app {
         next_id: u64,
     }
     fn add_local_screen(workspace: &Arc<Mutex<Workspace>>, catalog: &Arc<Mutex<State>>) {
+        add_local_session(workspace, catalog, None);
+    }
+    fn add_local_session(
+        workspace: &Arc<Mutex<Workspace>>,
+        catalog: &Arc<Mutex<State>>,
+        saved: Option<bridge_core::sessions::SavedViewerSession>,
+    ) {
         let snapshot = catalog.lock().map(|s| s.clone()).unwrap();
         let mut ws = workspace.lock().unwrap();
         ws.retiring.retain(|entry| {
@@ -326,9 +355,20 @@ mod app {
         let id = ws.next_id;
         let mut state = initial_state(snapshot.presets);
         state.hosts = snapshot.hosts;
+        state.stable_viewer = snapshot.stable_viewer;
         state.target_screen = state.hosts.first().map(|h| h.screen_id).unwrap_or(1);
         state.target_input = state.target_screen.to_string();
-        state.message = "Select a host screen and enter its PIN".into();
+        state.message =
+            "Select a host and log in, or leave account blank to use a screen PIN".into();
+        if let Some(saved) = saved {
+            state.username = saved.contract.username.clone();
+            state.contract = Some(saved.contract.clone());
+            state.preferences = saved.preferences.clone();
+            state.auto_connect = saved.auto_connect;
+            state.remember = true;
+            state.remembered = Some(saved);
+        }
+
         state.diagnostics = Arc::new(Diagnostics::new(&format!("viewer-local-{id}")));
         let state = Arc::new(Mutex::new(state));
         let (commands, rx) = mpsc::channel(64);
@@ -358,6 +398,17 @@ mod app {
             Some(ws.entries.remove(index))
         });
         if let Some(entry) = entry {
+            if let Ok(mut s) = entry.state.lock() {
+                s.auto_suspended = true;
+                s.remember = false;
+                s.auto_connect = false;
+                if let Some(contract) = &s.contract {
+                    if let Err(e) = bridge_core::sessions::forget_viewer(&contract.session_id) {
+                        s.diagnostics
+                            .record("session", format!("Cannot remove remembered session: {e}"));
+                    }
+                }
+            }
             entry.shutdown.send_replace(true);
             let _ = entry.commands.try_send(Command::Disconnect);
             if let Ok(mut ws) = workspace.lock() {
@@ -370,9 +421,9 @@ mod app {
         catalog: Arc<Mutex<State>>,
         state: Arc<Mutex<State>>,
         commands: mpsc::Sender<Command>,
-        inputs: [Entity<InputState>; 3],
+        inputs: [Entity<InputState>; 4],
         input_owner: Option<u64>,
-        input_values: [String; 3],
+        input_values: [String; 4],
         _input_subscriptions: Vec<Subscription>,
     }
 
@@ -575,7 +626,15 @@ mod app {
                     .map(|entry| {
                         let id = entry.id;
                         let state = entry.state.lock().unwrap();
-                        let summary = format!("Screen {id} · {}", state.message);
+                        let summary = format!(
+                            "{} · {}",
+                            state
+                                .contract
+                                .as_ref()
+                                .map(|c| format!("Session {}", c.username))
+                                .unwrap_or_else(|| format!("Connection {id}")),
+                            state.message
+                        );
                         Button::new(("local-screen", id as usize))
                             .w_full()
                             .min_w_0()
@@ -602,7 +661,7 @@ mod app {
                     .on_mouse_down(MouseButton::Left, |event, window, _| {
                         resize_from_border(event, window)
                     })
-                    .child(TitleBar::new().child("AirBridge · Screens"))
+                    .child(TitleBar::new().child("AirBridge · Sessions"))
                     .child(
                         div()
                             .id("local-list-scroll")
@@ -616,7 +675,7 @@ mod app {
                             .children(rows)
                             .child(
                                 Button::new("add-local-screen")
-                                    .label("+ Add screen")
+                                    .label("+ Add host session")
                                     .primary()
                                     .small()
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1249,17 +1308,19 @@ mod app {
                     .child(div().flex().flex_col().gap_1().children(hosts))
                     .child(Form::new().small()
                         .child(Field::new().label("Host screen ID").required(true).child(Input::new(&self.inputs[2]).small()))
-                        .child(Field::new().label("Six-digit screen PIN").required(true).child(Input::new(&self.inputs[1]).small().mask_toggle()))
+                        .child(Field::new().label("Session account").child(Input::new(&self.inputs[3]).small()))
+                        .child(Field::new().label("Password / screen PIN").required(true).child(Input::new(&self.inputs[1]).small().mask_toggle()))
                         .child(Field::new().label("Manual host address").description("Leave blank to use the selected discovered host").child(Input::new(&self.inputs[0]).small())))
                     .child(div().flex().flex_wrap().gap_2()
                         .child(Button::new("connect").label("Connect").primary().small().on_click(cx.listener(move |_, _, _, cx| {
                                 let state = connect_state.lock().unwrap().clone();
                                 if state.connected || state.connecting { return; }
-                                if state.target_screen == 0 { message(&connect_state, "Enter a valid host screen ID"); cx.notify(); return; }
-                                if bridge_core::security::validate_pin(&state.pin).is_err() { message(&connect_state, "Enter the six-digit host PIN"); cx.notify(); return; }
+                                if state.target_screen == 0 && state.username.is_empty() { message(&connect_state, "Enter a valid host screen ID"); cx.notify(); return; }
+                                if state.username.is_empty() && bridge_core::security::validate_pin(&state.pin).is_err() { message(&connect_state, "Enter the six-digit host PIN"); cx.notify(); return; }
                                 let address = if !state.manual_address.is_empty() {
                                     state.manual_address.parse::<SocketAddr>().ok().or_else(|| state.manual_address.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, bridge_core::protocol::PORT)))
                                 } else { state.hosts.get(state.selected_host).and_then(|host| host.addresses.first().copied()) };
+                                if let Ok(mut s)=connect_state.lock(){s.auto_suspended=false;}
                                 if let Some(address) = address { let _ = connect_commands.try_send(Command::Connect(address, state.pin, if state.override_host { Some(state.settings) } else { None })); }
                                 else { message(&connect_state, "Select a discovered Mac or enter its IP address"); }
                                 cx.notify();
@@ -1267,14 +1328,20 @@ mod app {
 )
 )
                     .child(div().flex().flex_wrap().gap_2().px_3().py_2()
-                       .child(Button::new("workspace-back").label("← Screens").primary().small().on_click(cx.listener(|this,_,_,cx|{
+                       .child(Button::new("workspace-back").label("← Sessions").primary().small().on_click(cx.listener(|this,_,_,cx|{
                           if let Ok(mut state)=this.state.lock(){state.show_codecs=false;state.show_logs=false;}
                           if let Ok(mut ws)=this.workspace.lock(){ws.selected=None;}cx.notify();})))
-                       .child(Button::new("workspace-remove").label("Remove local screen").danger().small().on_click(cx.listener(|this,_,_,cx|{let id=this.workspace.lock().ok().and_then(|ws|ws.selected);if let Some(id)=id{remove_local_screen(&this.workspace,id);}cx.notify();}))))
+                       .child(Button::new("workspace-remove").label("Remove local session").danger().small().on_click(cx.listener(|this,_,_,cx|{let id=this.workspace.lock().ok().and_then(|ws|ws.selected);if let Some(id)=id{remove_local_screen(&this.workspace,id);}cx.notify();}))))
                     .when(state.connected || state.connecting, |panel| panel.child(
-                        Button::new("disconnect").label(if state.connecting { "Cancel connection" } else { "Disconnect this screen" }).danger().small().on_click(cx.listener(|this, _, _, _| { let _ = this.commands.try_send(Command::Disconnect); }))))
+                        Button::new("disconnect").label(if state.connecting { "Cancel connection" } else { "Disconnect session" }).danger().small().on_click(cx.listener(|this, _, _, _| { if let Ok(mut s)=this.state.lock(){s.auto_suspended=true;}let _ = this.commands.try_send(Command::Disconnect); }))))
                     .when(!state.connected,|panel|panel.child(Button::new("offline-logs-toggle").label(if state.show_logs {"Hide logs"}else{"Show logs"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.show_logs= !s.show_logs;}cx.notify();}))))
                     .when(!state.connected && state.show_logs,|panel|panel.child(div().id("offline-logs").h(px(150.)).overflow_y_scroll().p_2().children(state.diagnostics.recent().into_iter().map(|line|div().text_sm().child(line)))))
+                    .child(div().flex().flex_col().gap_2()
+                        .child(Button::new("remember-session").label(if state.remember{"Remember credentials: on"}else{"Remember credentials: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.remember=!s.remember;s.auto_connect=s.remember;s.auto_suspended=false;if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}else if s.remember{s.remembered=saved_viewer_session(&s);}}cx.notify();})))
+                        .child(Button::new("auto-connect-session").label(if state.auto_connect{"Auto-connect: on"}else{"Auto-connect: off"}).outline().small().disabled(!state.remember).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.auto_connect=!s.auto_connect;s.auto_suspended=false;if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}}cx.notify();})))
+                        .child(Button::new("viewer-keep-awake").label(if state.preferences.keep_awake{"Keep viewer awake: on"}else{"Keep viewer awake: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.preferences.keep_awake=!s.preferences.keep_awake;}cx.notify();})))
+                        .child(state.power_notice.clone())
+                        .child(Button::new("forget-session").label("Forget saved login").danger().small().disabled(state.contract.is_none()).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){if let Some(contract)=&s.contract{match bridge_core::sessions::forget_viewer(&contract.session_id){Ok(())=>{s.remembered=None;s.authenticated_key=None;s.remember=false;s.auto_connect=false;s.auto_suspended=true;s.message="Saved credentials forgotten".into();},Err(e)=>s.message=format!("Cannot forget login: {e}")}}}cx.notify();}))))
                     .child(screen_list_panel)
                     .child(stream_details_panel))
                     .into_any_element()
@@ -1293,11 +1360,9 @@ mod app {
                 cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.10 or IP:port")),
                 cx.new(|cx| {
                     InputState::new(window, cx)
-                        .placeholder("123456")
+                        .placeholder("Password or screen PIN")
                         .masked(true)
-                        .validate(|value, _| {
-                            value.len() <= 6 && value.bytes().all(|b| b.is_ascii_digit())
-                        })
+                        .validate(|value, _| value.len() <= 256)
                 }),
                 cx.new(|cx| {
                     InputState::new(window, cx)
@@ -1306,6 +1371,7 @@ mod app {
                             value.len() <= 10 && value.bytes().all(|b| b.is_ascii_digit())
                         })
                 }),
+                cx.new(|cx| InputState::new(window, cx).placeholder("Account (blank for PIN)")),
             ];
             let subscriptions = inputs
                 .iter()
@@ -1318,11 +1384,24 @@ mod app {
                             if let Ok(mut state) = this.state.lock() {
                                 match index {
                                     0 => state.manual_address = value,
-                                    1 => state.pin = value,
-                                    _ => {
+                                    1 if state.pin != value => {
+                                        bridge_core::sessions::clear_secret(&mut state.pin);
+                                        state.pin = value;
+                                        state.remembered = None;
+                                        state.authenticated_key = None;
+                                        state.auto_suspended = true;
+                                    }
+                                    3 if state.username != value => {
+                                        state.username = value;
+                                        state.remembered = None;
+                                        state.contract = None;
+                                        state.authenticated_key = None;
+                                    }
+                                    2 => {
                                         state.target_screen = value.parse::<u32>().unwrap_or(0);
                                         state.target_input = value;
                                     }
+                                    _ => {}
                                 }
                             }
                             cx.notify();
@@ -1380,6 +1459,7 @@ mod app {
                             s.manual_address.clone(),
                             s.pin.clone(),
                             s.target_input.clone(),
+                            s.username.clone(),
                         ]
                     })
                     .unwrap_or_default();
@@ -1397,6 +1477,24 @@ mod app {
                 for screen in &mut state.screens {
                     if screen.stats_view.open {
                         screen.stats_view.refresh(&screen.telemetry);
+                    }
+                }
+            }
+            if let Ok(mut s) = self.state.lock() {
+                if !s.connected && s.contract.is_some() {
+                    if let Some(saved) = &s.remembered {
+                        if bridge_core::sessions::preferences_snapshot(&s.preferences).ok()
+                            != bridge_core::sessions::preferences_snapshot(&saved.preferences).ok()
+                        {
+                            if let Err(e) = save_viewer_session(&s) {
+                                s.message = format!("Session save failed: {e}");
+                            } else {
+                                let preferences = s.preferences.clone();
+                                if let Some(saved) = &mut s.remembered {
+                                    saved.preferences = preferences;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1477,14 +1575,24 @@ mod app {
             .build()?;
         runtime.block_on(async move {
             let mut reconnect=None;
+            let mut auto_timer=tokio::time::interval(Duration::from_secs(1));let mut attempt=0;let mut next_auto=std::time::Instant::now();
             loop {
                 let command = if let Some(command)=reconnect.take(){command}else{tokio::select! {
                     _ = shutdown.changed() => break,
                     command = commands.recv() => { let Some(command) = command else { break; }; command }
+                    _=auto_timer.tick()=>{
+                        if std::time::Instant::now()<next_auto{continue;}
+                        let address=shared.lock().ok().and_then(|s|s.auto_endpoint());
+                        let Some(address)=address else{continue;};
+                        attempt+=1;next_auto=std::time::Instant::now()+bridge_core::sessions::reconnect_delay(attempt);Command::Connect(address,String::new(),None)
+                    }
                 }};
                 if let Command::Connect(address, pin, settings) = command {
                     if let Ok(mut state) = shared.lock() { state.connecting = true; state.terminal_reason=None; }
+                    let began=std::time::Instant::now();
                     let result = connect(address, pin, settings, shared.clone(), &mut commands, shutdown.clone()).await;
+                    if began.elapsed()>Duration::from_secs(30){attempt=0;}
+                    next_auto=std::time::Instant::now()+bridge_core::sessions::reconnect_delay(attempt);
                     clear_client_session(&shared);
                     if let Err(error) = result {let cause=shared.lock().ok().and_then(|s|s.terminal_reason.clone());message(&shared,cause.unwrap_or_else(||format!("Connection failed: {error:#}")));}
                     if *shutdown.borrow() { break; }
@@ -1662,6 +1770,20 @@ mod app {
         } else {
             None
         };
+        let placement = shared.lock().ok().and_then(|s| {
+            s.preferences
+                .screens
+                .iter()
+                .find(|p| p.screen_id == config.screen_id)
+                .map(|p| p.window.clone())
+        });
+        if let Some(placement) = placement {
+            if let Err(error) = screen.video_window.restore_window(placement).await {
+                screen
+                    .diagnostics
+                    .record("window", format!("Window restoration unavailable: {error}"));
+            }
+        }
         if let Ok(mut frame) = screen.frame.lock() {
             frame.width = config.settings.width;
             frame.height = config.settings.height;
@@ -1784,7 +1906,21 @@ mod app {
         screen.cancel.send_replace(true);
         let _ = screen.video_window.close();
         let _ = pending;
-        send_control(control, &ClientMessage::Stop).await
+        if shared.lock().map(|s| s.contract.is_some()).unwrap_or(false) {
+            send_control(
+                control,
+                &ClientMessage::RemoveScreen {
+                    request_id: next_request_id(shared),
+                    screen_id,
+                },
+            )
+            .await
+        } else {
+            if let Ok(mut s) = shared.lock() {
+                s.auto_suspended = true;
+            }
+            send_control(control, &ClientMessage::Stop).await
+        }
     }
 
     fn end_client_lane(
@@ -2090,6 +2226,7 @@ mod app {
         commands: &mut mpsc::Receiver<Command>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        let pin = bridge_core::sessions::Secret(pin);
         let settings = settings.map(|mut settings| {
             settings.audio = false;
             settings
@@ -2097,7 +2234,31 @@ mod app {
         if let Some(settings) = &settings {
             settings.validate()?;
         }
-        bridge_core::security::validate_pin(&pin)?;
+        let (login, remembered) = shared
+            .lock()
+            .map(|s| {
+                let login = (!s.username.is_empty()).then(|| bridge_core::security::SessionLogin {
+                    username: s.username.clone(),
+                    session_id: s.contract.as_ref().map(|c| c.session_id.clone()),
+                    host_id: s
+                        .contract
+                        .as_ref()
+                        .map(|c| c.host_id.clone())
+                        .or_else(|| s.hosts.get(s.selected_host).map(|h| h.host_id.clone())),
+                    viewer_id: s.stable_viewer.clone(),
+                });
+                (
+                    login,
+                    s.remembered
+                        .as_ref()
+                        .map(|v| v.key.clone())
+                        .or_else(|| s.authenticated_key.clone()),
+                )
+            })
+            .map_err(|_| anyhow::anyhow!("Viewer state unavailable"))?;
+        if login.is_none() {
+            bridge_core::security::validate_pin(&pin)?;
+        }
         if let Ok(mut state) = shared.lock() {
             state.last_endpoint = Some(address);
         }
@@ -2109,16 +2270,33 @@ mod app {
                 endpoint.connect(address, "airbridge.local")?,
             )
             .await??;
-            tokio::time::timeout(
-                Duration::from_secs(12),
-                authenticate_viewer_screen(
-                    &connection,
-                    &pin,
-                    shared.lock().map(|s| s.target_screen).unwrap_or(1),
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("PIN entry timed out"))??;
+            let session_auth = if let Some(login) = &login {
+                Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(20),
+                        bridge_core::security::authenticate_viewer_session(
+                            &connection,
+                            login,
+                            &pin,
+                            remembered.as_ref(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Session login timed out"))??,
+                )
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(12),
+                    authenticate_viewer_screen(
+                        &connection,
+                        &pin,
+                        shared.lock().map(|s| s.target_screen).unwrap_or(1),
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("PIN entry timed out"))??;
+                None
+            };
             let (mut control_send, mut control_recv) = connection.open_bi().await?;
             let codecs = vec![
                 CodecOption {
@@ -2130,42 +2308,101 @@ mod app {
                     acceleration: Acceleration::Software,
                 },
             ];
-            send_control(
-                &mut control_send,
-                &ClientMessage::Hello(ClientHello {
-                    version: VERSION,
-                    codecs,
-                    initial_settings: settings,
-                }),
-            )
-            .await?;
+            let hello = ClientHello {
+                version: VERSION,
+                codecs,
+                initial_settings: settings,
+            };
+            let greeting = if let Some(login) = &login {
+                let preferences = shared
+                    .lock()
+                    .map(|s| s.preferences.clone())
+                    .unwrap_or_default();
+                ClientMessage::SessionHello {
+                    hello,
+                    viewer_id: login.viewer_id.clone(),
+                    preferences,
+                }
+            } else {
+                ClientMessage::Hello(hello)
+            };
+            send_control(&mut control_send, &greeting).await?;
             let accepted: HostMessage =
                 tokio::time::timeout(Duration::from_secs(15), receive_json(&mut control_recv))
                     .await
                     .map_err(|_| anyhow::anyhow!("Host session acceptance timed out"))??;
-            let primary = match accepted {
+            let screens = match accepted {
+                HostMessage::PersistentSessionAccepted {
+                    contract,
+                    screens,
+                    viewer_id,
+                } => {
+                    contract.validate()?;
+                    let (session_id, key) = session_auth
+                        .ok_or_else(|| anyhow::anyhow!("Unexpected session acceptance"))?;
+                    if session_id != contract.session_id
+                        || login
+                            .as_ref()
+                            .is_none_or(|l| l.username != contract.username)
+                        || screens.len() > MAX_SCREENS
+                        || screens.iter().any(|s| {
+                            !contract
+                                .screens
+                                .iter()
+                                .any(|saved| saved.screen_id == s.screen_id)
+                        })
+                    {
+                        bail!("Session acceptance violates authenticated contract");
+                    }
+                    if let Ok(mut s) = shared.lock() {
+                        s.host_identity = contract.host_id.clone();
+                        s.viewer_identity = viewer_id;
+                        s.preferences.screens.retain(|p| {
+                            contract
+                                .screens
+                                .iter()
+                                .any(|screen| screen.screen_id == p.screen_id)
+                        });
+                        s.contract = Some(contract);
+                        s.authenticated_key = Some(key);
+                        bridge_core::sessions::clear_secret(&mut s.pin);
+                        if s.remember {
+                            if let Err(e) = save_viewer_session(&s) {
+                                s.message =
+                                    format!("Login worked but saving credentials failed: {e}");
+                            } else {
+                                s.remembered = saved_viewer_session(&s);
+                            }
+                        }
+                    }
+                    screens
+                }
+
                 HostMessage::SessionAccepted {
                     host_id,
                     viewer_id,
                     screen,
-                } => {
+                } if login.is_none() => {
                     if let Ok(mut s) = shared.lock() {
                         s.host_identity = host_id;
                         s.viewer_identity = viewer_id;
                     }
-                    screen
+                    vec![screen]
                 }
                 HostMessage::Accepted { .. } => bail!("Legacy session acceptance is unsupported"),
                 HostMessage::Error { message, .. } => bail!("Host: {message}"),
                 _ => bail!("Host sent an invalid session response"),
             };
-            if primary.screen_id != shared.lock().map(|s| s.target_screen).unwrap_or(0) {
+            if login.is_none()
+                && screens.first().map(|s| s.screen_id)
+                    != Some(shared.lock().map(|s| s.target_screen).unwrap_or(0))
+            {
                 bail!("Host accepted a different screen than authenticated");
             }
-            Ok::<_, anyhow::Error>((endpoint, connection, control_send, control_recv, primary))
+            Ok::<_, anyhow::Error>((endpoint, connection, control_send, control_recv, screens))
         };
         tokio::pin!(setup);
-        let (_endpoint, connection, mut control_send, control_recv, primary) = loop {
+        let (_endpoint, connection, mut control_send, control_recv, screens) = loop {
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
                 result = &mut setup => break result?,
@@ -2176,42 +2413,35 @@ mod app {
             }
         };
         let mut queued_commands = VecDeque::new();
-        if !install_during_session(
-            &shared,
-            primary.clone(),
-            true,
-            &connection,
-            commands,
-            &mut queued_commands,
-            &mut shutdown,
-        )
-        .await?
-        {
-            connection.close(0u32.into(), b"viewer cancelled startup");
-            message(&shared, "Connection cancelled");
-            return Ok(());
+        for (index, screen) in screens.into_iter().enumerate() {
+            if !install_during_session(
+                &shared,
+                screen,
+                index == 0,
+                &connection,
+                commands,
+                &mut queued_commands,
+                &mut shutdown,
+            )
+            .await?
+            {
+                connection.close(0u32.into(), b"viewer cancelled startup");
+                message(&shared, "Connection cancelled");
+                return Ok(());
+            }
         }
         if let Ok(mut state) = shared.lock() {
             state.clock = ClockEstimate::default();
             state.connected = true;
             state.connecting = false;
             state.override_host = false;
-            state.settings = primary.settings.clone();
+            if let Some(first) = state.screens.first() {
+                state.settings = first.config.settings.clone();
+            }
             state.bytes = 0;
             state.received_frames = 0;
         }
-        message(
-            &shared,
-            format!(
-                "Connected · {} · {:?} {:?} · {}×{} at {} fps",
-                primary.name,
-                primary.codec.codec,
-                primary.codec.acceleration,
-                primary.settings.width,
-                primary.settings.height,
-                primary.settings.fps,
-            ),
-        );
+        message(&shared, "Connected · restoring session screens");
         let (lane_events, mut lane_notices) = mpsc::channel(64);
         let mut lane_task = Some(tokio::spawn(receive_lanes(
             connection.clone(),
@@ -2242,6 +2472,14 @@ mod app {
         let mut last_stats = now_us();
         let mut counters = HashMap::<ScreenId, (u64, u64, u64, u64, u64)>::new();
         let mut pending_requests = HashMap::<RequestId, PendingAction>::new();
+        let power_state = shared.clone();
+        let power = bridge_core::power::PowerController::new(move |notice| {
+            if let Ok(mut s) = power_state.lock() {
+                s.power_notice = notice;
+            }
+        });
+        let mut last_preferences = String::new();
+        let mut last_preferences_at = std::time::Instant::now() - Duration::from_secs(2);
         let session_result: Result<()> = async {
             loop {
                 tokio::select! {
@@ -2253,6 +2491,11 @@ mod app {
                     }
                     _ = watchdog.tick() => {
                         let screens = shared.lock().map(|state| state.screens.clone()).unwrap_or_default();
+                        power.set_active(shared.lock().map(|s|s.preferences.keep_awake).unwrap_or(false)&&screens.iter().any(|s|!s.terminal&&s.frame.lock().map(|f|f.frames>0&&!f.closed).unwrap_or(false)));
+                        if let Ok(mut s)=shared.lock(){for screen in &screens{if let Ok(frame)=screen.frame.lock(){if frame.window.width>0&&frame.window.height>0{if let Some(saved)=s.preferences.screens.iter_mut().find(|p|p.screen_id==screen.config.screen_id){saved.window=frame.window.clone();}else if s.preferences.screens.len()<MAX_SCREENS{s.preferences.screens.push(bridge_core::sessions::ViewerScreen{screen_id:screen.config.screen_id,window:frame.window.clone()});}}}}}
+                        let preferences=shared.lock().ok().filter(|s|s.contract.is_some()).map(|s|s.preferences.clone());
+                        if let Some(preferences)=preferences{let snapshot=bridge_core::sessions::preferences_snapshot(&preferences)?;if snapshot!=last_preferences&&last_preferences_at.elapsed()>=Duration::from_secs(1){send_control(&mut control_send,&ClientMessage::SessionPreferences(preferences)).await?;if let Ok(mut s)=shared.lock(){if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}}last_preferences=snapshot;last_preferences_at=std::time::Instant::now();}}
+
                         counters.retain(|id,_|screens.iter().any(|s|s.config.screen_id==*id));
                         let stats_now=now_us(); let collect=stats_now.saturating_sub(last_stats)>=1_000_000;
                         for screen in screens {
@@ -2333,9 +2576,15 @@ mod app {
                     }
                     response = control_messages.recv() => {
                         match response.ok_or_else(|| anyhow::anyhow!("Host control channel ended"))?? {
-                            HostMessage::ScreenAdded { .. } => bail!("Host attempted to add another screen to a single-screen session"),
+                            HostMessage::ScreenAdded {screen,..}=>{
+                                let allowed=shared.lock().map(|s|s.contract.as_ref().is_some_and(|contract|contract.screens.iter().any(|saved|saved.screen_id==screen.screen_id))).unwrap_or(false);
+                                if !allowed{bail!("Additional screen outside authenticated session");}
+                                if !install_during_session(&shared,screen,false,&connection,commands,&mut queued_commands,&mut shutdown).await?{break;}
+                            },
+                            HostMessage::SessionUpdated(contract)=>{contract.validate()?;if let Ok(mut s)=shared.lock(){if s.contract.as_ref().is_none_or(|c|c.session_id!=contract.session_id||c.host_id!=contract.host_id||contract.revision<c.revision){bail!("Session update identity/revision mismatch");}s.preferences.screens.retain(|p|contract.screens.iter().any(|screen|screen.screen_id==p.screen_id));s.contract=Some(contract);if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}}},
+                            HostMessage::PersistentSessionAccepted{..}=>bail!("Unexpected duplicate persistent session acceptance"),
                             HostMessage::ScreenSettingsApplied { request_id, screen } => {
-                                if screen.screen_id!=primary.screen_id{bail!("Settings belong to another host screen");}
+                                if !shared.lock().map(|s|s.screens.iter().any(|current|current.config.screen_id==screen.screen_id)).unwrap_or(false){bail!("Settings belong to an unattached screen");}
                                 pending_requests.retain(|_,action|!matches!(action,PendingAction::Settings(id,revision) if *id==screen.screen_id&&*revision<=screen.revision));
                                 if let Some(id) = request_id { pending_requests.remove(&id); }
                                 match install_during_session(&shared, screen.clone(), false, &connection, commands, &mut queued_commands, &mut shutdown).await {
@@ -2416,6 +2665,7 @@ mod app {
             }
             Ok(())
         }.await;
+        power.set_active(false);
         clear_client_session(&shared);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2464,6 +2714,28 @@ mod app {
         }
     }
 
+    fn saved_viewer_session(s: &State) -> Option<bridge_core::sessions::SavedViewerSession> {
+        Some(bridge_core::sessions::SavedViewerSession {
+            contract: s.contract.clone()?,
+            viewer_id: s.stable_viewer.clone(),
+            key: s
+                .authenticated_key
+                .clone()
+                .or_else(|| s.remembered.as_ref().map(|s| s.key.clone()))?,
+            preferences: s.preferences.clone(),
+            auto_connect: s.auto_connect,
+        })
+    }
+    fn save_viewer_session(s: &State) -> Result<()> {
+        if let Some(saved) = saved_viewer_session(s) {
+            if s.remember {
+                bridge_core::sessions::remember_viewer(saved)?;
+            } else {
+                bridge_core::sessions::forget_viewer(&saved.contract.session_id)?;
+            }
+        }
+        Ok(())
+    }
     fn initial_state(presets: Vec<Preset>) -> State {
         State {
             clock: ClockEstimate::default(),
@@ -2474,6 +2746,16 @@ mod app {
             host_identity: String::new(),
             viewer_identity: 0,
             pin: String::new(),
+            username: String::new(),
+            stable_viewer: bridge_core::sessions::new_id().expect("System randomness unavailable"),
+            remembered: None,
+            authenticated_key: None,
+            contract: None,
+            preferences: Default::default(),
+            remember: false,
+            auto_connect: false,
+            auto_suspended: false,
+            power_notice: String::new(),
             manual_address: String::new(),
             settings: presets[1].settings.clone(),
             override_host: false,
@@ -2505,6 +2787,21 @@ mod app {
         }
         let state = Arc::new(Mutex::new(initial_state(presets)));
         let workspace = Arc::new(Mutex::new(Workspace::default()));
+        match bridge_core::sessions::ViewerStore::load() {
+            Ok(store) => {
+                if let Ok(mut s) = state.lock() {
+                    s.stable_viewer = store.viewer_id;
+                }
+                for saved in store.sessions {
+                    add_local_session(&workspace, &state, Some(saved));
+                }
+                if let Ok(mut ws) = workspace.lock() {
+                    ws.selected = None;
+                }
+            }
+            Err(e) => message(&state, format!("Saved logins unavailable: {e}")),
+        }
+
         let (send, receive) = mpsc::channel(64);
         let (shutdown, _shutdown_rx) = watch::channel(false);
         drop(receive);
@@ -2764,8 +3061,8 @@ mod app {
             cx.run_until_parked();
             assert_eq!(
                 first.lock().unwrap().pin,
-                "112233",
-                "PIN validation rejects non-digits"
+                "112233a",
+                "The password input accepts non-digit credentials; PINs are checked on connect"
             );
             workspace.lock().unwrap().selected = Some(2);
             handle
@@ -2780,7 +3077,7 @@ mod app {
                     view.update(cx, |this, cx| this.refresh(window, cx))
                 })
                 .unwrap();
-            cx.read(|cx| assert_eq!(view.read(cx).inputs[1].read(cx).value().as_ref(), "112233"));
+            cx.read(|cx| assert_eq!(view.read(cx).inputs[1].read(cx).value().as_ref(), "112233a"));
             handle
                 .update(cx, |_, window, cx| {
                     let input = view.read(cx).inputs[0].clone();
@@ -2804,6 +3101,97 @@ mod app {
                 "periodic refresh must not reset the caret"
             );
             assert!(second.lock().unwrap().manual_address.is_empty());
+        }
+        fn remembered_state() -> State {
+            let mut s = initial_state(built_in_presets());
+            let contract = bridge_core::sessions::SessionContract {
+                version: bridge_core::sessions::STORE_VERSION,
+                session_id: bridge_core::sessions::new_id().unwrap(),
+                host_id: bridge_core::sessions::new_id().unwrap(),
+                username: "alice".into(),
+                revision: 1,
+                keep_awake: false,
+                screens: vec![],
+            };
+            s.username = "alice".into();
+            s.remember = true;
+            s.auto_connect = true;
+            s.contract = Some(contract.clone());
+            s.remembered = Some(bridge_core::sessions::SavedViewerSession {
+                contract,
+                viewer_id: s.stable_viewer.clone(),
+                key: bridge_core::sessions::Secret("11".repeat(32)),
+                preferences: Default::default(),
+                auto_connect: true,
+            });
+            s
+        }
+        #[test]
+        fn auto_connection_matches_identity_and_respects_manual_disconnect() {
+            let mut s = remembered_state();
+            let host_id = s.contract.as_ref().unwrap().host_id.clone();
+            s.hosts.push(DiscoveredHost {
+                name: "unrelated".into(),
+                host_id: "different-host".into(),
+                screen_id: 1,
+                addresses: vec!["127.0.0.1:4444".parse().unwrap()],
+            });
+            assert!(s.auto_endpoint().is_none());
+            let address = "127.0.0.1:44990".parse().unwrap();
+            s.hosts.push(DiscoveredHost {
+                name: "known-host".into(),
+                host_id,
+                screen_id: 0,
+                addresses: vec![address],
+            });
+            assert_eq!(s.auto_endpoint(), Some(address));
+            s.auto_suspended = true;
+            assert!(s.auto_endpoint().is_none());
+            s.auto_suspended = false;
+            s.remember = false;
+            assert!(s.auto_endpoint().is_none());
+        }
+        #[gpui_kit::test]
+        fn input_refresh_preserves_saved_session_identity_and_secret(
+            cx: &mut gpui_kit::TestAppContext,
+        ) {
+            use gpui_kit::test::TestWindowExt;
+            let state = Arc::new(Mutex::new(remembered_state()));
+            let (commands, _) = mpsc::channel(16);
+            let entry = LocalScreen {
+                id: 1,
+                state: state.clone(),
+                commands: commands.clone(),
+                shutdown: watch::channel(false).0,
+                thread: Arc::new(Mutex::new(None)),
+            };
+            let workspace = Arc::new(Mutex::new(Workspace {
+                entries: vec![entry],
+                selected: Some(1),
+                ..Default::default()
+            }));
+            cx.update(gpui_kit::init);
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| ViewerView::new(workspace, state.clone(), commands, window, cx))
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            assert!(state.lock().unwrap().remembered.is_some());
+            assert!(state.lock().unwrap().contract.is_some());
+            handle
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |this, cx| this.refresh(window, cx));
+                    let input = view.read(cx).inputs[1].clone();
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                    window.input("new-password", cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert!(state.lock().unwrap().remembered.is_none());
+            assert!(state.lock().unwrap().contract.is_some());
+            assert_eq!(state.lock().unwrap().pin, "new-password");
         }
         #[tokio::test]
         async fn completed_media_task_is_not_polled_again_during_cleanup() {
