@@ -198,6 +198,16 @@ mod app {
     }
 
     impl State {
+        fn viewer_lock_policy(&self) -> bridge_core::sessions::ViewerLockPolicy {
+            self.contract
+                .as_ref()
+                .map(|contract| contract.viewer_lock_policy)
+                .unwrap_or_default()
+        }
+        fn effective_keep_awake(&self) -> bool {
+            self.viewer_lock_policy()
+                .effective_keep_awake(self.preferences.keep_awake)
+        }
         fn auto_endpoint(&self) -> Option<SocketAddr> {
             if !self.auto_connect || self.auto_suspended || !self.remember {
                 return None;
@@ -1309,7 +1319,7 @@ mod app {
                     .child(Form::new().small()
                         .child(Field::new().label("Host screen ID").required(true).child(Input::new(&self.inputs[2]).small()))
                         .child(Field::new().label("Session account").child(Input::new(&self.inputs[3]).small()))
-                        .child(Field::new().label("Password / screen PIN").required(true).child(Input::new(&self.inputs[1]).small().mask_toggle()))
+                        .child(Field::new().label("Password / screen PIN").required(state.username.is_empty()).child(Input::new(&self.inputs[1]).small().mask_toggle()))
                         .child(Field::new().label("Manual host address").description("Leave blank to use the selected discovered host").child(Input::new(&self.inputs[0]).small())))
                     .child(div().flex().flex_wrap().gap_2()
                         .child(Button::new("connect").label("Connect").primary().small().on_click(cx.listener(move |_, _, _, cx| {
@@ -1339,7 +1349,8 @@ mod app {
                     .child(div().flex().flex_col().gap_2()
                         .child(Button::new("remember-session").label(if state.remember{"Remember credentials: on"}else{"Remember credentials: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.remember=!s.remember;s.auto_connect=s.remember;s.auto_suspended=false;if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}else if s.remember{s.remembered=saved_viewer_session(&s);}}cx.notify();})))
                         .child(Button::new("auto-connect-session").label(if state.auto_connect{"Auto-connect: on"}else{"Auto-connect: off"}).outline().small().disabled(!state.remember).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.auto_connect=!s.auto_connect;s.auto_suspended=false;if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}}cx.notify();})))
-                        .child(Button::new("viewer-keep-awake").label(if state.preferences.keep_awake{"Keep viewer awake: on"}else{"Keep viewer awake: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.preferences.keep_awake=!s.preferences.keep_awake;}cx.notify();})))
+                        .child(Button::new("viewer-keep-awake").label(if state.effective_keep_awake(){"Keep viewer awake: on"}else{"Keep viewer awake: off"}).outline().small().disabled(state.viewer_lock_policy()!=bridge_core::sessions::ViewerLockPolicy::ViewerChoice).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){s.preferences.keep_awake=!s.preferences.keep_awake;}cx.notify();})))
+                        .when(state.contract.is_some(),|panel|panel.child(state.viewer_lock_policy().label()))
                         .child(state.power_notice.clone())
                         .child(Button::new("forget-session").label("Forget saved login").danger().small().disabled(state.contract.is_none()).on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){if let Some(contract)=&s.contract{match bridge_core::sessions::forget_viewer(&contract.session_id){Ok(())=>{s.remembered=None;s.authenticated_key=None;s.remember=false;s.auto_connect=false;s.auto_suspended=true;s.message="Saved credentials forgotten".into();},Err(e)=>s.message=format!("Cannot forget login: {e}")}}}cx.notify();}))))
                     .child(screen_list_panel)
@@ -2491,7 +2502,7 @@ mod app {
                     }
                     _ = watchdog.tick() => {
                         let screens = shared.lock().map(|state| state.screens.clone()).unwrap_or_default();
-                        power.set_active(shared.lock().map(|s|s.preferences.keep_awake).unwrap_or(false)&&screens.iter().any(|s|!s.terminal&&s.frame.lock().map(|f|f.frames>0&&!f.closed).unwrap_or(false)));
+                        power.set_active(shared.lock().map(|s|s.effective_keep_awake()).unwrap_or(false)&&screens.iter().any(|s|!s.terminal&&s.frame.lock().map(|f|f.frames>0&&!f.closed).unwrap_or(false)));
                         if let Ok(mut s)=shared.lock(){for screen in &screens{if let Ok(frame)=screen.frame.lock(){if frame.window.width>0&&frame.window.height>0{if let Some(saved)=s.preferences.screens.iter_mut().find(|p|p.screen_id==screen.config.screen_id){saved.window=frame.window.clone();}else if s.preferences.screens.len()<MAX_SCREENS{s.preferences.screens.push(bridge_core::sessions::ViewerScreen{screen_id:screen.config.screen_id,window:frame.window.clone()});}}}}}
                         let preferences=shared.lock().ok().filter(|s|s.contract.is_some()).map(|s|s.preferences.clone());
                         if let Some(preferences)=preferences{let snapshot=bridge_core::sessions::preferences_snapshot(&preferences)?;if snapshot!=last_preferences&&last_preferences_at.elapsed()>=Duration::from_secs(1){send_control(&mut control_send,&ClientMessage::SessionPreferences(preferences)).await?;if let Ok(mut s)=shared.lock(){if let Err(e)=save_viewer_session(&s){s.message=format!("Session save failed: {e}");}}last_preferences=snapshot;last_preferences_at=std::time::Instant::now();}}
@@ -3111,6 +3122,7 @@ mod app {
                 username: "alice".into(),
                 revision: 1,
                 keep_awake: false,
+                viewer_lock_policy: Default::default(),
                 screens: vec![],
             };
             s.username = "alice".into();
@@ -3125,6 +3137,21 @@ mod app {
                 auto_connect: true,
             });
             s
+        }
+        #[test]
+        fn host_viewer_lock_policy_overrides_without_changing_local_preference() {
+            use bridge_core::sessions::ViewerLockPolicy;
+            let mut state = remembered_state();
+            state.preferences.keep_awake = false;
+            state.contract.as_mut().unwrap().viewer_lock_policy = ViewerLockPolicy::KeepAwake;
+            assert!(state.effective_keep_awake());
+            assert!(!state.preferences.keep_awake);
+            state.preferences.keep_awake = true;
+            state.contract.as_mut().unwrap().viewer_lock_policy = ViewerLockPolicy::AllowIdle;
+            assert!(!state.effective_keep_awake());
+            assert!(state.preferences.keep_awake);
+            state.contract.as_mut().unwrap().viewer_lock_policy = ViewerLockPolicy::ViewerChoice;
+            assert!(state.effective_keep_awake());
         }
         #[test]
         fn auto_connection_matches_identity_and_respects_manual_disconnect() {

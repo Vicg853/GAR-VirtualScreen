@@ -928,6 +928,10 @@ None=>break,
                 let(mut requests,mut replies)=viewer.open_bi().await.unwrap();
                 send_control(&mut requests,&ClientMessage::SessionHello{hello:bridge_core::protocol::ClientHello{version:VERSION,codecs:mac::available_codecs(),initial_settings:None},viewer_id:stable_viewer,preferences:Default::default()}).await.unwrap();
                 let accepted:HostMessage=receive_json(&mut replies).await.unwrap();let HostMessage::PersistentSessionAccepted{screens,contract,..}=accepted else{panic!("wrong acceptance")};assert_eq!(screens.len(),2);assert_eq!(contract.session_id,session_id);
+                for policy in [bridge_core::sessions::ViewerLockPolicy::KeepAwake,bridge_core::sessions::ViewerLockPolicy::AllowIdle]{
+                    {let mut state=shared.lock().unwrap();let contract=&mut state.sessions.sessions[0].contract;contract.viewer_lock_policy=policy;contract.revision+=1;}
+                    loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if let HostMessage::SessionUpdated(contract)=message{if contract.viewer_lock_policy==policy{break;}}}
+                }
                 send_control(&mut requests,&ClientMessage::RemoveScreen{request_id:44,screen_id:1}).await.unwrap();
                 loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if matches!(message,HostMessage::ScreenRemoved{request_id:Some(44),screen_id:1}){break;}}
                 send_control(&mut requests,&ClientMessage::ClockProbe{t1:987}).await.unwrap();loop{let message:HostMessage=receive_json(&mut replies).await.unwrap();if matches!(message,HostMessage::ClockReply{t1:987,..}){break;}}
@@ -947,6 +951,18 @@ None=>break,
                 let result=bridge_core::security::authenticate_viewer_session(&viewer,&login,if valid{""}else{"wrong-password"},valid.then_some(&session.key)).await;
                 if valid{assert!(result.is_ok());assert!(matches!(host_auth.await.unwrap().unwrap(),AuthenticatedTarget::Session{..}));}else{assert!(result.is_err());viewer.close(1u32.into(),b"invalid proof");assert!(tokio::time::timeout(Duration::from_secs(2),host_auth).await.unwrap().unwrap().is_err());}
             }
+        }
+        #[tokio::test]
+        async fn empty_and_single_character_session_passwords_authenticate(){
+            tokio::time::timeout(Duration::from_secs(10),async{
+                for password in ["","a"]{
+                    let mut store=bridge_core::sessions::HostStore::new().unwrap();let id=store.create("user".into(),password,vec![]).unwrap();let session=store.sessions[0].clone();
+                    let(_h,_c,host,viewer)=pair().await;
+                    let host_auth=tokio::spawn(async move{bridge_core::security::authenticate_host_target(&host,|_|None,move |_|Some(session.clone())).await});
+                    let login=bridge_core::security::SessionLogin{username:"user".into(),session_id:Some(id.clone()),host_id:Some(store.host_id),viewer_id:bridge_core::sessions::new_id().unwrap()};
+                    let(authenticated,_)=bridge_core::security::authenticate_viewer_session(&viewer,&login,password,None).await.unwrap();assert_eq!(authenticated,id);assert!(matches!(host_auth.await.unwrap().unwrap(),AuthenticatedTarget::Session{..}));
+                }
+            }).await.unwrap();
         }
         #[tokio::test]
         async fn capture_failure_keeps_authenticated_control_responsive() {

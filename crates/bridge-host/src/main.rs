@@ -1097,6 +1097,10 @@ mod app {
                                 });cx.notify();
                             })))
                             .when(state.selected_session.is_some(),|panel|panel.child(Button::new("host-keep-awake").label(if state.sessions.sessions.iter().any(|s|Some(&s.contract.session_id)==state.selected_session.as_ref()&&s.contract.keep_awake){"Keep host awake: on"}else{"Keep host awake: off"}).outline().small().on_click(cx.listener(|this,_,_,cx|{if let Ok(mut s)=this.state.lock(){let id=s.selected_session.clone();if let Some(session)=s.sessions.sessions.iter_mut().find(|session|Some(&session.contract.session_id)==id.as_ref()){session.contract.keep_awake=!session.contract.keep_awake;session.contract.revision+=1;}}cx.notify();}))))
+                            .when(state.selected_session.is_some(),|panel|panel.child(Button::new("host-viewer-lock-policy").label(state.sessions.sessions.iter().find(|s|Some(&s.contract.session_id)==state.selected_session.as_ref()).map(|s|s.contract.viewer_lock_policy.label()).unwrap_or("Viewer lock policy")).outline().small().on_click(cx.listener(|this,_,_,cx|{
+                                if let Ok(mut state)=this.state.lock(){let selected=state.selected_session.clone();if let Some(session)=state.sessions.sessions.iter_mut().find(|s|Some(&s.contract.session_id)==selected.as_ref()){session.contract.viewer_lock_policy=session.contract.viewer_lock_policy.next();session.contract.revision=session.contract.revision.saturating_add(1);}}
+                                cx.notify();
+                            }))))
                             .child(state.power_notice.clone())))
                         .child(screen_list_panel)
                         .child(screen_details),
@@ -1307,7 +1311,7 @@ mod app {
                                 cx.new(|cx| InputState::new(window, cx).placeholder("Username")),
                                 cx.new(|cx| {
                                     InputState::new(window, cx)
-                                        .placeholder("Password (8+ bytes)")
+                                        .placeholder("Password (optional)")
                                         .masked(true)
                                 }),
                             ],

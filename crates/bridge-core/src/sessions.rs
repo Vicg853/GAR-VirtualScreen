@@ -42,8 +42,8 @@ pub fn validate_login(user: &str, password: &str) -> Result<()> {
     {
         bail!("Username must contain 1–64 letters, digits, dots, underscores or hyphens");
     }
-    if !(8..=256).contains(&password.len()) {
-        bail!("Password must contain 8–256 bytes");
+    if password.len() > 256 {
+        bail!("Password must contain at most 256 bytes");
     }
     Ok(())
 }
@@ -109,6 +109,38 @@ pub struct ViewerRegistration {
     pub viewer_id: String,
     pub preferences: ViewerPreferences,
 }
+/// Host policy is independent of the viewer's saved local preference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerLockPolicy {
+    #[default]
+    ViewerChoice,
+    KeepAwake,
+    AllowIdle,
+}
+impl ViewerLockPolicy {
+    pub fn effective_keep_awake(self, viewer_preference: bool) -> bool {
+        match self {
+            Self::ViewerChoice => viewer_preference,
+            Self::KeepAwake => true,
+            Self::AllowIdle => false,
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::ViewerChoice => Self::KeepAwake,
+            Self::KeepAwake => Self::AllowIdle,
+            Self::AllowIdle => Self::ViewerChoice,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ViewerChoice => "Viewer lock policy: viewer choice",
+            Self::KeepAwake => "Viewer lock policy: keep awake",
+            Self::AllowIdle => "Viewer lock policy: allow idle lock",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionContract {
     pub version: u16,
@@ -117,6 +149,8 @@ pub struct SessionContract {
     pub username: String,
     pub revision: u64,
     pub keep_awake: bool,
+    #[serde(default)]
+    pub viewer_lock_policy: ViewerLockPolicy,
     pub screens: Vec<SavedScreen>,
 }
 impl SessionContract {
@@ -247,6 +281,7 @@ impl HostStore {
             username,
             revision: 1,
             keep_awake: false,
+            viewer_lock_policy: ViewerLockPolicy::default(),
             screens,
         };
         contract.validate()?;
@@ -379,6 +414,52 @@ mod tests {
                 .is_err()
         );
         s.validate().unwrap();
+    }
+    #[test]
+    fn session_password_has_no_minimum() {
+        for password in ["", "a", "12", "short"] {
+            validate_login("user", password).unwrap();
+            let mut store = HostStore::new().unwrap();
+            store.create("user".into(), password, vec![]).unwrap();
+            assert_eq!(
+                store.sessions[0].key.0,
+                password_key(password, &store.sessions[0].salt).unwrap().0
+            );
+        }
+        assert!(validate_login("user", &"x".repeat(256)).is_ok());
+        assert!(validate_login("user", &"x".repeat(257)).is_err());
+    }
+    #[test]
+    fn viewer_lock_policy_defaults_and_roundtrips() {
+        let mut store = HostStore::new().unwrap();
+        store.create("user".into(), "", vec![]).unwrap();
+        let mut legacy = serde_json::to_value(&store.sessions[0].contract).unwrap();
+        legacy.as_object_mut().unwrap().remove("viewer_lock_policy");
+        let legacy: SessionContract = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.viewer_lock_policy, ViewerLockPolicy::ViewerChoice);
+        for policy in [
+            ViewerLockPolicy::ViewerChoice,
+            ViewerLockPolicy::KeepAwake,
+            ViewerLockPolicy::AllowIdle,
+        ] {
+            store.sessions[0].contract.viewer_lock_policy = policy;
+            let copy: HostStore = serde_json::from_str(&snapshot(&store).unwrap()).unwrap();
+            assert_eq!(copy.sessions[0].contract.viewer_lock_policy, policy);
+            for local in [false, true] {
+                assert_eq!(
+                    policy.effective_keep_awake(local),
+                    match policy {
+                        ViewerLockPolicy::ViewerChoice => local,
+                        ViewerLockPolicy::KeepAwake => true,
+                        ViewerLockPolicy::AllowIdle => false,
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            ViewerLockPolicy::ViewerChoice.next().next().next(),
+            ViewerLockPolicy::ViewerChoice
+        );
     }
     #[test]
     fn contract_bounds() {
