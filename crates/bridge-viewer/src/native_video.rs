@@ -38,6 +38,8 @@ pub struct VideoFrame {
     pub height: u32,
     pub frames: u64,
     pub presented: u64,
+    pub decoded_sequence: Option<u64>,
+    pub submitted_sequence: Option<u64>,
     pub gpu_memory_bytes: u64,
     pub gpu_in_flight: u32,
     pub frame_age_us: Option<u64>,
@@ -329,7 +331,7 @@ struct DecodedOutput {
 
 enum DecodedFrame {
     Release(mpsc::Sender<std::result::Result<(), String>>),
-    Video(GpuPicture, Option<TraceToken>, u64),
+    Video(GpuPicture, Option<TraceToken>, u64, u64),
 }
 
 enum EngineStart {
@@ -511,6 +513,7 @@ impl VideoApp {
             if !frame.presented.swap(true, Ordering::AcqRel) {
                 if let Ok(mut status) = self.target.lock() {
                     status.presented += 1;
+                    status.submitted_sequence = Some(frame.sequence);
                     if DEBUG {
                         status.frame_age_us = frame.trace.as_ref().and_then(|t| {
                             (t.uncertainty_us != Some(u64::MAX)).then(|| {
@@ -546,6 +549,8 @@ impl VideoApp {
                 status.height = *height;
                 status.frames = 0;
                 status.presented = 0;
+                status.decoded_sequence = None;
+                status.submitted_sequence = None;
                 status.skipped = 0;
                 status.error = None;
             }
@@ -597,7 +602,7 @@ impl VideoApp {
                 continue;
             }
             if DEBUG {
-                if let Some(DecodedFrame::Video(_, Some(t), queued_us)) = &latest {
+                if let Some(DecodedFrame::Video(_, Some(t), queued_us, _)) = &latest {
                     t.mark(
                         Stage::RenderQueue,
                         *queued_us,
@@ -615,7 +620,7 @@ impl VideoApp {
                 decoded => {
                     let trace = if DEBUG {
                         match &decoded {
-                            DecodedFrame::Video(_, t, _) => t.clone(),
+                            DecodedFrame::Video(_, t, _, _) => t.clone(),
                             _ => None,
                         }
                     } else {
@@ -1131,6 +1136,7 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
     diagnostics.record("decoder", engine.api.name());
     update_decoder_status(&target, engine.api.name());
     let mut pending = HashMap::<u64, (TraceToken, u64)>::new();
+    let mut sequences = std::collections::VecDeque::with_capacity(64);
     let mut active_epoch = 0;
     let mut recovery_required = true;
     let mut last_progress = std::time::Instant::now();
@@ -1144,6 +1150,10 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                 last_progress = std::time::Instant::now();
             }
             for picture in pictures {
+                let Some(index) = sequences.iter().position(|&(pts, _)| pts == picture.pts) else {
+                    continue;
+                };
+                let (_, sequence) = sequences.remove(index).unwrap();
                 let trace = if DEBUG {
                     pending.remove(&picture.pts).map(|(token, start)| {
                         token.mark(Stage::Decode, start, Some(now_us()), Outcome::Complete,
@@ -1154,7 +1164,7 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                     None
                 };
                 if !publish_frame::<DEBUG>(
-                    DecodedFrame::Video(picture, trace, if DEBUG { now_us() } else { 0 }),
+                    DecodedFrame::Video(picture, trace, if DEBUG { now_us() } else { 0 }, sequence),
                     &output,
                     &target,
                 ) {
@@ -1187,6 +1197,7 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                         continue;
                     }
                     active_epoch = epoch;
+                    sequences.clear();
                     if DEBUG {
                         for (_, (t, start)) in pending.drain() {
                             t.mark(
@@ -1208,6 +1219,8 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                         status.height = height;
                         status.frames = 0;
                         status.presented = 0;
+                        status.decoded_sequence = None;
+                        status.submitted_sequence = None;
                         status.skipped = 0;
                     }
                 }
@@ -1215,7 +1228,7 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                     epoch,
                     bytes,
                     keyframe,
-                    sequence: _,
+                    sequence,
                     timestamp_us,
                     trace,
                     queued_us,
@@ -1292,6 +1305,10 @@ fn run_engine<A: DecodeApi<H264>, const DEBUG: bool>(
                     } else {
                         engine.api.submit(&bytes, timestamp_us, keyframe)?;
                     }
+                    if sequences.len() == 64 {
+                        sequences.pop_front();
+                    }
+                    sequences.push_back((timestamp_us, sequence));
                     // Wake display loop to drive GPU completion and input admission,
                     // even if decoding has not produced an output picture yet.
                     let _ = proxy.send_event(VideoEvent::Wake);
@@ -1352,8 +1369,8 @@ fn publish_frame<const DEBUG: bool>(
     output: &DecodedOutput,
     target: &Arc<Mutex<VideoFrame>>,
 ) -> bool {
-    let (width, height) = match &frame {
-        DecodedFrame::Video(frame, _, _) => (frame.width, frame.height),
+    let (width, height, sequence) = match &frame {
+        DecodedFrame::Video(frame, _, _, sequence) => (frame.width, frame.height, *sequence),
         DecodedFrame::Release(_) => return true,
     };
     if width == 0
@@ -1372,11 +1389,12 @@ fn publish_frame<const DEBUG: bool>(
         status.width = width;
         status.height = height;
         status.frames += 1;
+        status.decoded_sequence = Some(sequence);
         status.error = None;
     }
     let trace = if DEBUG {
         match &frame {
-            DecodedFrame::Video(_, t, _) => t.clone(),
+            DecodedFrame::Video(_, t, _, _) => t.clone(),
             _ => None,
         }
     } else {
@@ -1397,7 +1415,7 @@ fn publish_frame<const DEBUG: bool>(
         Ok(displaced) => {
             if let Some(displaced) = displaced {
                 if DEBUG {
-                    if let DecodedFrame::Video(_, Some(t), queued_us) = &displaced {
+                    if let DecodedFrame::Video(_, Some(t), queued_us, _) = &displaced {
                         t.mark(
                             Stage::RenderQueue,
                             *queued_us,
@@ -1433,6 +1451,7 @@ fn record_error(target: &Arc<Mutex<VideoFrame>>, message: String) {
 }
 
 struct PresentedFrame {
+    sequence: u64,
     storage: Arc<crate::stream_engine::PictureStorage>,
     presented: AtomicBool,
     bind_group: wgpu::BindGroup,
@@ -1620,7 +1639,7 @@ impl Renderer {
     fn set_frame<const DEBUG: bool>(&mut self, decoded: DecodedFrame) -> Result<PresentedFrame> {
         let upload_start = if DEBUG { now_us() } else { 0 };
         let mut token = None;
-        let DecodedFrame::Video(frame, trace, queued_us) = decoded else {
+        let DecodedFrame::Video(frame, trace, queued_us, sequence) = decoded else {
             bail!("Release barrier is not a picture");
         };
         if DEBUG {
@@ -1717,6 +1736,7 @@ impl Renderer {
             }
         }
         Ok(PresentedFrame {
+            sequence,
             storage,
             presented: AtomicBool::new(false),
             bind_group,

@@ -1799,6 +1799,8 @@ mod app {
             frame.width = config.settings.width;
             frame.height = config.settings.height;
             frame.frames = 0;
+            frame.decoded_sequence = None;
+            frame.submitted_sequence = None;
             frame.skipped = 0;
             frame.error = decoder_reset_error;
         }
@@ -2489,6 +2491,7 @@ mod app {
                 s.power_notice = notice;
             }
         });
+        let mut video_progress = HashMap::new();
         let mut last_preferences = String::new();
         let mut last_preferences_at = std::time::Instant::now() - Duration::from_secs(2);
         let session_result: Result<()> = async {
@@ -2509,7 +2512,22 @@ mod app {
 
                         counters.retain(|id,_|screens.iter().any(|s|s.config.screen_id==*id));
                         let stats_now=now_us(); let collect=stats_now.saturating_sub(last_stats)>=1_000_000;
+                        video_progress.retain(|id, _| screens.iter().any(|s| s.config.screen_id == *id));
                         for screen in screens {
+                            let progress = screen.frame.lock().ok().filter(|f| !f.closed && !screen.terminal).map(|f| bridge_core::protocol::VideoProgress {
+                                screen_id: screen.config.screen_id,
+                                generation: screen.config.generation,
+                                decoded: f.decoded_sequence,
+                                submitted: f.submitted_sequence,
+                            });
+                            if let Some(progress) = progress.filter(|p| p.decoded.is_some()) {
+                                if video_progress.get(&progress.screen_id).is_none_or(|(last, at)| {
+                                    *last != progress || stats_now.saturating_sub(*at) >= 500_000
+                                }) {
+                                    send_control(&mut control_send, &ClientMessage::VideoProgress(progress)).await?;
+                                    video_progress.insert(progress.screen_id, (progress, stats_now));
+                                }
+                            }
                             if collect && screen.config.instrumented {
                                 let (decoded,skipped,presented,memory,in_flight,age,engine)=screen.frame.lock().map(|s|(s.frames,s.skipped,s.presented,s.gpu_memory_bytes,s.gpu_in_flight,s.frame_age_us,s.decoder.clone())).unwrap_or_default();
                                 let previous=counters.insert(screen.config.screen_id,(screen.bytes,screen.received_frames,decoded,connection.rtt().as_micros() as u64,presented)).unwrap_or_default();

@@ -79,7 +79,7 @@ void airbridge_display_release(void *display) {
     if (display) CFBridgingRelease(display);
 }
 
-typedef void (*AirBridgeVideoFrameCallback)(void *context, const uint8_t *bytes, size_t length, size_t row_bytes);
+typedef void (*AirBridgeVideoFrameCallback)(void *context, IOSurfaceRef surface);
 
 @interface AirBridgeVideoStream : NSObject
 @property(nonatomic) CGDisplayStreamRef stream;
@@ -131,28 +131,32 @@ void *airbridge_video_stream_start(uint32_t display_id, uint32_t width, uint32_t
     NSDictionary *properties = @{
         (__bridge NSString *)cursor_key: @YES,
         (__bridge NSString *)frame_time_key: @(1.0 / fps),
-        (__bridge NSString *)depth_key: @3,
+        (__bridge NSString *)depth_key: @6,
     };
+    typedef const CGRect *(*UpdateRects)(CGDisplayStreamUpdateRef, CGDisplayStreamUpdateRectType, size_t *);
+    UpdateRects update_rects = (UpdateRects)dlsym(RTLD_DEFAULT, "CGDisplayStreamUpdateGetRects");
+    typedef size_t (*UpdateDropCount)(CGDisplayStreamUpdateRef);
+    UpdateDropCount drop_count = (UpdateDropCount)dlsym(RTLD_DEFAULT, "CGDisplayStreamUpdateGetDropCount");
+    __block BOOL delivered = NO;
     capture.stream = create_stream(
         display_id, width, height, kCVPixelFormatType_32BGRA,
         (__bridge CFDictionaryRef)properties, queue,
         ^(CGDisplayStreamFrameStatus status, uint64_t display_time,
           IOSurfaceRef surface, CGDisplayStreamUpdateRef update) {
             (void)display_time;
-            (void)update;
             if (status == kCGDisplayStreamFrameStatusStopped) {
                 dispatch_semaphore_signal(stopped);
                 return;
             }
             if (status != kCGDisplayStreamFrameStatusFrameComplete || !surface) return;
-            if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
-            const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-            size_t row_bytes = IOSurfaceGetBytesPerRow(surface);
-            size_t height = IOSurfaceGetHeight(surface);
-            if (base && row_bytes && height && height <= SIZE_MAX / row_bytes) {
-                callback(context, base, row_bytes * height, row_bytes);
+            if (delivered && update && update_rects && drop_count && !drop_count(update)) {
+                // Dirty rectangles are the union of refreshed and moved regions.
+                size_t dirty = 0;
+                update_rects(update, kCGDisplayStreamUpdateDirtyRects, &dirty);
+                if (!dirty) return;
             }
-            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+            delivered = YES;
+            callback(context, surface);
         });
     if (!capture.stream) {
         if (error_code) *error_code = -1001;

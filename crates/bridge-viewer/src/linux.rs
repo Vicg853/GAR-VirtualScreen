@@ -30,6 +30,8 @@ pub struct VideoFrame {
     pub height: u32,
     pub frames: u64,
     pub presented: u64,
+    pub decoded_sequence: Option<u64>,
+    pub submitted_sequence: Option<u64>,
     pub gpu_memory_bytes: u64,
     pub gpu_in_flight: u32,
     pub frame_age_us: Option<u64>,
@@ -458,6 +460,8 @@ fn launch_using(
                             s.height = status.height;
                             s.frames = status.frames;
                             s.presented = status.presented;
+                            s.decoded_sequence = status.decoded_sequence;
+                            s.submitted_sequence = status.submitted_sequence;
                             s.gpu_memory_bytes = status.gpu_memory_bytes;
                             s.gpu_in_flight = status.gpu_in_flight;
                             s.frame_age_us = status.frame_age_us;
@@ -709,6 +713,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
     let tick_logs = diagnostics.clone();
     let events = thread::spawn(move || {
         let mut log_cursor = 0;
+        let mut previous_status = None;
         while !tick_done.load(Ordering::Acquire) {
             let status = tick_frame
                 .lock()
@@ -718,6 +723,8 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                     height: s.height,
                     frames: s.frames,
                     presented: s.presented,
+                    decoded_sequence: s.decoded_sequence,
+                    submitted_sequence: s.submitted_sequence,
                     gpu_memory_bytes: s.gpu_memory_bytes,
                     gpu_in_flight: s.gpu_in_flight,
                     frame_age_us: s.frame_age_us,
@@ -729,8 +736,11 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                 })
                 .unwrap_or_default();
             if let Ok(mut socket) = tick_output.lock() {
-                if worker::write(&mut *socket, &Message::Status(status), &[]).is_err() {
-                    break;
+                if previous_status.as_ref() != Some(&status) {
+                    previous_status = Some(status.clone());
+                    if worker::write(&mut *socket, &Message::Status(status), &[]).is_err() {
+                        break;
+                    }
                 }
                 for (id, line) in tick_logs.since(log_cursor, 16) {
                     worker::write(
@@ -757,7 +767,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(50));
         }
     });
     let mut placement = bridge_core::sessions::WindowPlacement::default();

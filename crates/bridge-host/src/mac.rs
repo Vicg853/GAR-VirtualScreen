@@ -12,14 +12,14 @@ use std::{
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use videotoolbox::{
-    compression::{CompressionSession, HardwareAcceleration, ProfileLevel},
+    compression::{CompressionSession, FrameProperties, HardwareAcceleration, ProfileLevel},
     session::Codec,
 };
 
@@ -42,7 +42,7 @@ unsafe extern "C" {
         height: u32,
         fps: u32,
         context: *mut c_void,
-        callback: extern "C" fn(*mut c_void, *const u8, usize, usize),
+        callback: extern "C" fn(*mut c_void, *mut c_void),
         error_code: *mut i32,
     ) -> *mut c_void;
     #[cfg(not(test))]
@@ -129,8 +129,7 @@ impl Drop for VirtualDisplay {
 
 enum Captured {
     Video {
-        bytes: Vec<u8>,
-        row_bytes: usize,
+        surface: Arc<CaptureSurface>,
         timestamp_us: u64,
         sequence: u64,
         trace: Option<TraceToken>,
@@ -138,23 +137,39 @@ enum Captured {
     },
 }
 
+// The retain owns the object; the use count prevents CoreGraphics from
+// recycling its pixels while queued or while VideoToolbox is reading them.
+struct CaptureSurface(IOSurface);
+
+impl Drop for CaptureSurface {
+    fn drop(&mut self) {
+        self.0.decrement_use_count();
+    }
+}
+
+type LatestCapture = Arc<Mutex<Option<Captured>>>;
+
 struct FrameContext {
-    output: mpsc::Sender<Captured>,
+    output: LatestCapture,
+    consumer: std::thread::Thread,
     started: Instant,
     dropped: Arc<AtomicU64>,
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     telemetry: Arc<Telemetry>,
 }
 
-extern "C" fn frame_callback<const DEBUG: bool>(
-    context: *mut c_void,
-    bytes: *const u8,
-    len: usize,
-    row_bytes: usize,
-) {
+extern "C" fn frame_callback<const DEBUG: bool>(context: *mut c_void, surface: *mut c_void) {
     // No unwind may cross the Objective-C callback boundary.
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let context = unsafe { &*(context.cast::<FrameContext>()) };
+        let Some(surface) = (unsafe { IOSurface::from_raw_borrowed(surface) }) else {
+            return;
+        };
+        surface.increment_use_count();
+        let surface = Arc::new(CaptureSurface(surface));
+        let Ok(mut slot) = context.output.lock() else {
+            return;
+        };
         let sequence = context.sequence.fetch_add(1, Ordering::Relaxed);
         let trace = if DEBUG {
             let capture_us = now_us();
@@ -168,10 +183,8 @@ extern "C" fn frame_callback<const DEBUG: bool>(
         } else {
             None
         };
-        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
         let packet = Captured::Video {
-            bytes: bytes.to_vec(),
-            row_bytes,
+            surface,
             timestamp_us: context.started.elapsed().as_micros() as u64,
             sequence,
             trace: trace.clone(),
@@ -189,7 +202,10 @@ extern "C" fn frame_callback<const DEBUG: bool>(
                 t.mark(Stage::CaptureQueue, now_us(), None, Outcome::Pending, "");
             }
         }
-        if context.output.try_send(packet).is_err() {
+        let displaced = slot.replace(packet);
+        drop(slot);
+        context.consumer.unpark();
+        if let Some(Captured::Video { trace, .. }) = displaced {
             if DEBUG {
                 if let Some(t) = &trace {
                     t.mark(
@@ -197,7 +213,7 @@ extern "C" fn frame_callback<const DEBUG: bool>(
                         t.capture_us,
                         Some(now_us()),
                         Outcome::Dropped,
-                        "Capture queue full",
+                        "Replaced by newer capture",
                     );
                 }
             }
@@ -215,15 +231,18 @@ impl VideoStream {
     fn start<const DEBUG: bool>(
         display_id: u32,
         settings: &VideoSettings,
-        output: mpsc::Sender<Captured>,
+        output: LatestCapture,
+        started: Instant,
+        sequence: Arc<AtomicU64>,
         dropped: Arc<AtomicU64>,
         telemetry: Arc<Telemetry>,
     ) -> Result<Self> {
         let context = Box::into_raw(Box::new(FrameContext {
             output,
-            started: Instant::now(),
+            consumer: std::thread::current(),
+            started,
             dropped,
-            sequence: AtomicU64::new(0),
+            sequence,
             telemetry,
         }));
         let mut error_code = 0;
@@ -306,6 +325,33 @@ pub fn available_codecs() -> Vec<CodecOption> {
         .collect()
 }
 
+fn copy_bgra(source: &IOSurface, destination: &IOSurface) -> Result<()> {
+    let source_stride = source.bytes_per_row();
+    let destination_stride = destination.bytes_per_row();
+    let width = destination.width() * 4;
+    let height = destination.height();
+    let input = source
+        .lock(IOSurfaceLockOptions::READ_ONLY)
+        .map_err(|code| anyhow!("Capture IOSurface lock error {code}"))?;
+    let mut output = destination
+        .lock(IOSurfaceLockOptions::NONE)
+        .map_err(|code| anyhow!("Encoder IOSurface lock error {code}"))?;
+    let input = unsafe { input.as_slice() }.context("Capture surface cannot be mapped")?;
+    let output = unsafe { output.as_slice_mut() }.context("Encoder surface cannot be mapped")?;
+    for row in 0..height {
+        let src = row * source_stride;
+        let dst = row * destination_stride;
+        let bytes = input
+            .get(src..src + width)
+            .context("Capture row truncated")?;
+        output
+            .get_mut(dst..dst + width)
+            .context("Encoder row truncated")?
+            .copy_from_slice(bytes);
+    }
+    Ok(())
+}
+
 pub(crate) fn capture_display<const DEBUG: bool>(
     display_id: u32,
     screen_id: u32,
@@ -316,6 +362,7 @@ pub(crate) fn capture_display<const DEBUG: bool>(
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     telemetry: Arc<Telemetry>,
+    keyframe_request: Arc<AtomicBool>,
     progress: impl Fn(&str),
 ) -> Result<()> {
     if QUARANTINED.load(Ordering::Acquire) {
@@ -328,7 +375,9 @@ pub(crate) fn capture_display<const DEBUG: bool>(
     if !capture_allowed() {
         bail!("Screen Recording permission not granted for this executable");
     }
-    let (captured_tx, mut captured_rx) = mpsc::channel(4);
+    let captured = LatestCapture::default();
+    let sequence_counter = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
     progress("Preparing VideoToolbox encoder…");
     let mut encoder_builder =
         CompressionSession::builder(settings.width as i32, settings.height as i32, Codec::H264)
@@ -349,14 +398,12 @@ pub(crate) fn capture_display<const DEBUG: bool>(
     if settings.low_latency_rate_control {
         encoder_builder = encoder_builder.with_low_latency_rate_control(true);
     }
+    // Keep the most recently submitted lease alive until after the encoder
+    // is invalidated, including when completion returns an error.
+    let mut latest: Option<Arc<CaptureSurface>> = None;
+    let mut copy_surface = None;
     let encoder = encoder_builder.build()?;
-    let surface = IOSurface::create(
-        settings.width as usize,
-        settings.height as usize,
-        u32::from_be_bytes(*b"BGRA"),
-        4,
-    )
-    .ok_or_else(|| anyhow!("Cannot allocate encoder surface"))?;
+    let mut direct = std::env::var_os("AIRBRIDGE_CAPTURE_COPY").is_none();
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -366,7 +413,9 @@ pub(crate) fn capture_display<const DEBUG: bool>(
     let mut stream = VideoStream::start::<DEBUG>(
         display_id,
         &settings,
-        captured_tx,
+        captured.clone(),
+        started,
+        sequence_counter.clone(),
         dropped.clone(),
         telemetry,
     )?;
@@ -374,6 +423,9 @@ pub(crate) fn capture_display<const DEBUG: bool>(
     let capture_started = Instant::now();
     let mut received_first_frame = false;
     let mut permission_check = Instant::now();
+    let mut last_keyframe = None::<Instant>;
+    let mut last_force = None::<Instant>;
+    let mut last_timestamp = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         if permission_check.elapsed() >= Duration::from_secs(1) {
@@ -384,9 +436,28 @@ pub(crate) fn capture_display<const DEBUG: bool>(
             }
         }
 
-        let packet = match captured_rx.try_recv() {
-            Ok(packet) => packet,
-            Err(mpsc::error::TryRecvError::Empty) => {
+        let can_force = last_keyframe
+            .into_iter()
+            .chain(last_force)
+            .all(|at| at.elapsed() >= Duration::from_millis(250));
+        let packet = {
+            let mut slot = captured
+                .lock()
+                .map_err(|_| anyhow!("Capture slot unavailable"))?;
+            slot.take().or_else(|| {
+                let surface = latest.as_ref()?;
+                (can_force && keyframe_request.load(Ordering::Acquire)).then(|| Captured::Video {
+                    surface: surface.clone(),
+                    timestamp_us: started.elapsed().as_micros() as u64,
+                    sequence: sequence_counter.fetch_add(1, Ordering::Relaxed),
+                    trace: None,
+                    queued_us: 0,
+                })
+            })
+        };
+        let packet = match packet {
+            Some(packet) => packet,
+            None => {
                 if !received_first_frame && capture_started.elapsed() > Duration::from_secs(10) {
                     progress(
                         "Video capture delivered no frame within 10 seconds; stopping capture…",
@@ -395,10 +466,11 @@ pub(crate) fn capture_display<const DEBUG: bool>(
                         "CoreGraphics delivered no initial video frame within 10 seconds for virtual display {display_id}"
                     );
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                // Fresh capture wakes immediately; idle keyframe requests are
+                // checked on the timeout without polling hundreds of times/sec.
+                std::thread::park_timeout(Duration::from_millis(20));
                 continue;
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => break,
         };
         if !received_first_frame {
             received_first_frame = true;
@@ -406,13 +478,25 @@ pub(crate) fn capture_display<const DEBUG: bool>(
         }
         let (header, bytes, trace) = match packet {
             Captured::Video {
-                bytes,
-                row_bytes,
+                surface,
                 timestamp_us,
                 sequence,
                 trace,
                 queued_us,
             } => {
+                let force = can_force && keyframe_request.swap(false, Ordering::AcqRel);
+                if force {
+                    last_force = Some(Instant::now());
+                }
+                if surface.0.width() != settings.width as usize
+                    || surface.0.height() != settings.height as usize
+                    || surface.0.pixel_format() != u32::from_be_bytes(*b"BGRA")
+                {
+                    bail!("CoreGraphics capture surface has an unexpected format or size");
+                }
+                let timestamp_us = timestamp_us.max(last_timestamp.saturating_add(1));
+                last_timestamp = timestamp_us;
+                latest = Some(surface.clone());
                 let encode_start = if DEBUG { now_us() } else { 0 };
                 if DEBUG {
                     if let Some(t) = &trace {
@@ -426,44 +510,61 @@ pub(crate) fn capture_display<const DEBUG: bool>(
                         t.mark(Stage::Encode, encode_start, None, Outcome::Pending, "");
                     }
                 }
-                let mut guard = surface
-                    .lock(IOSurfaceLockOptions::NONE)
-                    .map_err(|code| anyhow!("IOSurface lock error {code}"))?;
-                let destination = (unsafe { guard.as_slice_mut() })
-                    .context("Encoder surface cannot be mapped")?;
-                let destination_row = surface.bytes_per_row();
-                let copy_width = (settings.width as usize) * 4;
-                for row in 0..settings.height as usize {
-                    let source_start = row * row_bytes;
-                    let destination_start = row * destination_row;
-                    if source_start + copy_width > bytes.len()
-                        || destination_start + copy_width > destination.len()
-                    {
-                        bail!("Capture buffer has unexpected dimensions");
-                    }
-                    destination[destination_start..destination_start + copy_width]
-                        .copy_from_slice(&bytes[source_start..source_start + copy_width]);
-                }
-                drop(guard);
-                let encoded =
-                    match encoder.encode(&surface, CMTime::new(timestamp_us as i64, 1_000_000)) {
-                        Ok(encoded) => encoded,
-                        Err(error) => {
-                            if DEBUG {
-                                if let Some(t) = &trace {
-                                    t.mark(
-                                        Stage::Encode,
-                                        encode_start,
-                                        Some(now_us()),
-                                        Outcome::Failed,
-                                        &error.to_string(),
-                                    );
-                                }
-                            }
-                            return Err(error.into());
+                let pts = CMTime::new(timestamp_us as i64, 1_000_000);
+                let properties = || FrameProperties::new().with_force_key_frame(force);
+                let result = if direct {
+                    match encoder.encode_with_properties(&surface.0, pts, properties()) {
+                        Err(videotoolbox::VTError::PixelBufferCreateFailed(_)) => {
+                            direct = false;
+                            progress(
+                                "Capture surface cannot be wrapped; using the compatible copy path",
+                            );
+                            None
                         }
-                    };
+                        result => Some(result),
+                    }
+                } else {
+                    None
+                };
+                let result = match result {
+                    Some(result) => result,
+                    None => {
+                        if copy_surface.is_none() {
+                            copy_surface = IOSurface::create(
+                                settings.width as usize,
+                                settings.height as usize,
+                                u32::from_be_bytes(*b"BGRA"),
+                                4,
+                            );
+                        }
+                        let copy = copy_surface
+                            .as_ref()
+                            .context("Cannot allocate encoder surface")?;
+                        copy_bgra(&surface.0, copy)?;
+                        encoder.encode_with_properties(copy, pts, properties())
+                    }
+                };
+                let encoded = match result {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        if DEBUG {
+                            if let Some(t) = &trace {
+                                t.mark(
+                                    Stage::Encode,
+                                    encode_start,
+                                    Some(now_us()),
+                                    Outcome::Failed,
+                                    &error.to_string(),
+                                );
+                            }
+                        }
+                        return Err(error.into());
+                    }
+                };
                 if encoded.data.is_empty() {
+                    if force {
+                        keyframe_request.store(true, Ordering::Release);
+                    }
                     if DEBUG {
                         if let Some(t) = &trace {
                             t.mark(
@@ -480,8 +581,12 @@ pub(crate) fn capture_display<const DEBUG: bool>(
                 let keyframe = encoded
                     .cm_sample_buffer()
                     .is_some_and(|sample| sample.is_sync_sample());
+                if force && !keyframe {
+                    keyframe_request.store(true, Ordering::Release);
+                }
                 let mut annex_b = Vec::with_capacity(encoded.data.len() + 128);
                 if keyframe {
+                    last_keyframe = Some(Instant::now());
                     if let Some(format) = encoded
                         .cm_sample_buffer()
                         .and_then(|sample| sample.format_description())
@@ -578,13 +683,41 @@ unsafe fn airbridge_video_stream_stop(_stream: *mut c_void) -> bool {
 mod ownership_tests {
     use super::*;
     #[test]
-    fn callback_context_is_retained_until_native_quiescence_is_confirmed() {
-        let (tx, _rx) = mpsc::channel(1);
-        let context = Box::into_raw(Box::new(FrameContext {
-            output: tx,
+    fn latest_capture_releases_displaced_surface_and_leases_the_current_one() {
+        let first = IOSurface::create(64, 64, u32::from_be_bytes(*b"BGRA"), 4).unwrap();
+        let second = IOSurface::create(64, 64, u32::from_be_bytes(*b"BGRA"), 4).unwrap();
+        let mut context = FrameContext {
+            output: LatestCapture::default(),
+            consumer: std::thread::current(),
             started: Instant::now(),
             dropped: Arc::new(AtomicU64::new(0)),
-            sequence: AtomicU64::new(0),
+            sequence: Arc::new(AtomicU64::new(0)),
+            telemetry: Telemetry::new(),
+        };
+        let ptr = std::ptr::from_mut(&mut context).cast();
+        frame_callback::<false>(ptr, first.as_ptr());
+        assert!(first.is_in_use());
+        frame_callback::<false>(ptr, second.as_ptr());
+        assert!(!first.is_in_use());
+        assert!(second.is_in_use());
+        assert_eq!(context.dropped.load(Ordering::Relaxed), 1);
+        let capture = context.output.lock().unwrap().take();
+        assert!(matches!(
+            &capture,
+            Some(Captured::Video { sequence: 1, .. })
+        ));
+        drop(capture);
+        assert!(!second.is_in_use());
+    }
+
+    #[test]
+    fn callback_context_is_retained_until_native_quiescence_is_confirmed() {
+        let context = Box::into_raw(Box::new(FrameContext {
+            output: LatestCapture::default(),
+            consumer: std::thread::current(),
+            started: Instant::now(),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sequence: Arc::new(AtomicU64::new(0)),
             telemetry: Telemetry::new(),
         }));
         let mut lease = VideoStream {

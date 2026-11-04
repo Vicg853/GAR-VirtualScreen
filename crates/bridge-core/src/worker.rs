@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Local IPC evolves independently from the network protocol.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TraceSeed {
     pub capture_us: u64,
@@ -15,7 +15,7 @@ pub struct TraceSeed {
     pub uncertainty_us: Option<u64>,
     pub queued_host_us: i64,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     #[serde(default)]
     pub window: crate::sessions::WindowPlacement,
@@ -23,6 +23,8 @@ pub struct Status {
     pub height: u32,
     pub frames: u64,
     pub presented: u64,
+    pub decoded_sequence: Option<u64>,
+    pub submitted_sequence: Option<u64>,
     pub gpu_memory_bytes: u64,
     pub gpu_in_flight: u32,
     pub frame_age_us: Option<u64>,

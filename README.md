@@ -28,7 +28,7 @@ cargo run -p bridge-viewer --release
 
 Start the Mac host, then start the viewer. On the host, add/select a screen and open its details to see its PIN. On the viewer, add a local screen, select the discovered host screen inside its details, enter that screen's PIN, and click **Connect**. If discovery fails, enter the Mac's IP address in the manual address field. UDP port **44990** and local mDNS traffic must be allowed between the machines.
 
-The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 6. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
+The connection uses QUIC keepalive packets every five seconds during capture setup. After PIN authentication, a dedicated bidirectional control stream stays separate from media. Each screen and each media lane uses its own labeled QUIC unidirectional stream with independent async sender/receiver tasks. A stalled or restarted screen lane therefore does not block another screen's media lane. Audio and future input/output lanes have reserved labels but are not implemented yet. Both apps must be rebuilt together because the wire protocol is version 9. A virtual display appearing in macOS Display Settings confirms display creation, but capture must still start before video can arrive.
 
 The host's video-only path uses CoreGraphics display streams, so it does not construct a ScreenCaptureKit stream. ScreenCaptureKit initialized a CoreAudio clock even with audio capture disabled and stalled for about 150 seconds on one Mac. The CoreGraphics display-stream API is marked obsolete by the macOS 15+ SDK and may be removed in a future macOS release; the host reports a visible error if this API is unavailable.
 
@@ -48,7 +48,7 @@ Closing a native video window detaches that viewer from its host screen. The hos
 
 The native video window uses its own wgpu renderer, separate from GPUI, and keeps one compressed packet waiting for the decoder and one decoded frame waiting for presentation. If decoding outruns painting, the older unpainted frame is skipped. The statistics inspector reports the skipped-frame count so an overloaded viewer is visible.
 
-## Wire protocol v8
+## Wire protocol v9
 
 A viewer connection can authenticate a saved host session using its account and password. One authenticated QUIC connection attaches the session's screens, each through an independent media lane and shared host source actor. The contract has a stable session ID and host ID; each viewer has a stable locally persisted device ID. Host-owned source settings and display arrangement are separate from viewer-owned display window preferences. Request IDs, settings revisions and capture generations scope later messages. Temporary screens that do not belong to a saved session still support the six-digit PIN flow. Session screens require their session account/password and do not admit PIN authentication.
 
@@ -67,6 +67,10 @@ Each Linux screen uses a supervised native child mode of the viewer executable. 
 ## Settings
 
 The host provides Responsive, Balanced, and Detailed presets. The viewer uses the host's selected preset by default. Selecting a preset in the viewer requests a shared source change for that host screen, affecting its active subscribers. The codec submenu exposes orientation, frame rate, bitrate, keyframe interval, H.264 profile, and low latency rate control. Changes to display settings take effect immediately on the selected screen after its media pipeline restarts. **Save custom preset** writes to the local `airbridge/presets.json` configuration file on that machine.
+
+CoreGraphics capture keeps one pending surface and replaces it with the newest update if encoding is busy. It hands the retained BGRA IOSurface to VideoToolbox directly, with a copy fallback if the surface cannot be wrapped. Set `AIRBRIDGE_CAPTURE_COPY=1` on the host to force the compatibility path. When CoreGraphics confirms there is no display damage, the host skips encoding; it can still send a keyframe from the last surface when a viewer joins or needs to recover.
+
+Viewers report the latest decoded and presentation-submitted frame IDs on the control channel. The host uses the age and count of outstanding frames to cap each viewer's video backlog independently. It skips stale work and resumes at a keyframe; it does not adjust the shared encoder bitrate based on a single viewer. Submission is not monitor scanout.
 
 The host currently sends progressive 8-bit 4:2:0 H.264 without B-frame reordering. Each video lane declares this contract, and the viewer carries the source PTS through its private worker IPC in both normal and instrumented modes. Inline SPS/PPS supply crop and SDR color metadata.
 
@@ -101,7 +105,7 @@ Run Cargo inside this repository so its toolchain file is applied. No nightly co
 
 ## Temporary stream diagnostics
 
-In stream details, click **Open statistics** below Video settings. Opening the inspector requests a new instrumented stream generation; closing it returns to the normal compiled path unless another peer still has its inspector open. Widget navigation leaves open inspectors and their subscriptions active. Both apps must be rebuilt for protocol v8. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
+In stream details, click **Open statistics** below Video settings. Opening the inspector requests a new instrumented stream generation; closing it returns to the normal compiled path unless another peer still has its inspector open. Widget navigation leaves open inspectors and their subscriptions active. Both apps must be rebuilt for protocol v9. Normal and instrumented capture/send/receive/decode/render functions are separately monomorphized from constant-generic implementations; the normal processing path has no timing collection branch. Routine sent/received-frame progress logs were removed; lifecycle/errors remain and console/file writes run asynchronously.
 
 **Open statistics** in the screen controls opens a separate resizable Kit DataTable inspector and enables temporary instrumentation. Statistics and timing controls appear only in this window. The identity column stays pinned while scrolling; columns can be resized. **GPU / display stages** filters the table for decoding, queues, uploads, swapchain acquisition, GPU work and presentation. **Start after capture (avg)** is a cumulative offset; **Stage duration (avg)** is time within the stage. Do not add the start offsets. Closing the inspector releases this screen's diagnostics subscription; instrumentation remains active if another peer is still subscribed. Removing/disconnecting a source clears the inspector's data and disables its stream actions.
 
@@ -118,7 +122,7 @@ Screen Recording preflight gates capture and display preparation. Use the explic
 
 The native callback queue and callback context remain owned until stop is confirmed and the callback queue drains. Unconfirmed cleanup retains the entire producer/display and blocks new capture/display work until host restart. A stuck in-process macOS operation is not forcibly freed; the screen records the retained-resource failure. The Linux supervisor has a stronger isolation boundary because its native resources live in a child process.
 
-The audited implementation plan and lifecycle/UI map are in [screen-ownership-and-lifecycle-plan.md](docs/screen-ownership-and-lifecycle-plan.md). Both apps must be rebuilt for protocol v8.
+The audited implementation plan and lifecycle/UI map are in [screen-ownership-and-lifecycle-plan.md](docs/screen-ownership-and-lifecycle-plan.md). Both apps must be rebuilt for protocol v9.
 
 ## GPU engine implementation and nonvisual checks
 

@@ -9,6 +9,8 @@ pub struct VideoFrame {
     pub height: u32,
     pub frames: u64,
     pub presented: u64,
+    pub decoded_sequence: Option<u64>,
+    pub submitted_sequence: Option<u64>,
     pub gpu_memory_bytes: u64,
     pub gpu_in_flight: u32,
     pub frame_age_us: Option<u64>,

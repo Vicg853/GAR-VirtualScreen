@@ -14,7 +14,7 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 pub const MAX_VIEWERS_PER_SCREEN: usize = 8;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
@@ -57,6 +57,16 @@ pub struct ChangeScreenSettingsRequest {
     pub settings: VideoSettings,
 }
 
+/// Cumulative progress for one viewer and one video generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoProgress {
+    pub screen_id: ScreenId,
+    pub generation: StreamGeneration,
+    pub decoded: Option<u64>,
+    /// Submitted for presentation, not monitor scanout.
+    pub submitted: Option<u64>,
+}
+
 /// Viewer-to-host requests. This enum is only read from the control stream on
 /// the host; role-specific types make invalid directionality explicit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +95,7 @@ pub enum ClientMessage {
     ClockProbe {
         t1: u64,
     },
+    VideoProgress(VideoProgress),
     VideoStopped {
         screen_id: ScreenId,
         generation: StreamGeneration,

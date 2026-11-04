@@ -16,7 +16,10 @@ mod service {
     struct ScreenHandle {
         tx: mpsc::Sender<ScreenCommand>,
     }
+    type VideoProgress = bridge_core::protocol::VideoProgress;
+
     enum ScreenCommand {
+        VideoProgress { id: u64, progress: VideoProgress },
         Join {
             id: u64,
             connection: quinn::Connection,
@@ -56,6 +59,7 @@ mod service {
             Arc<AtomicBool>,
             Arc<Telemetry>,
             Arc<AtomicU64>,
+            Arc<AtomicBool>,
         ),
     }
     enum NativeEvent {
@@ -69,6 +73,7 @@ mod service {
         controls: mpsc::Sender<HostMessage>,
         packets: Option<bridge_core::fanout::Subscriber<mac::EncodedPacket>>,
         sender: Option<tokio::task::JoinHandle<()>>,
+        progress: Option<watch::Sender<VideoProgress>>,
         debug: bool,
         active: bool,
         telemetry: Arc<Telemetry>,
@@ -215,7 +220,7 @@ mod service {
                     let _ = events
                         .blocking_send(NativeEvent::Prepared(prepare(&mut display, &settings)));
                 }
-                NativeCommand::Start(config, packets, stop, telemetry, dropped) => {
+                NativeCommand::Start(config, packets, stop, telemetry, dropped, keyframe_request) => {
                     let result = prepare(&mut display, &config.settings).and_then(|_| {
                         let display_id = display
                             .as_ref()
@@ -245,6 +250,7 @@ mod service {
                                 stop,
                                 dropped,
                                 telemetry,
+                                keyframe_request,
                                 progress,
                             )
                         } else {
@@ -258,6 +264,7 @@ mod service {
                                 stop,
                                 dropped,
                                 telemetry,
+                                keyframe_request,
                                 progress,
                             )
                         };
@@ -285,7 +292,7 @@ mod service {
                 NativeCommand::Configure(_) => {
                     let _ = events.blocking_send(NativeEvent::Prepared(Ok(())));
                 }
-                NativeCommand::Start(config, packets, stop, _telemetry, _dropped) => {
+                NativeCommand::Start(config, packets, stop, _telemetry, _dropped, keyframe_request) => {
                     if config.settings.bitrate_kbps == 7777 {
                         let _ = events.blocking_send(NativeEvent::Ended(Err(anyhow::anyhow!(
                             "Screen Recording permission denied (injected)"
@@ -302,7 +309,7 @@ mod service {
                                 kind: bridge_core::protocol::MediaKind::Video,
                                 sequence,
                                 timestamp_us: now_us(),
-                                keyframe: sequence % 5 == 1,
+                                keyframe: sequence % 5 == 1 || keyframe_request.swap(false, Ordering::AcqRel),
                                 width: config.settings.width,
                                 height: config.settings.height,
                                 sample_rate: 0,
@@ -327,6 +334,7 @@ mod service {
         screen: ScreenConfig,
         peer: &mut Peer,
         actor: mpsc::Sender<ScreenCommand>,
+        keyframe_request: Arc<AtomicBool>,
     ) {
         peer.packets = None;
         if let Some(t) = peer.sender.take() {
@@ -335,14 +343,17 @@ mod service {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
         peer.packets = Some(bridge_core::fanout::Subscriber::new(tx));
         let dropped = peer.packets.as_ref().unwrap().dropped.clone();
+        let (feedback, progress) = watch::channel(VideoProgress::default());
+        peer.progress = Some(feedback);
+        keyframe_request.store(true, Ordering::Release);
         let connection = peer.connection.clone();
         let telemetry = peer.telemetry.clone();
         let debug = screen.instrumented;
         peer.sender = Some(tokio::spawn(async move {
             let result = if debug {
-                send_video::<true>(connection, screen.clone(), rx, telemetry, dropped).await
+                send_video::<true>(connection, screen.clone(), rx, telemetry, dropped, progress, keyframe_request).await
             } else {
-                send_video::<false>(connection, screen.clone(), rx, telemetry, dropped).await
+                send_video::<false>(connection, screen.clone(), rx, telemetry, dropped, progress, keyframe_request).await
             };
             if let Err(error) = result {
                 let _ = actor
@@ -355,12 +366,59 @@ mod service {
             }
         }));
     }
+    #[derive(Default)]
+    struct DeliveryWindow {
+        frames: std::collections::VecDeque<(u64, Instant)>,
+        last_sent: Option<u64>,
+        decoded: Option<u64>,
+        submitted: Option<u64>,
+    }
+
+    impl DeliveryWindow {
+        fn sent(&mut self, sequence: u64, at: Instant) {
+            self.last_sent = Some(sequence);
+            self.frames.push_back((sequence, at));
+        }
+
+        fn acknowledge(&mut self, progress: VideoProgress) {
+            let Some(decoded) = progress.decoded.filter(|n| Some(*n) <= self.last_sent) else {
+                return;
+            };
+            self.decoded = self.decoded.max(Some(decoded));
+            self.submitted = self.submitted.max(progress.submitted.filter(|n| *n <= decoded));
+            while self.frames.front().is_some_and(|(n, _)| Some(*n) <= self.submitted) {
+                self.frames.pop_front();
+            }
+        }
+
+        fn behind(&self, limit: usize, budget: Duration) -> bool {
+            self.frames.len() >= limit
+                || (self.frames.len() >= 3
+                    && self.frames.front().is_some_and(|(_, at)| at.elapsed() >= budget))
+        }
+
+        fn drained(&self) -> bool {
+            self.last_sent <= self.decoded
+        }
+
+        fn stalled(&self, budget: Duration) -> bool {
+            self.frames.iter().find(|(n, _)| Some(*n) > self.decoded)
+                .is_some_and(|(_, at)| at.elapsed() >= budget)
+        }
+
+        fn reset_presentation_backlog(&mut self) {
+            self.frames.retain(|(n, _)| Some(*n) > self.decoded);
+        }
+    }
+
     async fn send_video<const DEBUG: bool>(
         connection: quinn::Connection,
         screen: ScreenConfig,
         mut packets: mpsc::Receiver<Arc<mac::EncodedPacket>>,
         telemetry: Arc<Telemetry>,
         dropped: Arc<AtomicU64>,
+        mut feedback: watch::Receiver<VideoProgress>,
+        keyframe_request: Arc<AtomicBool>,
     ) -> Result<()> {
         let mut stream = connection.open_uni().await?;
         send_json(
@@ -378,7 +436,59 @@ mod service {
         let mut frames = 0u64;
         let mut last = tokio::time::Instant::now();
         let mut previous = 0u64;
-        while let Some(packet) = packets.recv().await {
+        // Limit frames already handed to QUIC as well as packets in the actor queue.
+        // Allow one feedback interval plus RTT before treating old frames as backlog.
+        let mut delivery = DeliveryWindow::default();
+        let mut recovering = false;
+        let mut requested_keyframe = false;
+        let mut probe = None;
+        let mut timer = tokio::time::interval(Duration::from_millis(50));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let packet = tokio::select! {
+                packet = packets.recv() => match packet { Some(packet) => Some(packet), None => break },
+                changed = feedback.changed() => { if changed.is_err() { break; } None },
+                _ = timer.tick() => None,
+            };
+            delivery.acknowledge(*feedback.borrow_and_update());
+            let budget = connection.rtt() + Duration::from_millis(250);
+            let limit = ((budget.as_secs_f64() * f64::from(screen.settings.fps)).ceil() as usize).clamp(8, 48);
+            if probe.is_some_and(|sequence| Some(sequence) <= delivery.decoded) {
+                probe = None;
+            }
+            if delivery.behind(limit, budget) {
+                recovering = true;
+            }
+            if delivery.stalled(budget.max(Duration::from_secs(4))) {
+                let _ = stream.reset(1u32.into());
+                bail!("Viewer decode progress stalled");
+            }
+            // One recovery picture can bypass the normal budget if the viewer
+            // dropped a packet locally and cannot acknowledge the tail.
+            if recovering && probe.is_none() && !requested_keyframe
+                && (delivery.drained() || delivery.stalled(budget)) {
+                keyframe_request.store(true, Ordering::Release);
+                requested_keyframe = true;
+            }
+            let Some(packet) = packet else { continue };
+            if probe.is_some() {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if recovering {
+                if !requested_keyframe || !packet.header.keyframe {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                recovering = !delivery.drained();
+                if recovering {
+                    probe = Some(packet.header.sequence);
+                }
+                requested_keyframe = false;
+                delivery.reset_presentation_backlog();
+            }
+            let sent_at = Instant::now();
+
             let write = async {
                 if DEBUG {
                     let start = now_us();
@@ -422,6 +532,7 @@ mod service {
             tokio::time::timeout(Duration::from_secs(3), write)
                 .await
                 .map_err(|_| anyhow::anyhow!("Viewer video write stalled"))??;
+            delivery.sent(packet.header.sequence, sent_at);
             bytes += packet.bytes.len() as u64;
             frames += 1;
             if DEBUG && last.elapsed() >= Duration::from_secs(1) {
@@ -472,6 +583,7 @@ mod service {
         let mut stop = Arc::new(AtomicBool::new(false));
         let mut last_failure: Option<String> = None;
         let dropped = Arc::new(AtomicU64::new(0));
+        let mut keyframe_request = Arc::new(AtomicBool::new(false));
         let mut diagnostics_timer = tokio::time::interval(Duration::from_millis(500));
         diagnostics_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -506,6 +618,7 @@ mod service {
                     })
                     .unwrap_or(false)
                     || peers.values().any(|p| p.debug);
+                keyframe_request = Arc::new(AtomicBool::new(false));
                 for (&peer_id, peer) in &mut peers {
                     if !peer.active {
                         continue;
@@ -522,7 +635,7 @@ mod service {
                         request_id: None,
                         screen: screen.clone(),
                     });
-                    start_sender(peer_id, screen.clone(), peer, handle.tx.clone());
+                    start_sender(peer_id, screen.clone(), peer, handle.tx.clone(), keyframe_request.clone());
                 }
                 if peers.values().any(|p| p.active) {
                     stop = Arc::new(AtomicBool::new(false));
@@ -533,6 +646,7 @@ mod service {
                             stop.clone(),
                             telemetry,
                             dropped.clone(),
+                            keyframe_request.clone(),
                         ))
                         .is_err()
                     {
@@ -583,8 +697,8 @@ mod service {
                         if removed || peers.len()>=bridge_core::protocol::MAX_VIEWERS_PER_SCREEN{let _=reply.send(Err(anyhow::anyhow!("Screen unavailable or viewer limit reached")));continue;}
                         if !codecs.iter().any(|c|c.codec==screen.codec.codec){let _=reply.send(Err(anyhow::anyhow!("Viewer cannot decode this screen's active codec")));continue;}
                         let telemetry=Telemetry::new();peer_update(&shared,id,peer_id,Some(connection.remote_address().to_string()),"Attached",telemetry.clone());
-                        let mut peer=Peer{connection,controls,packets:None,sender:None,debug:false,active:true,telemetry};
-                        if running{start_sender(peer_id,screen.clone(),&mut peer,handle.tx.clone());}
+                        let mut peer=Peer{connection,controls,packets:None,sender:None,progress:None,debug:false,active:true,telemetry};
+                        if running{start_sender(peer_id,screen.clone(),&mut peer,handle.tx.clone(),keyframe_request.clone());}
                         peers.insert(peer_id,peer);let _=reply.send(Ok(screen.clone()));if !running{pending=true;}
                     }
                     Some(ScreenCommand::Leave(peer))=>{peers.remove(&peer);peer_remove(&shared,id,peer);if peers.is_empty(){stop.store(true,Ordering::Release);}}
@@ -608,6 +722,13 @@ mod service {
                         if instrumented!=screen.instrumented{stop.store(true,Ordering::Release);pending=true;}
                     }
                     Some(ScreenCommand::Burst(peer))=>{if let Ok(s)=shared.lock(){if let Some(s)=s.screens.iter().find(|s|s.screen_id==id){s.telemetry.burst();}}if let Some(p)=peer.and_then(|id|peers.get(&id)){p.telemetry.burst();}}
+                    Some(ScreenCommand::VideoProgress{id:peer,progress})=>{
+                        if progress.generation==screen.generation {
+                            if let Some(feedback)=peers.get(&peer).and_then(|p|p.progress.as_ref()){
+                                feedback.send_replace(progress);
+                            }
+                        }
+                    }
                     Some(ScreenCommand::VideoStopped{id:peer,generation})=>{
                         if generation==screen.generation{if let Some(p)=peers.get_mut(&peer){p.active=false;p.packets=None;if let Some(task)=p.sender.take(){task.abort();}peer_update(&shared,id,peer,None,"Video stopped; ready to retry",p.telemetry.clone());}
                         if peers.values().all(|p|p.packets.is_none()){stop.store(true,Ordering::Release);}}
@@ -632,7 +753,7 @@ mod service {
                     if !ready{ready=true;set_screen_message(&shared,id,"Streaming shared video");notify(&mut peers,HostMessage::StreamStatus{screen_id:id,generation:screen.generation,lane:MediaLane::Video,state:MediaState::Ready,message:"Shared video frames are flowing".into()});}
                     for (&peer_id,p) in &mut peers{
                         if let Some(tx)=p.packets.as_mut(){match tx.publish(packet.clone(),packet.header.keyframe){
-                            bridge_core::fanout::Delivery::Overflow=>peer_update(&shared,id,peer_id,None,"Resynchronizing at next keyframe",p.telemetry.clone()),
+                            bridge_core::fanout::Delivery::Overflow=>{keyframe_request.store(true,Ordering::Release);peer_update(&shared,id,peer_id,None,"Resynchronizing at next keyframe",p.telemetry.clone());},
                             bridge_core::fanout::Delivery::Queued if packet.header.keyframe=>peer_update(&shared,id,peer_id,None,"Streaming",p.telemetry.clone()),
                             bridge_core::fanout::Delivery::Closed=>{},
                             _=>{},
@@ -788,6 +909,7 @@ mod service {
                 Some(Ok(ClientMessage::Diagnostics{screen_id,enabled})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::Diagnostics{peer:Some(id),enabled}).await?;}
                 Some(Ok(ClientMessage::TraceBurst{screen_id})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::Burst(Some(id))).await?;}
                 Some(Ok(ClientMessage::ClockProbe{t1}))=>{let t2=now_us();send_control(&mut send,&HostMessage::ClockReply{t1,t2,t3:now_us()}).await?;}
+                Some(Ok(ClientMessage::VideoProgress(progress))) if attached.contains_key(&progress.screen_id)=>{let _=attached[&progress.screen_id].tx.try_send(ScreenCommand::VideoProgress{id,progress});}
                 Some(Ok(ClientMessage::VideoStopped{screen_id,generation})) if attached.contains_key(&screen_id)=>{attached[&screen_id].tx.send(ScreenCommand::VideoStopped{id,generation}).await?;}
                 Some(Ok(ClientMessage::SessionPreferences(preferences))) if session_id.is_some()=>{
                     preferences.validate()?;
@@ -882,6 +1004,46 @@ None=>break,
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn progress_budget_is_per_viewer_and_uses_presentation_backlog() {
+            let mut slow = DeliveryWindow::default();
+            let mut fast = DeliveryWindow::default();
+            let old = Instant::now() - Duration::from_millis(350);
+            for sequence in [0, 7, 42] {
+                slow.sent(sequence, old);
+                fast.sent(sequence, old);
+            }
+            fast.acknowledge(VideoProgress { decoded: Some(42), submitted: Some(42), ..Default::default() });
+            slow.acknowledge(VideoProgress { decoded: Some(42), submitted: Some(0), ..Default::default() });
+            assert!(!fast.behind(8, Duration::from_millis(250)));
+            assert_eq!(slow.frames.len(), 2);
+            slow.sent(48, old);
+            assert!(slow.behind(8, Duration::from_millis(250)));
+            slow.acknowledge(VideoProgress { decoded: Some(48), submitted: Some(0), ..Default::default() });
+            assert!(slow.drained());
+            slow.reset_presentation_backlog();
+            assert!(!slow.behind(8, Duration::from_millis(250)));
+        }
+
+        #[test]
+        fn progress_ignores_future_and_regressing_acks_and_preserves_stall_age() {
+            let mut window = DeliveryWindow::default();
+            let old = Instant::now() - Duration::from_secs(5);
+            window.sent(1, old);
+            window.sent(3, old);
+            window.acknowledge(VideoProgress { decoded: Some(1), submitted: Some(3), ..Default::default() });
+            window.acknowledge(VideoProgress { decoded: Some(100), submitted: Some(100), ..Default::default() });
+            window.acknowledge(VideoProgress { decoded: Some(0), submitted: Some(0), ..Default::default() });
+            assert_eq!(window.decoded, Some(1));
+            assert_eq!(window.submitted, Some(0));
+            assert!(!window.drained());
+            window.reset_presentation_backlog();
+            assert!(window.stalled(Duration::from_secs(4)));
+            window.acknowledge(VideoProgress { decoded: Some(3), submitted: Some(3), ..Default::default() });
+            assert!(window.drained());
+            assert!(!window.stalled(Duration::from_secs(4)));
+        }
+
         async fn pair() -> (
             quinn::Endpoint,
             quinn::Endpoint,
@@ -896,6 +1058,68 @@ None=>break,
             let (v, s) = tokio::join!(outgoing, async { h.accept().await.unwrap().await.unwrap() });
             (h, c, s, v.unwrap())
         }
+        #[tokio::test]
+        async fn slow_video_sender_skips_deltas_and_recovers_on_the_same_lane() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (_host, _viewer, host, viewer) = pair().await;
+                let state = Arc::new(Mutex::new(initial_state(built_in_presets(), "123456".into())));
+                let mut screen = config(&state, 1).unwrap();
+                screen.settings.fps = 24;
+                let (packets, rx) = mpsc::channel(2);
+                let (progress, feedback) = watch::channel(VideoProgress::default());
+                let dropped = Arc::new(AtomicU64::new(0));
+                let keyframe = Arc::new(AtomicBool::new(false));
+                let sender = tokio::spawn(send_video::<false>(
+                    host, screen.clone(), rx, Telemetry::new(), dropped.clone(), feedback,
+                    keyframe.clone(),
+                ));
+                let mut lane = viewer.accept_uni().await.unwrap();
+                let hello: MediaStreamHello = receive_json(&mut lane).await.unwrap();
+                assert_eq!(hello.generation, screen.generation);
+                let packet = |sequence, keyframe| Arc::new(mac::EncodedPacket {
+                    header: bridge_core::protocol::MediaHeader {
+                        screen_id: 1,
+                        generation: screen.generation,
+                        kind: bridge_core::protocol::MediaKind::Video,
+                        sequence,
+                        timestamp_us: sequence,
+                        keyframe,
+                        width: screen.settings.width,
+                        height: screen.settings.height,
+                        sample_rate: 0,
+                        channels: 0,
+                    },
+                    bytes: vec![1, 2, 3],
+                    trace: None,
+                    queued_us: 0,
+                });
+                for sequence in 1..=8 {
+                    packets.send(packet(sequence, sequence == 1)).await.unwrap();
+                    let (header, _) = bridge_core::protocol::receive_media_or_end(&mut lane)
+                        .await.unwrap().unwrap();
+                    assert_eq!(header.sequence, sequence);
+                }
+                packets.send(packet(9, false)).await.unwrap();
+                while dropped.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                progress.send_replace(VideoProgress {
+                    screen_id: 1, generation: screen.generation, decoded: Some(8), submitted: Some(8),
+                });
+                while !keyframe.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                packets.send(packet(10, false)).await.unwrap();
+                packets.send(packet(11, true)).await.unwrap();
+                let (header, _) = bridge_core::protocol::receive_media_or_end(&mut lane)
+                    .await.unwrap().unwrap();
+                assert_eq!(header.sequence, 11);
+                assert!(header.keyframe);
+                drop(packets);
+                sender.await.unwrap().unwrap();
+            }).await.unwrap();
+        }
+
         async fn next_matching(
             rx: &mut mpsc::Receiver<HostMessage>,
             predicate: impl Fn(&HostMessage) -> bool,
