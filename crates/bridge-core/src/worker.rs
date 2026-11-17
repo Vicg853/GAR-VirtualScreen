@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Local IPC evolves independently from the network protocol.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TraceSeed {
     pub capture_us: u64,
@@ -47,6 +47,8 @@ pub enum Message {
     },
     Show,
     Placement(crate::sessions::WindowPlacement),
+    /// Viewer-side presentation only; the decoder and stream are untouched.
+    Presentation(crate::sessions::ViewerDisplay),
     Reset {
         width: u32,
         height: u32,

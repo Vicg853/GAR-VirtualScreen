@@ -14,7 +14,7 @@ pub type RequestId = u64;
 pub type ConfigRevision = u64;
 pub type StreamGeneration = u64;
 
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 pub const MAX_VIEWERS_PER_SCREEN: usize = 8;
 pub const PORT: u16 = 44990;
 pub const MAX_CONTROL: usize = 64 * 1024;
@@ -27,14 +27,22 @@ pub struct ClientHello {
     pub version: u16,
     pub codecs: Vec<CodecOption>,
     pub initial_settings: Option<VideoSettings>,
+    /// The viewer's device name, shown in the host's list of connected viewers.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// Complete settings for one screen. Revisions increase whenever settings are
 /// applied, while generations increase whenever its media pipeline is rebuilt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenConfig {
+    /// Stable slot identity. The host maps it to whichever OS display currently
+    /// backs the screen; OS display IDs never cross the network.
     pub screen_id: ScreenId,
     pub name: String,
+    /// Short slot label shown next to the name: "Slot A", "T-1".
+    #[serde(default)]
+    pub slot: String,
     pub revision: ConfigRevision,
     pub generation: StreamGeneration,
     pub settings: VideoSettings,
@@ -77,11 +85,20 @@ pub enum ClientMessage {
         hello: ClientHello,
         viewer_id: String,
         preferences: crate::sessions::ViewerPreferences,
+        /// True when the viewer dialed on its own; the host refuses these while
+        /// its side of auto-connect is paused.
+        #[serde(default)]
+        automatic: bool,
     },
     SessionPreferences(crate::sessions::ViewerPreferences),
     AddScreen(AddScreenRequest),
     ChangeScreenSettings(ChangeScreenSettingsRequest),
     RemoveScreen {
+        request_id: RequestId,
+        screen_id: ScreenId,
+    },
+    /// Resume a session screen this viewer paused with `RemoveScreen`.
+    AttachScreen {
         request_id: RequestId,
         screen_id: ScreenId,
     },
@@ -539,16 +556,10 @@ mod tests {
             screen_id: 7,
             revision: 12,
             settings: VideoSettings {
-                width: 1920,
-                height: 1080,
-                fps: 60,
                 bitrate_kbps: 12_000,
                 keyframe_interval: 120,
-                h264_profile: Default::default(),
                 low_latency_rate_control: true,
-                vsync: true,
-                audio: false,
-                preferred_codec: None,
+                ..Default::default()
             },
         });
 
@@ -577,19 +588,16 @@ mod tests {
             screen: ScreenConfig {
                 screen_id: 4,
                 name: "Screen 4".into(),
+                slot: "Slot A".into(),
                 revision: 18,
                 generation: 23,
                 settings: VideoSettings {
                     width: 2560,
                     height: 1440,
-                    fps: 60,
                     bitrate_kbps: 18_000,
                     keyframe_interval: 120,
-                    h264_profile: Default::default(),
                     low_latency_rate_control: true,
-                    vsync: true,
-                    audio: false,
-                    preferred_codec: None,
+                    ..Default::default()
                 },
                 instrumented: false,
                 codec: crate::config::CodecOption {
