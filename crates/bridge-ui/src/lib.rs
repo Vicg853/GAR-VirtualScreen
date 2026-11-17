@@ -1,4 +1,8 @@
 //! Shared controls presentation. Native video resources never enter this crate.
+pub mod fields;
+pub mod kit;
+pub mod logs;
+
 use bridge_core::telemetry::{Stage, TimingView};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, TitleBar,
@@ -6,8 +10,9 @@ use gpui_kit::component::{
     table::{Column, DataTable, TableDelegate, TableState},
 };
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Global, IntoElement, Render,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, Context, Entity, Global, IntoElement, MouseButton,
+    Pixels, Render, ResizeEdge, SharedString, Size, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, size,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -69,6 +74,147 @@ impl InspectionSource {
     }
 }
 
+#[derive(Default)]
+struct AuxiliaryWindows(HashMap<String, AnyWindowHandle>);
+impl Global for AuxiliaryWindows {}
+
+/// Open a secondary window (logs, settings) once per key; asking again focuses it.
+pub fn open_auxiliary<V: Render + 'static>(
+    key: String,
+    window_size: Size<Pixels>,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V> + 'static,
+) -> anyhow::Result<()> {
+    if !cx.has_global::<AuxiliaryWindows>() {
+        cx.set_global(AuxiliaryWindows::default());
+        cx.on_window_closed(|cx, closed_id| {
+            cx.global_mut::<AuxiliaryWindows>()
+                .0
+                .retain(|_, handle| handle.window_id() != closed_id);
+        })
+        .detach();
+    }
+    if let Some(handle) = cx.global::<AuxiliaryWindows>().0.get(&key).copied()
+        && handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        return Ok(());
+    }
+    let bounds = Bounds::centered(None, window_size, cx);
+    let (handle, _) = gpui_kit::open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(360.), px(240.))),
+            ..TitleBar::window_options()
+        },
+        cx,
+        build,
+    )?;
+    cx.global_mut::<AuxiliaryWindows>().0.insert(key, handle);
+    Ok(())
+}
+
+/// Close the secondary windows of something that no longer exists (a removed screen).
+pub fn close_auxiliary(prefix: &str, cx: &mut App) {
+    if !cx.has_global::<AuxiliaryWindows>() {
+        return;
+    }
+    let handles = cx
+        .global::<AuxiliaryWindows>()
+        .0
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .map(|(_, handle)| *handle)
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+/// Client-decorated windows have no native resize border; emulate one.
+pub fn resize_from_border(event: &gpui_kit::MouseDownEvent, window: &mut Window) {
+    let point = event.position;
+    let size = window.window_bounds().get_bounds().size;
+    let border = px(7.0);
+    let left = point.x < border;
+    let right = point.x > size.width - border;
+    let top = point.y < border;
+    let bottom = point.y > size.height - border;
+    let edge = match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (_, true, true, _) => Some(ResizeEdge::TopRight),
+        (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        (true, _, _, _) => Some(ResizeEdge::Left),
+        (_, true, _, _) => Some(ResizeEdge::Right),
+        (_, _, true, _) => Some(ResizeEdge::Top),
+        (_, _, _, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    };
+    if let Some(edge) = edge {
+        window.start_window_resize(edge);
+    }
+}
+
+/// Main controls window: title bar with its right-aligned buttons, an optional
+/// strip under it, then the scrolling page.
+pub fn shell(
+    title: impl Into<SharedString>,
+    actions: Vec<gpui_kit::AnyElement>,
+    strip: Option<gpui_kit::AnyElement>,
+    page: impl IntoElement,
+    cx: &App,
+) -> gpui_kit::Div {
+    div()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            resize_from_border(event, window)
+        })
+        .bg(cx.theme().background)
+        .border_1()
+        .border_color(cx.theme().border)
+        .text_color(cx.theme().foreground)
+        .text_size(px(14.))
+        .flex()
+        .flex_col()
+        .child(
+            TitleBar::new().child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .pr_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(title.into()),
+                    )
+                    .children(actions),
+            ),
+        )
+        .children(strip)
+        .child(
+            div()
+                .id("page-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(18.))
+                .child(page),
+        )
+}
+
 struct InspectionWindow {
     handle: AnyWindowHandle,
     source: InspectionSource,
@@ -123,7 +269,7 @@ pub fn open_inspector(key: String, source: InspectionSource, cx: &mut App) -> an
         },
         cx,
         move |window, cx| {
-            window.set_window_title("AirBridge · Statistics inspector");
+            window.set_window_title("AirBridge · Stats");
             let view = cx.new(|cx| Inspector::new(source, window, cx));
             let weak = view.downgrade();
             cx.spawn(async move |cx| {
@@ -347,20 +493,121 @@ impl Render for Inspector {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.data.as_ref().map(|d| d.mode);
         let frozen = self.data.as_ref().is_some_and(|d| d.frozen);
-        div().size_full().min_w_0().min_h_0().flex().flex_col()
-            .bg(cx.theme().background).text_color(cx.theme().foreground)
-            .child(TitleBar::new().child("AirBridge · Statistics"))
-            .child(div().p_3().flex().flex_col().gap_2()
-                .child(self.data.as_ref().map(|d| d.title.clone()).unwrap_or_else(|| "Statistics closed or screen removed. Reopen Stats in the screen controls.".into()))
-                .child(div().flex().flex_wrap().gap_2()
-                    .child(Button::new("inspector-frames").label("Frame rows").outline().small().selected(mode == Some(TimingView::Frames)).disabled(self.data.is_none()).on_click(cx.listener(|this, _, _, cx| this.action(InspectionAction::Frames, cx))))
-                    .child(Button::new("inspector-averages").label("Stage averages").outline().small().selected(mode == Some(TimingView::Averages)).disabled(self.data.is_none()).on_click(cx.listener(|this, _, _, cx| this.action(InspectionAction::Averages, cx))))
-                    .child(Button::new("inspector-gpu-filter").label(if self.gpu_only {"All stages"} else {"GPU / display stages"}).outline().small().selected(self.gpu_only).on_click(cx.listener(|this, _, _, cx| {this.gpu_only = !this.gpu_only; this.refresh(cx);})))
-                    .child(Button::new("inspector-freeze").label(if frozen {"Resume"} else {"Freeze"}).outline().small().disabled(self.data.is_none()).on_click(cx.listener(|this, _, _, cx| this.action(InspectionAction::Freeze, cx))))
-                    .child(Button::new("inspector-burst").label("Capture next 20").primary().small().disabled(self.data.is_none()).on_click(cx.listener(|this, _, _, cx| this.action(InspectionAction::Burst, cx)))))
-                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(TIMING_HELP))
-                .children(self.data.as_ref().map(|d| d.lines.clone()).unwrap_or_default().into_iter().map(|line| div().text_sm().font_family(cx.theme().mono_font_family.clone()).child(line))))
-            .child(div().flex_1().min_w_0().min_h_0().p_3().child(DataTable::new(&self.table).small()))
+        div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(TitleBar::new().child("AirBridge · Stats"))
+            .child(
+                div()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        self.data
+                            .as_ref()
+                            .map(|d| d.title.clone())
+                            .unwrap_or_else(|| {
+                                "Stats closed or screen removed. Reopen Stats from the screen view."
+                                    .into()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("inspector-frames")
+                                    .label("Frame rows")
+                                    .outline()
+                                    .small()
+                                    .selected(mode == Some(TimingView::Frames))
+                                    .disabled(self.data.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.action(InspectionAction::Frames, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("inspector-averages")
+                                    .label("Stage averages")
+                                    .outline()
+                                    .small()
+                                    .selected(mode == Some(TimingView::Averages))
+                                    .disabled(self.data.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.action(InspectionAction::Averages, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("inspector-gpu-filter")
+                                    .label(if self.gpu_only {
+                                        "All stages"
+                                    } else {
+                                        "GPU / display stages"
+                                    })
+                                    .outline()
+                                    .small()
+                                    .selected(self.gpu_only)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.gpu_only = !this.gpu_only;
+                                        this.refresh(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("inspector-freeze")
+                                    .label(if frozen { "Resume" } else { "Freeze" })
+                                    .outline()
+                                    .small()
+                                    .disabled(self.data.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.action(InspectionAction::Freeze, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("inspector-burst")
+                                    .label("Capture next 20")
+                                    .primary()
+                                    .small()
+                                    .disabled(self.data.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.action(InspectionAction::Burst, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(TIMING_HELP),
+                    )
+                    .children(
+                        self.data
+                            .as_ref()
+                            .map(|d| d.lines.clone())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|line| {
+                                div()
+                                    .text_sm()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .child(line)
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .p_3()
+                    .child(DataTable::new(&self.table).small()),
+            )
     }
 }
 
