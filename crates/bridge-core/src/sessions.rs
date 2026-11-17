@@ -74,10 +74,93 @@ pub struct WindowPlacement {
     pub x: Option<i32>,
     pub y: Option<i32>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The monitor a stream is shown on, identified by its desktop origin so the
+/// controls and the native video worker agree without sharing handles.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayTarget {
+    pub x: i32,
+    pub y: i32,
+    pub label: String,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowMode {
+    Fullscreen,
+    #[default]
+    Window,
+    Borderless,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scaling {
+    #[default]
+    Fit,
+    Fill,
+    Stretch,
+    Native,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpscaleFilter {
+    #[default]
+    Bilinear,
+    Lanczos,
+    Nearest,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoderChoice {
+    #[default]
+    Hardware,
+    Software,
+}
+/// How one stream is presented on this viewer. Never changes the stream or the host.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewerDisplay {
+    pub target: Option<DisplayTarget>,
+    pub window_mode: WindowMode,
+    pub scaling: Scaling,
+    pub filter: UpscaleFilter,
+    /// Clockwise quarter turns in degrees: 0, 90, 180 or 270.
+    pub rotation: u16,
+    pub vsync: bool,
+    pub jitter_frames: u8,
+    pub decoder: DecoderChoice,
+}
+impl ViewerDisplay {
+    pub const MAX_JITTER_FRAMES: u8 = 8;
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.rotation, 0 | 90 | 180 | 270)
+            || self.jitter_frames > Self::MAX_JITTER_FRAMES
+            || self.target.as_ref().is_some_and(|t| t.label.len() > 128)
+        {
+            bail!("Invalid viewer display settings");
+        }
+        Ok(())
+    }
+}
+fn yes() -> bool {
+    true
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewerScreen {
     pub screen_id: ScreenId,
     pub window: WindowPlacement,
+    /// False while this viewer has paused the screen; the host then sends it no video.
+    #[serde(default = "yes")]
+    pub visible: bool,
+    #[serde(default)]
+    pub display: ViewerDisplay,
+}
+impl ViewerScreen {
+    pub fn new(screen_id: ScreenId) -> Self {
+        Self {
+            screen_id,
+            window: WindowPlacement::default(),
+            visible: true,
+            display: ViewerDisplay::default(),
+        }
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ViewerPreferences {
@@ -100,8 +183,28 @@ impl ViewerPreferences {
             {
                 bail!("Invalid window size");
             }
+            screen.display.validate()?;
         }
         Ok(())
+    }
+    pub fn screen(&self, screen_id: ScreenId) -> Option<&ViewerScreen> {
+        self.screens.iter().find(|s| s.screen_id == screen_id)
+    }
+    /// The slot's entry, created on first use; `None` once the slot table is full.
+    pub fn screen_mut(&mut self, screen_id: ScreenId) -> Option<&mut ViewerScreen> {
+        if screen_id == 0 {
+            return None;
+        }
+        if !self.screens.iter().any(|s| s.screen_id == screen_id) {
+            if self.screens.len() >= MAX_SCREENS {
+                return None;
+            }
+            self.screens.push(ViewerScreen::new(screen_id));
+        }
+        self.screens.iter_mut().find(|s| s.screen_id == screen_id)
+    }
+    pub fn visible(&self, screen_id: ScreenId) -> bool {
+        self.screen(screen_id).is_none_or(|s| s.visible)
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,11 +236,12 @@ impl ViewerLockPolicy {
             Self::AllowIdle => Self::ViewerChoice,
         }
     }
+    pub const ALL: [Self; 3] = [Self::ViewerChoice, Self::KeepAwake, Self::AllowIdle];
     pub fn label(self) -> &'static str {
         match self {
-            Self::ViewerChoice => "Viewer lock policy: viewer choice",
-            Self::KeepAwake => "Viewer lock policy: keep awake",
-            Self::AllowIdle => "Viewer lock policy: allow idle lock",
+            Self::ViewerChoice => "Viewer decides",
+            Self::KeepAwake => "Keep viewers awake",
+            Self::AllowIdle => "Allow idle lock",
         }
     }
 }
@@ -147,6 +251,9 @@ pub struct SessionContract {
     pub session_id: String,
     pub host_id: String,
     pub username: String,
+    /// Display name; the login stays `username` so saved viewers keep working.
+    #[serde(default)]
+    pub label: String,
     pub revision: u64,
     pub keep_awake: bool,
     #[serde(default)]
@@ -159,7 +266,10 @@ impl SessionContract {
         {
             bail!("Invalid session contract identity/version");
         }
-        if self.username.is_empty() || self.username.len() > 64 || self.screens.len() > MAX_SCREENS
+        if self.username.is_empty()
+            || self.username.len() > 64
+            || self.label.len() > 64
+            || self.screens.len() > MAX_SCREENS
         {
             bail!("Invalid session account or screen count");
         }
@@ -172,6 +282,24 @@ impl SessionContract {
         }
         Ok(())
     }
+    /// The name shown in both apps.
+    pub fn display_name(&self) -> &str {
+        if self.label.is_empty() {
+            &self.username
+        } else {
+            &self.label
+        }
+    }
+    /// Stable short label of a screen within this session: Slot A, Slot B, …
+    pub fn slot_label(&self, screen_id: ScreenId) -> Option<String> {
+        self.screens
+            .iter()
+            .position(|s| s.screen_id == screen_id)
+            .map(slot_label)
+    }
+}
+pub fn slot_label(index: usize) -> String {
+    format!("Slot {}", (b'A' + (index % 26) as u8) as char)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostSession {
@@ -179,12 +307,16 @@ pub struct HostSession {
     pub salt: [u8; 16],
     pub key: Secret,
     pub viewers: Vec<ViewerRegistration>,
+    /// An active session has its virtual screens created; an inactive one keeps only its config.
+    #[serde(default = "yes")]
+    pub active: bool,
+    /// Host-side switch: when off, viewers are not connected automatically.
+    #[serde(default = "yes")]
+    pub auto_connect: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostStore {
     pub version: u16,
-    #[serde(default = "first_screen_id")]
-    pub next_screen_id: u32,
     pub host_id: String,
     pub sessions: Vec<HostSession>,
 }
@@ -192,7 +324,6 @@ impl HostStore {
     pub fn new() -> Result<Self> {
         Ok(Self {
             version: STORE_VERSION,
-            next_screen_id: 1,
             host_id: new_id()?,
             sessions: vec![],
         })
@@ -221,8 +352,8 @@ impl HostStore {
         for s in &self.sessions {
             s.contract.validate()?;
             for screen in &s.contract.screens {
-                if !screens.insert(screen.screen_id) || screens.len() > MAX_SCREENS {
-                    bail!("Host screen ownership is duplicated or exceeds the screen limit");
+                if !screens.insert(screen.screen_id) {
+                    bail!("Host screen ownership is duplicated");
                 }
             }
             if s.contract.host_id != self.host_id
@@ -241,10 +372,34 @@ impl HostStore {
                 v.preferences.validate()?;
             }
         }
-        if self.next_screen_id == 0 || screens.iter().any(|id| *id >= self.next_screen_id) {
-            bail!("Invalid screen identity allocator");
-        }
         Ok(())
+    }
+    /// The lowest screen ID no saved or live screen uses. IDs are slots: a
+    /// re-created screen takes a released one instead of an ever-growing number.
+    pub fn free_screen_id(&self, live: impl IntoIterator<Item = ScreenId>) -> ScreenId {
+        let used = self
+            .sessions
+            .iter()
+            .flat_map(|s| s.contract.screens.iter().map(|screen| screen.screen_id))
+            .chain(live)
+            .collect::<std::collections::HashSet<_>>();
+        (1..).find(|id| !used.contains(id)).unwrap_or(1)
+    }
+    pub fn session(&self, session_id: &str) -> Option<&HostSession> {
+        self.sessions
+            .iter()
+            .find(|s| s.contract.session_id == session_id)
+    }
+    pub fn session_mut(&mut self, session_id: &str) -> Option<&mut HostSession> {
+        self.sessions
+            .iter_mut()
+            .find(|s| s.contract.session_id == session_id)
+    }
+    /// The session that remembers a screen, if it is not a temporary one.
+    pub fn owner(&self, screen_id: ScreenId) -> Option<&HostSession> {
+        self.sessions
+            .iter()
+            .find(|s| s.contract.screens.iter().any(|x| x.screen_id == screen_id))
     }
     pub fn create(
         &mut self,
@@ -261,12 +416,12 @@ impl HostStore {
         {
             bail!("Account already exists or session limit reached");
         }
-        if screens.iter().any(|screen| screen.screen_id == u32::MAX) {
-            bail!("Screen identity exhausted");
+        if screens
+            .iter()
+            .any(|screen| self.owner(screen.screen_id).is_some())
+        {
+            bail!("A screen already belongs to another session");
         }
-        self.next_screen_id = self
-            .next_screen_id
-            .max(screens.iter().map(|s| s.screen_id + 1).max().unwrap_or(1));
         let session_id = new_id()?;
         let salt_id = new_id()?;
         let mut salt = [0; 16];
@@ -279,6 +434,7 @@ impl HostStore {
             session_id: session_id.clone(),
             host_id: self.host_id.clone(),
             username,
+            label: String::new(),
             revision: 1,
             keep_awake: false,
             viewer_lock_policy: ViewerLockPolicy::default(),
@@ -290,6 +446,8 @@ impl HostStore {
             salt,
             key,
             viewers: vec![],
+            active: true,
+            auto_connect: true,
         });
         Ok(session_id)
     }
@@ -469,11 +627,11 @@ mod tests {
         assert!(s.validate().is_err());
         let mut p = ViewerPreferences::default();
         p.screens.push(ViewerScreen {
-            screen_id: 1,
             window: WindowPlacement {
                 width: 999999,
                 ..Default::default()
             },
+            ..ViewerScreen::new(1)
         });
         assert!(p.validate().is_err());
         assert_eq!(reconnect_delay(100).as_secs(), 30);
@@ -489,7 +647,7 @@ mod tests {
                     position: None,
                     screen_id: 7,
                     name: "Display".into(),
-                    settings: crate::config::built_in_presets()[1].settings.clone(),
+                    settings: VideoSettings::default(),
                 }],
             )
             .unwrap();
@@ -500,13 +658,13 @@ mod tests {
         let preferences = ViewerPreferences {
             keep_awake: true,
             screens: vec![ViewerScreen {
-                screen_id: 7,
                 window: WindowPlacement {
                     width: 1280,
                     height: 720,
                     x: Some(-1280),
                     y: Some(50),
                 },
+                ..ViewerScreen::new(7)
             }],
         };
         let decoded: ViewerPreferences =
@@ -516,6 +674,59 @@ mod tests {
         let duplicate = store.sessions[0].contract.screens[0].clone();
         store.sessions[0].contract.screens.push(duplicate);
         assert!(store.validate().is_err());
+    }
+    #[test]
+    fn screen_ids_are_reused_slots_and_sessions_keep_their_own() {
+        let mut store = HostStore::new().unwrap();
+        let screen = |screen_id| SavedScreen {
+            position: None,
+            screen_id,
+            name: format!("Screen {screen_id}"),
+            settings: VideoSettings::default(),
+        };
+        assert_eq!(store.free_screen_id([]), 1);
+        store
+            .create("desk".into(), "", vec![screen(1), screen(2)])
+            .unwrap();
+        // A temporary screen takes the lowest free slot and releases it on removal.
+        assert_eq!(store.free_screen_id([]), 3);
+        assert_eq!(store.free_screen_id([3]), 4);
+        assert_eq!(store.free_screen_id([]), 3);
+        // Several sessions may exist; a screen belongs to at most one.
+        assert!(store.create("tv".into(), "", vec![screen(2)]).is_err());
+        store.create("tv".into(), "", vec![screen(3)]).unwrap();
+        store.validate().unwrap();
+        assert_eq!(store.owner(3).unwrap().contract.username, "tv");
+        assert_eq!(store.sessions[0].contract.slot_label(2).unwrap(), "Slot B");
+        // Stores written before sessions could be paused load as active.
+        let mut legacy = serde_json::to_value(&store).unwrap();
+        for session in legacy["sessions"].as_array_mut().unwrap() {
+            let session = session.as_object_mut().unwrap();
+            session.remove("active");
+            session.remove("auto_connect");
+        }
+        legacy["next_screen_id"] = 12.into();
+        let legacy: HostStore = serde_json::from_value(legacy).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.sessions.iter().all(|s| s.active && s.auto_connect));
+    }
+    #[test]
+    fn viewer_slots_default_to_visible_and_validate_display_settings() {
+        let legacy: ViewerScreen = serde_json::from_str(
+            r#"{"screen_id":4,"window":{"width":0,"height":0,"x":null,"y":null}}"#,
+        )
+        .unwrap();
+        assert!(legacy.visible);
+        assert_eq!(legacy.display, ViewerDisplay::default());
+        let mut preferences = ViewerPreferences::default();
+        assert!(preferences.visible(9), "unknown slots are shown");
+        preferences.screen_mut(4).unwrap().visible = false;
+        assert!(!preferences.visible(4));
+        preferences.screen_mut(4).unwrap().display.rotation = 45;
+        assert!(preferences.validate().is_err());
+        preferences.screen_mut(4).unwrap().display.rotation = 270;
+        preferences.validate().unwrap();
+        assert!(preferences.screen_mut(0).is_none());
     }
     #[test]
     fn atomic_private_roundtrip() {
@@ -565,10 +776,6 @@ pub fn forget_viewer(id: &str) -> Result<()> {
 }
 pub fn preferences_snapshot(preferences: &ViewerPreferences) -> Result<String> {
     Ok(serde_json::to_string(preferences)?)
-}
-
-fn first_screen_id() -> u32 {
-    1
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
