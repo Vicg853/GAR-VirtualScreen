@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>AirBridge</title>
+  <!-- App tile: 824 px on a 1024 px canvas, the margin macOS icons expect. -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="#1a1a1a"/>
+  <g fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Two screens… -->
+    <rect x="214" y="484" width="264" height="178" rx="26"/>
+    <rect x="546" y="484" width="264" height="178" rx="26"/>
+    <path d="M346 662v52M294 714h104M678 662v52M626 714h104"/>
+    <!-- …and the bridge between them. -->
+    <path d="M346 424c0-150 332-150 332 0"/>
+  </g>
+  <circle cx="512" cy="312" r="38" fill="#ffffff"/>
+</svg>
