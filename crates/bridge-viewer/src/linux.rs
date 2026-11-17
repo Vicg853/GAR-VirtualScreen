@@ -190,6 +190,19 @@ impl VideoWindow {
         })
         .await
     }
+    /// How this device shows the stream. Never reaches the host or the decoder.
+    pub async fn set_presentation(
+        &self,
+        display: bridge_core::sessions::ViewerDisplay,
+    ) -> Result<()> {
+        let epoch = self.epoch.current().context("Obsolete video window")?;
+        self.send(Input {
+            epoch,
+            message: Message::Presentation(display),
+            payload: vec![],
+        })
+        .await
+    }
     pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
         let epoch = self.epoch.advance();
         if let Ok(mut s) = self.target.lock() {
@@ -354,11 +367,16 @@ fn launch(
     telemetry: Arc<Mutex<Option<Arc<Telemetry>>>>,
     diagnostics: Arc<Diagnostics>,
     stop: Arc<AtomicBool>,
+    software_decoder: bool,
 ) -> Result<Process> {
     let executable = std::env::current_exe()?;
     launch_using(target, telemetry, diagnostics, stop, |path| {
         let mut command = Command::new(executable);
         command.arg("--native-video-worker").arg(path);
+        // The worker picks its decoder once, at start.
+        if software_decoder {
+            command.env("AIRBRIDGE_DECODER", "software");
+        }
         command
     })
 }
@@ -521,6 +539,7 @@ fn supervise<const DEBUG: bool>(
 ) {
     let mut process: Option<Process> = None;
     let mut placement = bridge_core::sessions::WindowPlacement::default();
+    let mut presentation = bridge_core::sessions::ViewerDisplay::default();
     let mut config = (1280, 720);
     let mut generation = 0;
     while !stop.load(Ordering::Acquire) {
@@ -584,6 +603,7 @@ fn supervise<const DEBUG: bool>(
                         telemetry.clone(),
                         diagnostics.clone(),
                         stop.clone(),
+                        presentation.decoder == bridge_core::sessions::DecoderChoice::Software,
                     ) {
                         Ok(mut p) => {
                             if let Err(error) = worker::write(
@@ -607,6 +627,18 @@ fn supervise<const DEBUG: bool>(
                                     &target,
                                     &diagnostics,
                                     format!("Window restore IPC failed: {error}"),
+                                );
+                                break;
+                            }
+                            if let Err(error) = worker::write(
+                                &mut p.socket,
+                                &Message::Presentation(presentation.clone()),
+                                &[],
+                            ) {
+                                fail(
+                                    &target,
+                                    &diagnostics,
+                                    format!("Display settings IPC failed: {error}"),
                                 );
                                 break;
                             }
@@ -651,6 +683,21 @@ fn supervise<const DEBUG: bool>(
                             &target,
                             &diagnostics,
                             format!("Window placement IPC failed: {error}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            Message::Presentation(value) => {
+                presentation = value.clone();
+                if let Some(p) = process.as_mut() {
+                    if let Err(error) =
+                        worker::write(&mut p.socket, &Message::Presentation(value), &[])
+                    {
+                        fail(
+                            &target,
+                            &diagnostics,
+                            format!("Display settings IPC failed: {error}"),
                         );
                         break;
                     }
@@ -771,6 +818,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
         }
     });
     let mut placement = bridge_core::sessions::WindowPlacement::default();
+    let mut presentation = bridge_core::sessions::ViewerDisplay::default();
     let mut window: Option<crate::native_video::VideoWindow> = None;
     let mut config = (1280, 720, false);
     let mut submit: fn(
@@ -822,6 +870,7 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                         )?;
                         runtime.block_on(created.reset(config.0, config.1))?;
                         created.restore_window(placement.clone())?;
+                        created.set_presentation(presentation.clone())?;
                         window = Some(created);
                     }
                     let window = window.as_ref().context("Native window unavailable")?;
@@ -854,6 +903,13 @@ fn run_child(path: std::ffi::OsString) -> Result<()> {
                     placement = value;
                     if let Some(window) = &window {
                         window.restore_window(placement.clone())?;
+                    }
+                }
+                Message::Presentation(value) => {
+                    value.validate()?;
+                    presentation = value;
+                    if let Some(window) = &window {
+                        window.set_presentation(presentation.clone())?;
                     }
                 }
                 Message::Show => {

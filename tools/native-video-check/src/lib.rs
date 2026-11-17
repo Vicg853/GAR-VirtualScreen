@@ -13,6 +13,8 @@
 mod linux;
 #[path = "../../../crates/bridge-viewer/src/native_video.rs"]
 mod native_video;
+#[path = "../../../crates/bridge-viewer/src/presentation.rs"]
+mod presentation;
 #[path = "../../../crates/bridge-viewer/src/resource_lifecycle.rs"]
 mod resource_lifecycle;
 #[path = "../../../crates/bridge-viewer/src/stream_engine.rs"]

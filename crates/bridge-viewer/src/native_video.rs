@@ -5,6 +5,7 @@ use crate::stream_engine::{DecodeApi, GpuPicture, H264, SoftwareH264, StreamEngi
 use anyhow::{Context, Result, anyhow, bail};
 use bridge_core::{
     diagnostics::Diagnostics,
+    sessions::{UpscaleFilter, ViewerDisplay, WindowMode},
     telemetry::{Outcome, Stage, TraceToken, now_us},
 };
 use bytemuck::{Pod, Zeroable};
@@ -206,6 +207,9 @@ impl VideoWindow {
     pub fn restore_window(&self, placement: bridge_core::sessions::WindowPlacement) -> Result<()> {
         self.send_event(VideoEvent::Placement(self.id, placement))
     }
+    pub fn set_presentation(&self, display: ViewerDisplay) -> Result<()> {
+        self.send_event(VideoEvent::Presentation(self.id, display))
+    }
     pub async fn reset(&mut self, width: u32, height: u32) -> Result<()> {
         let epoch = self.epoch.advance();
         self.send_input(VideoInput::Reset {
@@ -302,6 +306,7 @@ enum VideoEvent {
     Wake,
     Show(u64),
     Placement(u64, bridge_core::sessions::WindowPlacement),
+    Presentation(u64, ViewerDisplay),
     Close(u64, Option<mpsc::Sender<()>>),
     Shutdown,
 }
@@ -789,6 +794,46 @@ impl ApplicationHandler<VideoEvent> for DisplayManager {
                                 window.set_outer_position(position);
                             }
                         }
+                    }
+                }
+            }
+            VideoEvent::Presentation(id, display) => {
+                if let Some(app) = self.apps.get_mut(&id) {
+                    if let Some(window) = &app.window {
+                        // The target is named by its desktop origin. The controls
+                        // and this window may count pixels at different scales, so
+                        // take the monitor whose origin is nearest.
+                        let monitor = display.target.as_ref().and_then(|target| {
+                            window.available_monitors().min_by_key(|monitor| {
+                                let origin = monitor.position();
+                                (i64::from(origin.x) - i64::from(target.x)).pow(2)
+                                    + (i64::from(origin.y) - i64::from(target.y)).pow(2)
+                            })
+                        });
+                        match display.window_mode {
+                            WindowMode::Fullscreen => {
+                                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(
+                                    monitor,
+                                )));
+                            }
+                            mode => {
+                                window.set_fullscreen(None);
+                                window.set_decorations(mode == WindowMode::Window);
+                                if let Some(monitor) = monitor {
+                                    let already_there =
+                                        window.current_monitor().is_some_and(|current| {
+                                            current.position() == monitor.position()
+                                        });
+                                    if !already_there {
+                                        window.set_outer_position(monitor.position());
+                                    }
+                                }
+                            }
+                        }
+                        window.request_redraw();
+                    }
+                    if let Some(renderer) = app.renderer.as_mut() {
+                        renderer.set_display(display);
                     }
                 }
             }
@@ -1477,7 +1522,14 @@ struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
+    /// What the surface can present with, to switch VSync without re-probing.
+    present_modes: Vec<wgpu::PresentMode>,
+    /// This device's presentation settings; the stream is never affected.
+    display: ViewerDisplay,
+    /// Parameters of the frame on screen, rewritten when the rotation changes.
+    color: Option<ColorUniform>,
 
     size: PhysicalSize<u32>,
     in_flight: Arc<AtomicUsize>,
@@ -1541,7 +1593,8 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // The vertex stage reads the viewer rotation.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1556,6 +1609,14 @@ impl Renderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -1606,7 +1667,11 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             sampler,
+            nearest_sampler,
             uniform_buffer,
+            present_modes: capabilities.present_modes.clone(),
+            display: ViewerDisplay::default(),
+            color: None,
 
             size,
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1624,6 +1689,36 @@ impl Renderer {
             })
             .context("Waiting for GPU frame work during cleanup")?;
         Ok(())
+    }
+
+    /// Low latency without VSync (the default), display-paced with it.
+    fn present_mode(&self) -> wgpu::PresentMode {
+        if self.display.vsync {
+            return wgpu::PresentMode::Fifo;
+        }
+        [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
+            .into_iter()
+            .find(|mode| self.present_modes.contains(mode))
+            .unwrap_or(wgpu::PresentMode::Fifo)
+    }
+
+    /// Apply this device's presentation settings. Scaling takes effect on the
+    /// next draw, the filter with the next frame; nothing is sent to the host.
+    fn set_display(&mut self, display: ViewerDisplay) {
+        self.display = display;
+        let present_mode = self.present_mode();
+        if present_mode != self.configuration.present_mode {
+            self.configuration.present_mode = present_mode;
+            if self.size.width > 0 && self.size.height > 0 {
+                self.surface.configure(&self.device, &self.configuration);
+            }
+        }
+        if let Some(mut color) = self.color {
+            color.output[1] = f32::from(self.display.rotation / 90);
+            self.color = Some(color);
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&color));
+        }
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -1690,11 +1785,12 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                0.0,
+                f32::from(self.display.rotation / 90),
                 0.0,
                 0.0,
             ],
         };
+        self.color = Some(color);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&color));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1715,7 +1811,13 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(
+                        if self.display.filter == UpscaleFilter::Nearest {
+                            &self.nearest_sampler
+                        } else {
+                            &self.sampler
+                        },
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1841,17 +1943,13 @@ impl Renderer {
                 multiview_mask: None,
             });
             if let Some(frame) = frame {
-                let surface_width = self.size.width as f32;
-                let surface_height = self.size.height as f32;
-                let image_aspect = frame.width as f32 / frame.height as f32;
-                let surface_aspect = surface_width / surface_height;
-                let (x, y, width, height) = if surface_aspect > image_aspect {
-                    let width = surface_height * image_aspect;
-                    ((surface_width - width) / 2.0, 0.0, width, surface_height)
-                } else {
-                    let height = surface_width / image_aspect;
-                    (0.0, (surface_height - height) / 2.0, surface_width, height)
-                };
+                let (x, y, width, height) = crate::presentation::viewport(
+                    self.display.scaling,
+                    self.display.rotation,
+                    (frame.width, frame.height),
+                    (self.size.width, self.size.height),
+                    self.device.limits().max_texture_dimension_2d,
+                );
                 pass.set_viewport(x, y, width, height, 0.0, 1.0);
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &frame.bind_group, &[]);
@@ -1991,81 +2089,4 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-const VIDEO_SHADER: &str = r#"
-struct ColorUniform {
-    values: vec4<f32>,
-    coefficients: vec4<f32>,
-    output: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@group(0) @binding(0) var plane_y_or_rgba: texture_2d<f32>;
-@group(0) @binding(1) var plane_uv: texture_2d<f32>;
-@group(0) @binding(4) var plane_v: texture_2d<f32>;
-@group(0) @binding(2) var frame_sampler: sampler;
-@group(0) @binding(3) var<uniform> color: ColorUniform;
-
-@vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0)
-    );
-    let position = positions[index];
-    var output: VertexOutput;
-    output.position = vec4<f32>(position, 0.0, 1.0);
-    output.uv = vec2<f32>(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
-    return output;
-}
-
-fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
-    let low = value / 12.92;
-    let high = pow((value + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-    return select(low, high, value > vec3<f32>(0.04045));
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var rgb: vec3<f32>;
-    if color.values.w > 0.5 && color.values.w < 1.5 {
-        rgb = textureSample(plane_y_or_rgba, frame_sampler, input.uv).rgb;
-    } else {
-        let luma = textureSample(plane_y_or_rgba, frame_sampler, input.uv).r;
-        var chroma = textureSample(plane_uv, frame_sampler, input.uv).rg;
-        if color.values.w > 1.5 { chroma.y = textureSample(plane_v, frame_sampler, input.uv).r; }
-        chroma -= vec2<f32>(128.0/255.0, 128.0/255.0);
-        let y = (luma + color.values.x) * color.values.y;
-        let u = chroma.x * color.values.z;
-        let v = chroma.y * color.values.z;
-        rgb = vec3<f32>(
-            y + color.coefficients.x * v,
-            y + color.coefficients.y * u + color.coefficients.z * v,
-            y + color.coefficients.w * u
-        );
-    }
-    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    if color.output.x > 0.5 {
-        rgb = srgb_to_linear(rgb);
-    }
-    return vec4<f32>(rgb, 1.0);
-}
-"#;
-
-#[cfg(test)]
-mod shader_tests {
-    #[test]
-    fn direct_yuv_shader_is_valid_without_opening_a_window() {
-        let module = naga::front::wgsl::parse_str(super::VIDEO_SHADER).unwrap();
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap();
-    }
-}
+const VIDEO_SHADER: &str = include_str!("video.wgsl");

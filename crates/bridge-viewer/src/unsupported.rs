@@ -86,6 +86,12 @@ impl VideoWindow {
     ) -> Result<()> {
         Ok(())
     }
+    pub async fn set_presentation(
+        &self,
+        _display: bridge_core::sessions::ViewerDisplay,
+    ) -> Result<()> {
+        Ok(())
+    }
     pub async fn reset(&mut self, _width: u32, _height: u32) -> Result<()> {
         bail!("{}", self.message)
     }
