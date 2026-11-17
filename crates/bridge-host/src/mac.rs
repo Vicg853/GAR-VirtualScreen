@@ -36,11 +36,18 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn airbridge_display_release(display: *mut c_void);
     fn airbridge_display_update(display: *mut c_void, width: u32, height: u32, fps: u32) -> bool;
+    fn airbridge_display_mode(
+        display_id: u32,
+        width: *mut u32,
+        height: *mut u32,
+        fps: *mut u32,
+    ) -> bool;
     fn airbridge_video_stream_start(
         display_id: u32,
         width: u32,
         height: u32,
         fps: u32,
+        vsync: bool,
         context: *mut c_void,
         callback: extern "C" fn(*mut c_void, *mut c_void),
         error_code: *mut i32,
@@ -252,6 +259,7 @@ impl VideoStream {
                 settings.width,
                 settings.height,
                 settings.fps,
+                settings.vsync,
                 context.cast(),
                 frame_callback::<DEBUG>,
                 &mut error_code,
@@ -395,6 +403,9 @@ pub(crate) fn capture_display<const DEBUG: bool>(
                 H264Profile::Main => ProfileLevel::H264MainAutoLevel,
                 H264Profile::High => ProfileLevel::H264HighAutoLevel,
             });
+    if let Some(quality) = settings.h264_quality() {
+        encoder_builder = encoder_builder.with_quality(f32::from(quality) / 100.0);
+    }
     if settings.low_latency_rate_control {
         encoder_builder = encoder_builder.with_low_latency_rate_control(true);
     }
@@ -737,6 +748,13 @@ mod ownership_tests {
     }
 }
 
+/// The resolution and refresh rate macOS currently drives a virtual display
+/// with. Differs from the screen's settings after a switch in System Settings.
+pub(crate) fn display_mode(display_id: u32) -> Option<(u32, u32, u32)> {
+    let (mut width, mut height, mut fps) = (0, 0, 0);
+    unsafe { airbridge_display_mode(display_id, &mut width, &mut height, &mut fps) }
+        .then_some((width, height, fps))
+}
 pub(crate) fn display_position(display_id: u32) -> Option<bridge_core::sessions::DisplayPosition> {
     let (mut x, mut y) = (0, 0);
     if unsafe { airbridge_display_position(display_id, &mut x, &mut y) } {

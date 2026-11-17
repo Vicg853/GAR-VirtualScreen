@@ -31,6 +31,91 @@
 - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
 @end
 
+// The mode macOS currently drives a display with, in pixels. False while the
+// display is not (yet) online.
+bool airbridge_display_mode(uint32_t display_id, uint32_t *width, uint32_t *height, uint32_t *fps) {
+    if (!CGDisplayIsOnline(display_id)) return false;
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display_id);
+    if (!mode) return false;
+    *width = (uint32_t)CGDisplayModeGetPixelWidth(mode);
+    *height = (uint32_t)CGDisplayModeGetPixelHeight(mode);
+    *fps = (uint32_t)(CGDisplayModeGetRefreshRate(mode) + 0.5);
+    CGDisplayModeRelease(mode);
+    return *width > 0 && *height > 0;
+}
+
+static bool airbridge_mode_is(uint32_t display_id, uint32_t width, uint32_t height) {
+    uint32_t w = 0, h = 0, fps = 0;
+    return airbridge_display_mode(display_id, &w, &h, &fps) && w == width && h == height;
+}
+
+// The requested mode first, then the common resolutions in the same
+// orientation, so the screen can also be switched from System Settings.
+static NSArray *airbridge_modes(uint32_t width, uint32_t height, uint32_t fps) {
+    static const uint32_t common[][2] = {
+        {1280, 720}, {1920, 1080}, {1920, 1200}, {2560, 1440},
+        {2560, 1600}, {3024, 1964}, {3440, 1440}, {3840, 2160},
+    };
+    Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+    NSMutableArray *modes = [NSMutableArray array];
+    [modes addObject:[[modeClass alloc] initWithWidth:width height:height refreshRate:fps]];
+    BOOL portrait = height > width;
+    for (size_t i = 0; i < sizeof(common) / sizeof(common[0]); i++) {
+        uint32_t w = portrait ? common[i][1] : common[i][0];
+        uint32_t h = portrait ? common[i][0] : common[i][1];
+        if (w == width && h == height) continue;
+        [modes addObject:[[modeClass alloc] initWithWidth:w height:h refreshRate:fps]];
+    }
+    return modes;
+}
+
+static void airbridge_select_mode(uint32_t display_id, uint32_t width, uint32_t height) {
+    CFArrayRef all = CGDisplayCopyAllDisplayModes(display_id, NULL);
+    if (!all) return;
+    for (CFIndex i = 0; i < CFArrayGetCount(all); i++) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(all, i);
+        if (CGDisplayModeGetPixelWidth(mode) == width && CGDisplayModeGetPixelHeight(mode) == height) {
+            CGDisplaySetDisplayMode(display_id, mode, NULL);
+            break;
+        }
+    }
+    CFRelease(all);
+}
+
+static bool airbridge_wait_online(uint32_t display_id) {
+    uint32_t w = 0, h = 0, fps = 0;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (airbridge_display_mode(display_id, &w, &h, &fps)) return true;
+        usleep(25000);
+    }
+    return false;
+}
+
+// Offer several modes and make the requested one current. If macOS will not
+// switch to it, fall back to offering that mode alone, which always applies.
+static bool airbridge_apply_mode(CGVirtualDisplay *display, uint32_t width, uint32_t height, uint32_t fps) {
+    Class settingsClass = NSClassFromString(@"CGVirtualDisplaySettings");
+    Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+    CGVirtualDisplaySettings *settings = [settingsClass new];
+    settings.hiDPI = 0;
+    settings.modes = airbridge_modes(width, height, fps);
+    if ([display applySettings:settings]) {
+        uint32_t display_id = display.displayID;
+        if (airbridge_wait_online(display_id)) {
+            if (airbridge_mode_is(display_id, width, height)) return true;
+            airbridge_select_mode(display_id, width, height);
+            for (int attempt = 0; attempt < 20; attempt++) {
+                if (airbridge_mode_is(display_id, width, height)) return true;
+                usleep(25000);
+            }
+        }
+    }
+    CGVirtualDisplaySettings *only = [settingsClass new];
+    only.hiDPI = 0;
+    only.modes = @[[[modeClass alloc] initWithWidth:width height:height refreshRate:fps]];
+    return [display applySettings:only];
+}
+
 // The returned object must stay alive for the lifetime of the extended desktop.
 void *airbridge_display_create(uint32_t width, uint32_t height, uint32_t fps, uint32_t *display_id) {
     @try {
@@ -51,10 +136,10 @@ void *airbridge_display_create(uint32_t width, uint32_t height, uint32_t fps, ui
         @synchronized(displayClass) { descriptor.serialNum = nextSerial++; }
         CGVirtualDisplay *display = [[displayClass alloc] initWithDescriptor:descriptor];
         if (!display) return NULL;
-        CGVirtualDisplaySettings *settings = [settingsClass new];
-        settings.hiDPI = 0;
-        settings.modes = @[[[modeClass alloc] initWithWidth:width height:height refreshRate:fps]];
-        if (![display applySettings:settings]) return NULL;
+        if (!airbridge_apply_mode(display, width, height, fps)) return NULL;
+        // Only ever hand out the display created here: never a built-in or
+        // otherwise physical monitor that happens to share an identifier.
+        if (display.displayID == 0 || CGDisplayIsBuiltin(display.displayID)) return NULL;
         *display_id = display.displayID;
         return (__bridge_retained void *)display;
     } @catch (NSException *exception) {
@@ -68,10 +153,12 @@ bool airbridge_display_update(void *ptr,uint32_t width,uint32_t height,uint32_t 
     @try {
         CGVirtualDisplay *display = (__bridge CGVirtualDisplay *)ptr;
         if (!display) return false;
-        CGVirtualDisplaySettings *settings=[NSClassFromString(@"CGVirtualDisplaySettings") new];
-        settings.hiDPI=0;
-        settings.modes=@[[[NSClassFromString(@"CGVirtualDisplayMode") alloc] initWithWidth:width height:height refreshRate:fps]];
-        return [display applySettings:settings];
+        // Already in the requested mode (for example after the user switched it
+        // in System Settings): leave the display alone.
+        uint32_t w = 0, h = 0, current = 0;
+        if (airbridge_display_mode(display.displayID, &w, &h, &current) && w == width && h == height
+            && (current == 0 || current == fps)) return true;
+        return airbridge_apply_mode(display, width, height, fps);
     } @catch(NSException *e) { return false; }
 }
 
@@ -111,7 +198,7 @@ static CFStringRef airbridge_stream_key(const char *name) {
 // CGDisplayStream captures display pixels without constructing an SCStream or
 // asking CoreAudio for the clock that can stall video-only connections.
 void *airbridge_video_stream_start(uint32_t display_id, uint32_t width, uint32_t height,
-                                   uint32_t fps, void *context,
+                                   uint32_t fps, bool vsync, void *context,
                                    AirBridgeVideoFrameCallback callback, int32_t *error_code) {
     if (error_code) *error_code = 0;
     AirBridgeCreateStream create_stream = airbridge_create_stream();
@@ -130,7 +217,8 @@ void *airbridge_video_stream_start(uint32_t display_id, uint32_t width, uint32_t
     capture.queue = queue;
     NSDictionary *properties = @{
         (__bridge NSString *)cursor_key: @YES,
-        (__bridge NSString *)frame_time_key: @(1.0 / fps),
+        // Paced to the display refresh, or delivered as soon as pixels change.
+        (__bridge NSString *)frame_time_key: @(vsync ? 1.0 / fps : 0.0),
         (__bridge NSString *)depth_key: @6,
     };
     typedef const CGRect *(*UpdateRects)(CGDisplayStreamUpdateRef, CGDisplayStreamUpdateRectType, size_t *);
